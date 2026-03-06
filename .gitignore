@@ -1,0 +1,23 @@
+# Build output
+fm
+build/*.o
+build/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug
+core
+*.core
+
+# Backup files
+*.bak
+*.orig
