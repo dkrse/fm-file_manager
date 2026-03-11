@@ -2,24 +2,24 @@
 
 ## Overview
 
-Single-window GTK4 application — a Total Commander clone. One global `FM` struct (stack-allocated in `main.c` as `g_fm`) holds the entire application state and is passed by pointer everywhere.
+Single-window GTK4 application — a Total Commander clone. A single global `FM` struct (stack-allocated in `main.c` as `g_fm`) holds the entire application state and is passed everywhere as a pointer.
 
 ## Files
 
 | File | Responsibility |
 |------|---------------|
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
-| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, icon name resolving |
+| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, icon name resolving, path entry navigation (`do_path_activate`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
-| `src/fileops.c` | copy/move/delete/mkdir/rename + progress dialog + `on_browse_clicked` |
+| `src/fileops.c` | copy/move/delete/mkdir/rename + progress dialog + `on_browse_clicked`; recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Recursive glob search dialog, `SearchItem` GObject |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, `apply_*_css`; SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
-| `src/viewer.c` | File viewer (F3), local + SSH, max 1 MB |
-| `src/editor.c` | Text editor (F4), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
+| `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators |
+| `src/editor.c` | Text editor (F4) with menu bar, find/replace (Ctrl+F/H), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
 | `src/highlight.c` | Syntax highlighting: GtkSourceView wrapper or custom regex highlighter |
 
-## Data Flow
+## Data flow
 
 ```
 FM (g_fm)
@@ -35,26 +35,28 @@ FM (g_fm)
     └── viewer_css_provider   APPLICATION+2  (textview.fm-viewer)
 ```
 
-## Panel Model
+## Panel model
 
 Each `Panel` has:
+- `path_entry` — editable path; Enter navigates, Escape restores; supports `~` and relative paths
 - `GListStore<FileItem>` — raw data
 - `GtkSortListModel` — sorts store (synchronous, `incremental=FALSE`)
-- `GtkMultiSelection` — selection over sorted model
-- `GtkColumnView` — 3 columns (Name, Size, Modified) via `GtkSignalListItemFactory`
+- `GtkMultiSelection` — selection over sort model
+- `GtkColumnView` — 3 columns (Name, Size, Date) via `GtkSignalListItemFactory`
 - `cursor_pos` — manual cursor position tracking
 - `inhibit_sel` — flag preventing `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
 
-**Sort:** Always `..` first, then directories, then files. Within each group, sorted by the active column.
+**Sort:** Always `..` first, then directories, then files. Within each group by active column.
 
-**Selection:** `panel_selection()` returns GTK multi-selection if any rows are selected, otherwise falls back to the cursor row (TC style).
+**Selection:** `panel_selection()` returns GTK multi-selection if rows are selected, otherwise falls back to cursor row (TC style).
 
-## Key Handling Hierarchy
+## Key handling hierarchy
 
-1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys globally (skipped if `GtkEntry` has focus)
+1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (skipped if `GtkEntry` has focus)
 2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (select toggle), Backspace (go up), Enter (activate), `+` (select all)
+3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
 
-## Dialog Pattern
+## Dialog pattern
 
 All modal dialogs use `DlgCtx` + `GMainLoop` instead of `gtk_dialog_run`:
 ```c
@@ -64,7 +66,7 @@ if (dlg_ctx_run(&ctx) == 1) { /* OK pressed */ }
 gtk_window_destroy(GTK_WINDOW(dlg));
 ```
 
-## CSS Architecture
+## CSS architecture
 
 Four CSS providers with different priorities ensure correct specificity:
 
@@ -75,28 +77,29 @@ Four CSS providers with different priorities ensure correct specificity:
 | `editor_css_provider` | APPLICATION+2 | `textview.fm-editor` text font, `label.fm-editor-status` GUI font |
 | `viewer_css_provider` | APPLICATION+2 | `textview.fm-viewer` font |
 
-## Syntax Highlighting
+## Syntax highlighting
 
 With `HAVE_GTKSOURCEVIEW` (gtksourceview5-devel):
 - Editor and viewer use `GtkSourceView` / `GtkSourceBuffer`
-- Language auto-detected from extension via `GtkSourceLanguageManager`
+- Language auto-detected from file extension via `GtkSourceLanguageManager`
 - Color scheme configurable in Settings
 - Line numbers natively via `gtk_source_view_set_show_line_numbers`
 
 Without GtkSourceView (fallback):
 - `highlight.c` — custom GRegex-based highlighter for C/C++, Python, Shell, JS
-- Editor: live re-highlight with 300ms debounce (`g_timeout_add`)
+- Editor: live re-highlight with 300 ms debounce (`g_timeout_add`)
 - Viewer: one-time on load
 - Custom Cairo gutter for line numbers
 
-## Cursor — Focus Behavior
+## Cursor — focus behavior
 
-- **Startup:** after `set_active_panel(fm, 0)`, panel[1] is deselected (`inhibit_sel=TRUE` + `unselect_all`)
-- **Tab-switch:** before `grab_focus`, `panels[next].inhibit_sel = TRUE` is set → `on_focus_enter` detects it, restores `cursor_pos`, resets flag
-- **Mouse click:** `inhibit_sel` is FALSE at `on_focus_enter` → restore is skipped → `on_selection_changed` sets cursor directly to clicked position (no jump)
+- **Start:** after `set_active_panel(fm, 0)` panel[1] is deselected (`inhibit_sel=TRUE` + `unselect_all`)
+- **Tab switch:** before `grab_focus`, `panels[next].inhibit_sel = TRUE` is set → `on_focus_enter` detects it, restores `cursor_pos`, resets flag
+- **Mouse click:** `inhibit_sel` is FALSE on `on_focus_enter` → restore is skipped → `on_selection_changed` sets cursor directly to clicked position (no jump)
 - **After closing viewer/editor:** `inhibit_sel = TRUE` + `gtk_widget_grab_focus(panel->column_view)` → `on_focus_enter` restores cursor
+- **After dialogs (SSH connect, mkdir, rename, delete, copy, move):** same `inhibit_sel + grab_focus` pattern restores cursor
 
-## SSH Connections — Data Model
+## SSH connections — data model
 
 ```
 SshBookmark { name, user, host, port }   // fm.h
@@ -128,7 +131,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `editor_font_family`, `editor_font_size` | Editor text font |
 | `editor_gui_font_family`, `editor_gui_font_size` | Editor GUI font |
 | `editor_line_numbers`, `editor_linenum_font_size` | Line numbers |
-| `syntax_highlight` | Syntax highlighting on/off |
+| `syntax_highlight` | Syntax highlighting enabled |
 | `editor_style_scheme` | Color scheme (GtkSourceView) |
 
 ## Dependencies
@@ -140,13 +143,16 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | libssh2 | optional | SFTP panel (`#ifdef HAVE_LIBSSH2`) |
 | gtksourceview-5 | optional | full syntax highlighting (`#ifdef HAVE_GTKSOURCEVIEW`) |
 
-## Important Notes
+## Important notes
 
 - `on_browse_clicked` is defined in `fileops.c`, declared in `fm.h` as non-static — used by `search.c`
-- `panel_load()` dispatches to `panel_load_remote()` at the beginning if `p->ssh_conn != NULL`
+- `panel_load()` dispatches to `panel_load_remote()` at the start if `p->ssh_conn != NULL`
 - `lstat()` everywhere (not `stat()`) — correct symlink detection
 - Cross-device move: `rename()` → `EXDEV` → fallback copy+delete
 - `g_list_store_splice()` for batch insert (performance with 4000+ files)
 - `inhibit_sel` must be set BEFORE each `gtk_column_view_scroll_to(..., GTK_LIST_SCROLL_SELECT, ...)`
 - `ssh_write_file` writes in a loop (`libssh2_sftp_write` may return partial write)
 - `EditorCtx.filepath` is NULL for SFTP editing; `EditorCtx.remote_path` is NULL for local — always use `title = remote_path ?: filepath`
+- `do_path_activate`: text from `gtk_editable_get_text` must be copied (`g_strdup`) before calling `panel_load`, because it modifies the entry and invalidates the internal buffer
+- SFTP directory operations: `sftp_upload_dir_r` / `sftp_download_dir_r` recurse locally/remotely; `sftp_delete_r` walks remote dirs depth-first
+- `ssh_dlg_dropdown_fill` must be called AFTER all form entry widgets are created (otherwise `ssh_dlg_fill_form` writes to NULL widgets)

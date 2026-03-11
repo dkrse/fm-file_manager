@@ -32,7 +32,9 @@
 #define KEY_EDITOR_GUI_SIZE   "editor_gui_font_size"
 #define KEY_EDITOR_LINENUM      "editor_line_numbers"
 #define KEY_EDITOR_LINENUM_SIZE  "editor_linenum_font_size"
-#define KEY_SYNTAX_HIGHLIGHT     "syntax_highlight"
+#define KEY_SYNTAX_HIGHLIGHT         "syntax_highlight"
+#define KEY_VIEWER_SYNTAX_HIGHLIGHT  "viewer_syntax_highlight"
+#define KEY_VIEWER_LINE_NUMBERS      "viewer_line_numbers"
 #define KEY_STYLE_SCHEME         "editor_style_scheme"
 #define DEFAULT_STYLE_SCHEME     "classic"
 
@@ -298,6 +300,14 @@ void settings_load(FM *fm)
     fm->syntax_highlight = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SYNTAX_HIGHLIGHT, &sherr2);
     if (sherr2) { g_clear_error(&sherr2); fm->syntax_highlight = TRUE; }
 
+    GError *vsherr = NULL;
+    fm->viewer_syntax_highlight = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_SYNTAX_HIGHLIGHT, &vsherr);
+    if (vsherr) { g_clear_error(&vsherr); fm->viewer_syntax_highlight = TRUE; }
+
+    GError *vlnerr = NULL;
+    fm->viewer_line_numbers = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_LINE_NUMBERS, &vlnerr);
+    if (vlnerr) { g_clear_error(&vlnerr); fm->viewer_line_numbers = FALSE; }
+
     g_free(fm->editor_style_scheme);
     fm->editor_style_scheme = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_STYLE_SCHEME, NULL);
     if (!fm->editor_style_scheme || !fm->editor_style_scheme[0]) {
@@ -359,6 +369,8 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_EDITOR_LINENUM_SIZE,
                            fm->editor_linenum_font_size > 0 ? fm->editor_linenum_font_size : DEFAULT_EDITOR_LINENUM_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SYNTAX_HIGHLIGHT, fm->syntax_highlight);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_SYNTAX_HIGHLIGHT, fm->viewer_syntax_highlight);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_LINE_NUMBERS, fm->viewer_line_numbers);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_STYLE_SCHEME,
                           fm->editor_style_scheme ? fm->editor_style_scheme : DEFAULT_STYLE_SCHEME);
 
@@ -514,7 +526,7 @@ void settings_dialog(FM *fm)
     gtk_widget_set_margin_bottom(g, 16);
 
     /* ═══════════════════════════════════════════════════════
-     *  Tab 1 – Panels
+     *  Tab 1 – Panely
      * ═══════════════════════════════════════════════════════ */
     MAKE_TAB_GRID(g1)
     int row = 0;
@@ -608,7 +620,7 @@ void settings_dialog(FM *fm)
                              gtk_label_new("Panels"));
 
     /* ═══════════════════════════════════════════════════════
-     *  Tab 2 – Cursor
+     *  Tab 2 – Kurzor
      * ═══════════════════════════════════════════════════════ */
     MAKE_TAB_GRID(g2)
     row = 0;
@@ -678,6 +690,22 @@ void settings_dialog(FM *fm)
     gtk_widget_set_hexpand(viewer_font_btn, TRUE);
     gtk_grid_attach(GTK_GRID(g_viewer), lbl_vfont,      0, row, 1, 1);
     gtk_grid_attach(GTK_GRID(g_viewer), viewer_font_btn, 1, row++, 1, 1);
+
+    GtkWidget *chk_viewer_synhl = gtk_check_button_new_with_label(
+#ifdef HAVE_GTKSOURCEVIEW
+        "Syntax highlighting"
+#else
+        "Syntax highlighting (C, Python, Shell, JS)"
+#endif
+    );
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_viewer_synhl), fm->viewer_syntax_highlight);
+    gtk_grid_attach(GTK_GRID(g_viewer), chk_viewer_synhl, 0, row++, 2, 1);
+
+#ifdef HAVE_GTKSOURCEVIEW
+    GtkWidget *chk_viewer_linenum = gtk_check_button_new_with_label("Show line numbers");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_viewer_linenum), fm->viewer_line_numbers);
+    gtk_grid_attach(GTK_GRID(g_viewer), chk_viewer_linenum, 0, row++, 2, 1);
+#endif
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g_viewer,
                              gtk_label_new("Viewer"));
@@ -930,6 +958,12 @@ void settings_dialog(FM *fm)
             fm->viewer_font_family = g_strdup(vfamily ? vfamily : DEFAULT_VIEWER_FAMILY);
             fm->viewer_font_size = vsize;
         }
+        fm->viewer_syntax_highlight =
+            gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_viewer_synhl));
+#ifdef HAVE_GTKSOURCEVIEW
+        fm->viewer_line_numbers =
+            gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_viewer_linenum));
+#endif
         apply_viewer_css(fm);
 
         apply_gui_css(fm);
@@ -941,4 +975,9 @@ void settings_dialog(FM *fm)
         fm_status(fm, "Settings saved");
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
+
+    /* Restore focus to active panel */
+    Panel *ap = &fm->panels[fm->active];
+    ap->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(ap->column_view);
 }

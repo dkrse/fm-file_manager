@@ -1,25 +1,79 @@
 # Changelog
 
+## [2.5.0] — 2026-03-11
+
+### Recursive SFTP directory operations, SSH dialog and cursor fixes
+
+**Recursive SFTP directory operations:**
+- Copy directories with all subdirectories and files over SFTP (upload and download)
+- Move directories over SFTP (copy + recursive delete)
+- Delete directories recursively over SFTP with progress updates
+- Mkdir (F7) now works on SFTP panels via `libssh2_sftp_mkdir`
+- Rename (F9) now works on SFTP panels via `libssh2_sftp_rename`
+- New helpers: `sftp_calc_size_r`, `sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`
+
+**SSH connect dialog fixes:**
+- Dropdown: form fields now populate immediately when dialog opens (moved `ssh_dlg_dropdown_fill` after entry widgets are created)
+- Dropdown: explicit `ssh_dlg_fill_form` call after `set_selected` — fixes case where `notify::selected` signal doesn't fire when index is already 0
+- Signal connected before dropdown fill to ensure initial selection fires callback
+
+**Cursor fixes:**
+- Cursor no longer becomes unresponsive after SSH connect — `inhibit_sel + grab_focus` added to `ssh_connect_dialog`
+- Cursor no longer becomes unresponsive after F7 mkdir — `inhibit_sel + grab_focus` added to `fo_mkdir`
+- Same fix applied to `fo_rename`, `fo_delete`, `fo_copy`, `fo_move` for consistency
+
+---
+
+## [2.4.0] — 2026-03-02
+
+### Editable path, find/replace in editor and viewer, menu bar
+
+**Editable path in panels:**
+- Path entry at the top of each panel shows the current path
+- Manual path change + Enter loads the directory
+- Support for `~` expansion (home directory)
+- Support for relative paths (resolved against current directory)
+- Escape restores the original path
+- Works for SFTP panels too (sftp://user@host/path or just /path)
+
+**Find and replace in editor:**
+- Menu bar: File (Save, Close), Edit (Undo, Redo, Cut, Copy, Paste), Find (Find, Replace, Find next/prev.)
+- Ctrl+F opens search panel, Ctrl+H also opens replace row
+- All occurrences highlighted in yellow
+- Match position indicators on vertical scrollbar (red marks)
+- "X of Y" match counter
+- F3 / Shift+F3 navigation between matches
+
+**Search in viewer:**
+- Ctrl+F opens search panel (no replace - read-only)
+- Same highlighting and scrollbar indicators as in editor
+- F3 / Shift+F3 navigation
+
+**Fixes:**
+- Path entry: fixed use-after-free during navigation (gtk_editable_get_text returns internal buffer)
+
+---
+
 ## [2.3.0] — 2026-03-01
 
 ### Editor for SFTP, saved SSH connections, cursor fixes
 
-**Text editor over SFTP:**
-- Editor (F4) now works on the remote (SFTP) panel — reads via `ssh_read_file`, saves via `ssh_write_file`
-- New `ssh_write_file` function in `ssh.c` (real + stub)
+**Text editor via SFTP:**
+- Editor (F4) works on remote (SFTP) panel too — reading via `ssh_read_file`, saving via `ssh_write_file`
+- New function `ssh_write_file` in `ssh.c` (real + stub)
 - `EditorCtx` extended with `remote_path` and `ssh_conn`; window title, `●` modifier and syntax highlighting use the remote path
 
 **Saved SSH connections:**
 - Replaced simple `user@host` format with full named connections (`SshBookmark`: name, user, host, port)
 - Stored in `settings.ini` under key `[ssh] connections`, format `name|user|host|port;...`
-- Backward compatibility: old `user@host` format is read and converted
-- SSH connect dialog redesigned: GtkDropDown for connection selection, form (Name/Host/User/Port/Password), buttons New / Save / Delete / Close / Connect
+- Backward compatibility: old `user@host` format is loaded and converted
+- SSH connect dialog redesigned: GtkDropDown for connection selection, form (Name/Host/User/Port/Password), buttons New / Save / Remove / Close / Connect
 - Password is **not saved** (security)
 - New API: `ssh_bookmark_free`, `settings_load_ssh_bookmarks`, `settings_save_ssh_bookmarks`
 
 **Cursor fixes:**
 - At startup: only the active panel (left) shows cursor — panel[1] is deselected right after `set_active_panel`
-- Mouse click on inactive panel: removed cursor jump to old position before click target — `on_focus_enter` now distinguishes mouse (inhibit_sel=FALSE → skip restore) from Tab-switch (inhibit_sel=TRUE → restore cursor_pos)
+- Mouse click on inactive panel: removed jump to old position before clicked location — `on_focus_enter` now distinguishes mouse (inhibit_sel=FALSE → skip restore) from Tab switch (inhibit_sel=TRUE → restore cursor_pos)
 - After closing viewer/editor: cursor is restored to the original file — `grab_focus` with `inhibit_sel=TRUE` triggers restore in `on_focus_enter`
 
 ---
@@ -29,7 +83,7 @@
 ### Text editor (F4), Syntax highlighting, Viewer font
 
 **Text editor:**
-- New built-in text editor on F4 (replaces SSH dialog, which moved to a standalone button)
+- New built-in text editor on F4 (replaces SSH dialog, which moved to a separate button)
 - Classic window without toolbar — Ctrl+S saves, title shows `●` for unsaved changes
 - Optional line numbers (Cairo gutter) with configurable font size
 - Status bar shows line and column number
@@ -37,9 +91,9 @@
 **Syntax highlighting:**
 - GtkSourceView 5 integration as optional dependency (`sudo dnf install gtksourceview5-devel`)
 - Automatic language detection from file extension — hundreds of languages via system `.lang` files
-- Color scheme selection (classic, oblivion, solarized-dark, kate, ...) in Settings
+- Color scheme selectable in Settings (classic, oblivion, solarized-dark, kate, ...)
 - Without GtkSourceView: fallback — custom regex highlighter for C/C++, Python, Shell, JS
-- Highlighting active in editor (live, 300ms debounce) and viewer
+- Highlighting active in editor (live, 300 ms debounce) and viewer
 
 **Viewer:**
 - Configurable font and size (new "Viewer" tab in Settings)
@@ -52,7 +106,7 @@
 - Viewer: font and size
 
 **Fixes:**
-- Cursor after arrow key navigation following `panel_go_up` was skipping multiple rows — fixed by disabling `gtk_sort_list_model_set_incremental` (was causing race condition between async sort and cursor restore)
+- Cursor when navigating with arrow keys after `panel_go_up` was jumping multiple rows — fixed by disabling `gtk_sort_list_model_set_incremental` (was causing race condition between async sort and cursor restore)
 - `apply_editor_css` was not called after saving settings — editor font was not applied
 - CSS specificity: `window.fm-editor-win *` was overriding `textview.fm-editor` font-size — fixed with targeted `label.fm-editor-status`
 
@@ -62,15 +116,15 @@
 
 ### Cursor, performance, search
 
-**Panel cursor:**
+**Cursor in panels:**
 - Configurable cursor style: filled color (with inverse text color) or outline only
 - Cursor color selection via `GtkColorDialogButton`
-- Suppressed GTK focus rings (`row:focus-visible { outline: none }`)
+- GTK focus ring suppression (`row:focus-visible { outline: none }`)
 - `inhibit_sel` flag — prevents `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
 - Cursor position remembered when switching panels (Tab, mouse click)
 
 **Performance:**
-- `panel_load`: replaced 4000× `g_list_store_append` with a single `g_list_store_splice` — dramatic speedup for large directories
+- `panel_load`: replaced 4000× `g_list_store_append` with single `g_list_store_splice` — dramatic speedup for large directories
 - `fstatat(dirfd, ...)` instead of `stat(fullpath, ...)` — fewer string allocations
 
 **Search:**
@@ -83,23 +137,23 @@
 
 ### Complete rewrite to GTK4
 
-**Major changes:**
+**Main changes:**
 - Migration from GTK3 to GTK4 (minimum 4.12+)
-- `GtkTreeView` + `GtkListStore` replaced with `GtkColumnView` + `GListStore<FileItem>`
-- `GtkCellRenderer` replaced with `GtkSignalListItemFactory` (setup/bind callbacks)
-- `GtkDialog` + `gtk_dialog_run()` replaced with `GtkWindow` + `DlgCtx` (GMainLoop pattern)
-- `GtkStatusbar` replaced with `GtkLabel`
-- Icons: `GdkPixbuf` cache replaced with icon name strings
+- `GtkTreeView` + `GtkListStore` replaced by `GtkColumnView` + `GListStore<FileItem>`
+- `GtkCellRenderer` replaced by `GtkSignalListItemFactory` (setup/bind callbacks)
+- `GtkDialog` + `gtk_dialog_run()` replaced by `GtkWindow` + `DlgCtx` (GMainLoop pattern)
+- `GtkStatusbar` replaced by `GtkLabel`
+- Icons: `GdkPixbuf` cache replaced by icon name strings
 
 **New features:**
-- Terminal button in panel — opens terminal in the current directory (local and SSH)
+- Terminal button in panel — opens terminal in current directory (local and SSH)
 - Terminal application selection in settings
 - Progress bar with byte-level tracking for copy and move
 - SSH download: file sizes via SFTP stat for accurate progress
 
 **Fixes:**
 - Use-after-free in `panel_load_remote` after copying
-- Progress bar was not displaying — added event loop pump after `gtk_window_present`
+- Progress bar was not showing — added event loop pump after `gtk_window_present`
 
 ---
 
@@ -113,6 +167,6 @@
 - File viewer (F3), max 1 MB, UTF-8
 - SSH/SFTP connection via libssh2 — browsing, upload, download
 - Settings: panel font, GUI font, column widths, hidden files
-- SSH bookmarks (saved in settings.ini)
+- SSH bookmarks (stored in settings.ini)
 - Sorting: .. always first, directories before files
 - Keyboard shortcuts: Tab, F-keys, Space/Insert, Ctrl+H, Ctrl+R, Ctrl+=

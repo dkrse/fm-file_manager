@@ -1,30 +1,33 @@
 # FM — Total Commander for Linux
 
-A dual-panel file manager inspired by Total Commander, written in C with GTK4.
+Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 ## Features
 
-- **Two panels** — Total Commander-style navigation
+- **Two panels** — navigation like in Total Commander
+- **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2)
-- **Copy, move, delete** — F5/F6/F8 with progress bar (byte-level tracking)
-- **Search** — F2, recursive glob search with no result limit
-- **File viewer** — F3, displays text (max 1 MB, UTF-8) with configurable font
-- **Text editor** — F4, built-in editor with Ctrl+S, line numbers, syntax highlighting; works on SFTP panels too
+- **Copy, move, delete** — F5/F6/F8 with progress bar (byte-level tracking); full recursive directory support over SFTP
+- **File search** — F2, recursive glob search with no result limit
+- **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
+- **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS)
-- **SSH terminal** — open a terminal directly in the current directory (local and SSH)
+- **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — named connections (name/host/user/port) in settings.ini, selectable via dropdown
 - **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
 
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
+### Panel
 | Key | Action |
 |-----|--------|
 | Tab | Switch active panel |
-| Enter | Open file/directory |
+| Enter | Open file/directory (or confirm path in path entry) |
+| Escape | Cancel path editing (in path entry) |
 | Backspace | Go up one level |
-| Space / Insert | Toggle selection + advance cursor |
+| Space / Insert | Select + move cursor |
 | + | Select/deselect all |
-| F2 | Search |
+| F2 | Search files |
 | F3 | View file |
 | F4 | Text editor |
 | F5 | Copy |
@@ -34,9 +37,18 @@ A dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F9 | Rename |
 | F10 | Quit |
 | Ctrl+H | Hidden files |
-| Ctrl+R | Reload both panels |
+| Ctrl+R | Refresh both panels |
 | Ctrl+= | Synchronize panels |
-| Ctrl+S | Save (in editor) |
+
+### Editor / Viewer
+| Key | Action |
+|-----|--------|
+| Ctrl+S | Save (editor) |
+| Ctrl+F | Find |
+| Ctrl+H | Replace (editor only) |
+| F3 | Find next |
+| Shift+F3 | Find previous |
+| Escape | Close search panel |
 
 ## Requirements
 
@@ -55,7 +67,7 @@ sudo dnf install libssh2-devel        # optional, for SFTP
 sudo dnf install gtksourceview5-devel # optional, for syntax highlighting
 ```
 
-### Building
+### Compilation
 
 ```bash
 make              # compile (auto-detects libssh2 and gtksourceview5)
@@ -64,11 +76,11 @@ make install      # install to /usr/local/bin/fm
 make clean        # clean build artifacts
 ```
 
-## Project Structure
+## Project structure
 
 ```
 include/fm.h        — shared types and declarations
-src/main.c          — window, panels, key handlers, CSS
+src/main.c          — window, panels, keys, CSS
 src/fileitem.c      — FileItem GObject (model for file list)
 src/fileops.c       — file operations (copy, move, delete, mkdir, rename)
 src/search.c        — file search
@@ -78,25 +90,25 @@ src/viewer.c        — file viewer (F3)
 src/editor.c        — text editor (F4)
 src/highlight.c     — syntax highlighting (GtkSourceView wrapper / custom regex)
 docs/architecture.md — detailed architecture
-docs/changelog.md   — change history
+docs/changelog.md   — changelog
 Makefile            — build system
 ```
 
 ## Settings
 
-Stored in `~/.config/fm/settings.ini`. Configure via the Settings dialog (gear icon):
+Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear icon):
 
 **Panels** — panel font, GUI font, column widths (name/size/date), hidden files
 
 **Cursor** — style (filled color or outline only), cursor color
 
-**Viewer** — font and size for the file viewer (F3)
+**Viewer** — font and size for file viewer (F3)
 
 **Editor** — text font, editor GUI font, line number font size, line numbers, syntax highlighting, color scheme
 
 **System** — terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
 
-## SSH Connections
+## SSH connections
 
 Stored in `~/.config/fm/settings.ini`, section `[ssh]`, key `connections`. Format: `name|user|host|port` separated by `;`.
 
@@ -104,33 +116,9 @@ The dialog (SSH icon) allows:
 - **Select** a saved connection from the dropdown → fills the form
 - **New** — clears the form for entering a new connection
 - **Save** — saves/updates the connection (password is not saved)
-- **Delete** — deletes the selected connection
-- **Connect** — connects with current data and password
-
-## Author
-
-**krse**
+- **Remove** — deletes the selected connection
+- **Connect** — connects with the current details and password
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 krse
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT

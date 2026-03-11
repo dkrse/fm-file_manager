@@ -275,6 +275,140 @@ static int sftp_download(SshConn *conn, const char *remote_path,
     return err;
 }
 
+/* Recursive SFTP size calculation for progress */
+static gint64 sftp_calc_size_r(SshConn *conn, const char *remote_path)
+{
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return 0;
+    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions))
+        return (gint64)a.filesize;
+
+    gint64 total = 0;
+    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
+    if (!handle) return 0;
+
+    char name[512];
+    char longentry[512];
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
+                                    longentry, sizeof(longentry), &attrs) > 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
+        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+            LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
+            total += sftp_calc_size_r(conn, sub);
+        else if (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
+            total += (gint64)attrs.filesize;
+        g_free(sub);
+    }
+    libssh2_sftp_closedir(handle);
+    return total;
+}
+
+/* Recursive SFTP upload (local dir → remote dir) */
+static int sftp_upload_dir_r(SshConn *conn, const char *local_path,
+                              const char *remote_path, CopyProgress *cp)
+{
+    /* Create remote directory (ignore if exists) */
+    libssh2_sftp_mkdir(conn->sftp, remote_path,
+        LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP |
+        LIBSSH2_SFTP_S_IXGRP | LIBSSH2_SFTP_S_IROTH |
+        LIBSSH2_SFTP_S_IXOTH);
+
+    DIR *dir = opendir(local_path);
+    if (!dir) return -1;
+
+    struct dirent *de;
+    struct stat st;
+    int err = 0;
+
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        gchar *lp = g_build_filename(local_path, de->d_name, NULL);
+        gchar *rp = g_strdup_printf("%s/%s", remote_path, de->d_name);
+        if (lstat(lp, &st) == 0) {
+            if (S_ISDIR(st.st_mode))
+                err |= sftp_upload_dir_r(conn, lp, rp, cp);
+            else
+                err |= sftp_upload(conn, lp, rp, cp);
+        }
+        g_free(lp); g_free(rp);
+    }
+    closedir(dir);
+    return err;
+}
+
+/* Recursive SFTP download (remote dir → local dir) */
+static int sftp_download_dir_r(SshConn *conn, const char *remote_path,
+                                const char *local_path, CopyProgress *cp)
+{
+    if (mkdir(local_path, 0755) != 0 && errno != EEXIST) return -1;
+
+    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
+    if (!handle) return -1;
+
+    char name[512];
+    char longentry[512];
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+    int err = 0;
+
+    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
+                                    longentry, sizeof(longentry), &attrs) > 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        gchar *rp = g_strdup_printf("%s/%s", remote_path, name);
+        gchar *lp = g_build_filename(local_path, name, NULL);
+        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+            LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
+            err |= sftp_download_dir_r(conn, rp, lp, cp);
+        else
+            err |= sftp_download(conn, rp, lp, cp);
+        g_free(rp); g_free(lp);
+    }
+    libssh2_sftp_closedir(handle);
+    return err;
+}
+
+/* Recursive SFTP delete */
+static int sftp_delete_r(SshConn *conn, const char *remote_path,
+                          ProgressDlg *pd, int *del_count)
+{
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return -1;
+
+    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions)) {
+        int r = libssh2_sftp_unlink(conn->sftp, remote_path);
+        if (pd && del_count) {
+            (*del_count)++;
+            if (*del_count % 50 == 0) {
+                gchar *msg = g_strdup_printf("Deleted: %d files", *del_count);
+                gtk_label_set_text(GTK_LABEL(pd->label), msg);
+                g_free(msg);
+                gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
+                while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+            }
+        }
+        return r;
+    }
+
+    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
+    if (!handle) return -1;
+
+    char name[512];
+    char longentry[512];
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+
+    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
+                                    longentry, sizeof(longentry), &attrs) > 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
+        sftp_delete_r(conn, sub, pd, del_count);
+        g_free(sub);
+    }
+    libssh2_sftp_closedir(handle);
+    return libssh2_sftp_rmdir(conn->sftp, remote_path);
+}
+
 #endif /* HAVE_LIBSSH2 */
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -300,7 +434,7 @@ void on_browse_clicked(GtkButton *btn, gpointer user_data)
 {
     GtkWidget *entry = GTK_WIDGET(user_data);
     GtkFileDialog *fd = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(fd, "Select target directory");
+    gtk_file_dialog_set_title(fd, "Select destination directory");
 
     const char *cur = gtk_editable_get_text(GTK_EDITABLE(entry));
     if (cur && cur[0]) {
@@ -336,7 +470,7 @@ static gchar *ask_destination(FM *fm, const char *title, const char *default_dst
     gtk_widget_set_margin_top(vbox, 12);
     gtk_widget_set_margin_bottom(vbox, 12);
 
-    GtkWidget *lbl = gtk_label_new("Target directory:");
+    GtkWidget *lbl = gtk_label_new("Destination directory:");
     gtk_widget_set_halign(lbl, GTK_ALIGN_START);
 
     GtkWidget *entry = gtk_entry_new();
@@ -400,7 +534,7 @@ void fo_copy(FM *fm)
 #endif
 
     GList *targets = panel_selection(src);
-    if (!targets) { fm_status(fm, "Nothing selected"); return; }
+    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
     const char *default_dst =
 #ifdef HAVE_LIBSSH2
@@ -418,13 +552,11 @@ void fo_copy(FM *fm)
     gint64 total_bytes = 0;
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn) {
-        /* SSH download: get sizes via SFTP stat */
+        /* SSH download: get sizes via SFTP stat (recursive for dirs) */
         for (GList *l = targets; l; l = l->next) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
                                         (const char *)l->data);
-            LIBSSH2_SFTP_ATTRIBUTES a;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &a) == 0)
-                total_bytes += (gint64)a.filesize;
+            total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
             g_free(rp);
         }
     } else if (dst->ssh_conn) {
@@ -456,12 +588,21 @@ void fo_copy(FM *fm)
         if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
             gchar *lp = g_build_filename(dest, name, NULL);
-            r = sftp_download(src->ssh_conn, rp, lp, &cp);
+            LIBSSH2_SFTP_ATTRIBUTES ra;
+            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &ra) == 0 &&
+                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
+                r = sftp_download_dir_r(src->ssh_conn, rp, lp, &cp);
+            else
+                r = sftp_download(src->ssh_conn, rp, lp, &cp);
             g_free(rp); g_free(lp);
         } else if (dst->ssh_conn) {
             gchar *lp = g_build_filename(src->cwd, name, NULL);
             gchar *rp = g_strdup_printf("%s/%s", dest, name);
-            r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
+            struct stat ust;
+            if (lstat(lp, &ust) == 0 && S_ISDIR(ust.st_mode))
+                r = sftp_upload_dir_r(dst->ssh_conn, lp, rp, &cp);
+            else
+                r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
             g_free(lp); g_free(rp);
         } else
 #endif
@@ -505,6 +646,10 @@ void fo_copy(FM *fm)
 
     panel_reload(src);
     panel_reload(dst);
+
+    /* Restore focus to active panel */
+    src->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(src->column_view);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -524,7 +669,7 @@ void fo_move(FM *fm)
 #endif
 
     GList *targets = panel_selection(src);
-    if (!targets) { fm_status(fm, "Nothing selected"); return; }
+    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
     const char *default_dst =
 #ifdef HAVE_LIBSSH2
@@ -545,9 +690,7 @@ void fo_move(FM *fm)
         for (GList *l = targets; l; l = l->next) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
                                         (const char *)l->data);
-            LIBSSH2_SFTP_ATTRIBUTES a;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &a) == 0)
-                total_bytes += (gint64)a.filesize;
+            total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
             g_free(rp);
         }
     } else if (dst->ssh_conn) {
@@ -578,14 +721,23 @@ void fo_move(FM *fm)
         if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
             gchar *lp = g_build_filename(dest, name, NULL);
-            r = sftp_download(src->ssh_conn, rp, lp, &cp);
+            LIBSSH2_SFTP_ATTRIBUTES ra;
+            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &ra) == 0 &&
+                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
+                r = sftp_download_dir_r(src->ssh_conn, rp, lp, &cp);
+            else
+                r = sftp_download(src->ssh_conn, rp, lp, &cp);
             if (r == 0)
-                libssh2_sftp_unlink(src->ssh_conn->sftp, rp);
+                sftp_delete_r(src->ssh_conn, rp, NULL, NULL);
             g_free(rp); g_free(lp);
         } else if (dst->ssh_conn) {
             gchar *lp = g_build_filename(src->cwd, name, NULL);
             gchar *rp = g_strdup_printf("%s/%s", dest, name);
-            r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
+            struct stat ust;
+            if (lstat(lp, &ust) == 0 && S_ISDIR(ust.st_mode))
+                r = sftp_upload_dir_r(dst->ssh_conn, lp, rp, &cp);
+            else
+                r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
             if (r == 0) delete_r(lp, NULL, NULL);
             g_free(lp); g_free(rp);
         } else
@@ -637,6 +789,10 @@ void fo_move(FM *fm)
 
     panel_reload(src);
     panel_reload(dst);
+
+    /* Restore focus to active panel */
+    src->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(src->column_view);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -647,7 +803,7 @@ void fo_delete(FM *fm)
 {
     Panel *p = active_panel(fm);
     GList *targets = panel_selection(p);
-    if (!targets) { fm_status(fm, "Nothing selected"); return; }
+    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
     int n = g_list_length(targets);
     gchar *question = (n == 1)
@@ -659,7 +815,7 @@ void fo_delete(FM *fm)
     dlg_ctx_init(&ctx);
 
     GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "Confirm deletion");
+    gtk_window_set_title(GTK_WINDOW(dlg), "Delete confirmation");
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
     gtk_window_set_default_size(GTK_WINDOW(dlg), 400, -1);
@@ -675,7 +831,7 @@ void fo_delete(FM *fm)
     gtk_widget_set_halign(q_lbl, GTK_ALIGN_START);
     g_free(question);
 
-    GtkWidget *warn = gtk_label_new("This action cannot be undone.");
+    GtkWidget *warn = gtk_label_new("This action is irreversible.");
     gtk_widget_set_halign(warn, GTK_ALIGN_START);
 
     GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -718,10 +874,7 @@ void fo_delete(FM *fm)
 #ifdef HAVE_LIBSSH2
         if (p->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
-            int r = libssh2_sftp_unlink(p->ssh_conn->sftp, rp);
-            if (r != 0)
-                r = libssh2_sftp_rmdir(p->ssh_conn->sftp, rp);
-            (r == 0) ? ok2++ : fail++;
+            (sftp_delete_r(p->ssh_conn, rp, pd, &del_count) == 0) ? ok2++ : fail++;
             g_free(rp);
         } else
 #endif
@@ -736,6 +889,10 @@ void fo_delete(FM *fm)
     g_list_free_full(targets, g_free);
     fm_status(fm, "Deleted: %d  errors: %d", ok2, fail);
     panel_reload(p);
+
+    /* Restore focus to active panel */
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -790,17 +947,39 @@ void fo_mkdir(FM *fm)
     if (dlg_ctx_run(&ctx) == 1) {
         const gchar *name = gtk_editable_get_text(GTK_EDITABLE(entry));
         if (name && name[0]) {
-            gchar *path = g_build_filename(p->cwd, name, NULL);
-            if (mkdir(path, 0755) == 0) {
-                fm_status(fm, "Directory created: %s", name);
-                panel_reload(p);
-            } else {
-                fm_status(fm, "Error creating directory: %s", g_strerror(errno));
+#ifdef HAVE_LIBSSH2
+            if (p->ssh_conn) {
+                gchar *rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
+                int r = libssh2_sftp_mkdir(p->ssh_conn->sftp, rp,
+                    LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP |
+                    LIBSSH2_SFTP_S_IXGRP | LIBSSH2_SFTP_S_IROTH |
+                    LIBSSH2_SFTP_S_IXOTH);
+                if (r == 0) {
+                    fm_status(fm, "Directory created: %s", name);
+                    panel_load_remote(p, p->ssh_conn->remote_path);
+                } else {
+                    fm_status(fm, "Error creating remote directory");
+                }
+                g_free(rp);
+            } else
+#endif
+            {
+                gchar *path = g_build_filename(p->cwd, name, NULL);
+                if (mkdir(path, 0755) == 0) {
+                    fm_status(fm, "Directory created: %s", name);
+                    panel_reload(p);
+                } else {
+                    fm_status(fm, "Error creating directory: %s", g_strerror(errno));
+                }
+                g_free(path);
             }
-            g_free(path);
         }
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
+
+    /* Restore focus to active panel */
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -813,7 +992,7 @@ void fo_rename(FM *fm)
     gchar *old_name = panel_cursor_name(p);
     if (!old_name || strcmp(old_name, "..") == 0) {
         g_free(old_name);
-        fm_status(fm, "No file selected");
+        fm_status(fm, "No file is selected");
         return;
     }
 
@@ -832,7 +1011,7 @@ void fo_rename(FM *fm)
     gtk_widget_set_margin_top(vbox, 12);
     gtk_widget_set_margin_bottom(vbox, 12);
 
-    gchar *markup = g_strdup_printf("Rename  <b>%s</b>  to:", old_name);
+    gchar *markup = g_strdup_printf("Rename <b>%s</b> to:", old_name);
     GtkWidget *lbl = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(lbl), markup);
     g_free(markup);
@@ -867,17 +1046,37 @@ void fo_rename(FM *fm)
     if (dlg_ctx_run(&ctx) == 1) {
         const gchar *new_name = gtk_editable_get_text(GTK_EDITABLE(entry));
         if (new_name && new_name[0] && strcmp(new_name, old_name) != 0) {
-            gchar *src_path = g_build_filename(p->cwd, old_name, NULL);
-            gchar *dst_path = g_build_filename(p->cwd, new_name, NULL);
-            if (rename(src_path, dst_path) == 0) {
-                fm_status(fm, "Renamed: %s → %s", old_name, new_name);
-                panel_reload(p);
-            } else {
-                fm_status(fm, "Error renaming: %s", g_strerror(errno));
+#ifdef HAVE_LIBSSH2
+            if (p->ssh_conn) {
+                gchar *old_rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, old_name);
+                gchar *new_rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, new_name);
+                int r = libssh2_sftp_rename(p->ssh_conn->sftp, old_rp, new_rp);
+                if (r == 0) {
+                    fm_status(fm, "Renamed: %s → %s", old_name, new_name);
+                    panel_load_remote(p, p->ssh_conn->remote_path);
+                } else {
+                    fm_status(fm, "Error renaming remote file");
+                }
+                g_free(old_rp); g_free(new_rp);
+            } else
+#endif
+            {
+                gchar *src_path = g_build_filename(p->cwd, old_name, NULL);
+                gchar *dst_path = g_build_filename(p->cwd, new_name, NULL);
+                if (rename(src_path, dst_path) == 0) {
+                    fm_status(fm, "Renamed: %s → %s", old_name, new_name);
+                    panel_reload(p);
+                } else {
+                    fm_status(fm, "Error renaming: %s", g_strerror(errno));
+                }
+                g_free(src_path); g_free(dst_path);
             }
-            g_free(src_path); g_free(dst_path);
         }
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
     g_free(old_name);
+
+    /* Restore focus to active panel */
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
 }

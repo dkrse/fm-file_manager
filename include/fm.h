@@ -35,6 +35,12 @@ FileItem *file_item_new(const char *icon_name, const char *name,
                         gboolean is_dir, const char *fg_color,
                         gint weight, gint64 size_raw, gint64 date_raw);
 
+/* Optimized version: takes ownership of size and date (caller must not free) */
+FileItem *file_item_new_take(const char *icon_name, const char *name,
+                             gchar *size, gchar *date,
+                             gboolean is_dir, const char *fg_color,
+                             gint weight, gint64 size_raw, gint64 date_raw);
+
 /* ── SSH saved connection (bookmark) ─────────────────────────────── */
 typedef struct {
     gchar *name;   /* display label                */
@@ -126,7 +132,9 @@ struct _FM {
     int             editor_gui_font_size;
     gboolean        editor_line_numbers;
     int             editor_linenum_font_size; /* line number gutter font size */
-    gboolean        syntax_highlight;         /* syntax highlighting on/off   */
+    gboolean        syntax_highlight;         /* editor syntax highlighting   */
+    gboolean        viewer_syntax_highlight;  /* viewer syntax highlighting   */
+    gboolean        viewer_line_numbers;      /* viewer line numbers          */
     gchar          *editor_style_scheme;      /* GtkSourceView style scheme id */
 };
 
@@ -201,6 +209,10 @@ void   settings_apply_columns(FM *fm);
 void   apply_editor_css(FM *fm);
 void   apply_viewer_css(FM *fm);
 void   highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled);
+#ifdef HAVE_GTKSOURCEVIEW
+#include <gtksourceview/gtksource.h>
+GtkSourceLanguage *source_guess_language(const char *filename);
+#endif
 void   ssh_bookmark_free            (gpointer p);
 GList *settings_load_ssh_bookmarks  (FM *fm);          /* GList<SshBookmark*> */
 void   settings_save_ssh_bookmarks  (FM *fm, GList *list);

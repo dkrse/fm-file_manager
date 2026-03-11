@@ -68,7 +68,7 @@ $(BUILDDIR):
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LIBS)
-	@echo "Hotovo: ./$(TARGET)"
+	@echo "Done: ./$(TARGET)"
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/fm.h
 	$(CC) $(CFLAGS) -c $< -o $@

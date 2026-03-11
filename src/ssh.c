@@ -185,6 +185,9 @@ void panel_load_remote(Panel *p, const char *path)
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
 
+    /* Suppress selection events during load */
+    p->inhibit_sel = TRUE;
+
     gchar *new_path = g_strdup(path);   /* copy before free – path may alias remote_path */
     g_free(conn->remote_path);
     conn->remote_path = new_path;
@@ -195,21 +198,23 @@ void panel_load_remote(Panel *p, const char *path)
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), entry_text);
     g_free(entry_text);
 
-    g_list_store_remove_all(p->store);
-
-    /* ".." entry */
-    FileItem *up = file_item_new("go-up-symbolic", "..", "", "",
-                                 TRUE, "#1565C0", PANGO_WEIGHT_BOLD,
-                                 (gint64)-2, (gint64)0);
-    g_list_store_append(p->store, up);
-    g_object_unref(up);
-
     LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, path);
     if (!handle) {
         fm_status(p->fm, "SFTP: failed to open directory %s", path);
+        g_list_store_remove_all(p->store);
         panel_update_status(p);
+        p->inhibit_sel = FALSE;
         return;
     }
+
+    /* Collect all items into array first, then splice once (O(n) instead of O(n²)) */
+    GPtrArray *items = g_ptr_array_new_with_free_func(g_object_unref);
+
+    /* ".." entry */
+    g_ptr_array_add(items,
+        file_item_new("go-up-symbolic", "..", "", "",
+                      TRUE, "#1565C0", PANGO_WEIGHT_BOLD,
+                      (gint64)-2, (gint64)0));
 
     char name_buf[512];
     char longentry[512];
@@ -237,30 +242,40 @@ void panel_load_remote(Panel *p, const char *path)
         gint64 mtime    = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)
                           ? (gint64)attrs.mtime : 0;
 
-        gchar *sz_str = is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw);
-        gchar *dt_str = fmt_date(mtime);
-
         const gchar *fg = NULL;
         gint         wt = PANGO_WEIGHT_NORMAL;
         if      (is_dir)  { fg = "#1565C0"; wt = PANGO_WEIGHT_BOLD; }
         else if (is_link) { fg = "#7B1FA2"; }
         else if (is_exec) { fg = "#2E7D32"; }
 
-        FileItem *item = file_item_new(icon, name_buf, sz_str, dt_str,
-                                       is_dir, fg, wt, size_raw, mtime);
-        g_list_store_append(p->store, item);
-        g_object_unref(item);
-        g_free(sz_str);
-        g_free(dt_str);
+        /* file_item_new_take takes ownership of size/date strings */
+        g_ptr_array_add(items,
+            file_item_new_take(icon, name_buf,
+                               is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
+                               fmt_date(mtime),
+                               is_dir, fg, wt, size_raw, mtime));
     }
     libssh2_sftp_closedir(handle);
+
+    /* Single splice: one items-changed signal → one sort pass */
+    g_list_store_remove_all(p->store);
+    g_list_store_splice(p->store, 0, 0,
+                        (gpointer *)items->pdata, items->len);
+    g_ptr_array_unref(items);
 
     panel_update_status(p);
 
     p->cursor_pos = 0;
-    if (p->column_view && g_list_model_get_n_items(G_LIST_MODEL(p->sort_model)) > 0)
+    if (p->column_view && g_list_model_get_n_items(G_LIST_MODEL(p->sort_model)) > 0) {
+        gboolean is_active = (p->fm->active == p->idx);
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
-                                  NULL, GTK_LIST_SCROLL_FOCUS, NULL);
+                                  NULL,
+                                  is_active ? GTK_LIST_SCROLL_SELECT
+                                            : GTK_LIST_SCROLL_NONE,
+                                  NULL);
+    }
+
+    p->inhibit_sel = FALSE;
 }
 
 /* ── Connection dialog helpers ───────────────────────────────────── */
@@ -276,6 +291,8 @@ typedef struct {
     FM            *fm;
     gboolean       block_sel;   /* TRUE while rebuilding dropdown */
 } SshDlgData;
+
+static void ssh_dlg_fill_form(SshDlgData *d, SshBookmark *bm);
 
 /* Rebuild GtkStringList items from d->bookmarks */
 static void ssh_dlg_dropdown_fill(SshDlgData *d, int select_idx)
@@ -299,10 +316,14 @@ static void ssh_dlg_dropdown_fill(SshDlgData *d, int select_idx)
 
     d->block_sel = FALSE;
 
-    if (select_idx >= 0 && select_idx < (int)g_list_length(d->bookmarks))
+    if (select_idx >= 0 && select_idx < (int)g_list_length(d->bookmarks)) {
         gtk_drop_down_set_selected(d->dropdown, (guint)select_idx);
-    else
+        /* Explicitly fill form — signal may not fire if index unchanged */
+        SshBookmark *bm = g_list_nth_data(d->bookmarks, select_idx);
+        if (bm) ssh_dlg_fill_form(d, bm);
+    } else {
         gtk_drop_down_set_selected(d->dropdown, GTK_INVALID_LIST_POSITION);
+    }
 }
 
 static void ssh_dlg_fill_form(SshDlgData *d, SshBookmark *bm)
@@ -398,7 +419,7 @@ void ssh_connect_dialog(FM *fm)
     dlg_ctx_init(&ctx);
 
     GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "SSH / SFTP Connections");
+    gtk_window_set_title(GTK_WINDOW(dlg), "SSH / SFTP connections");
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
     gtk_window_set_default_size(GTK_WINDOW(dlg), 460, -1);
@@ -430,7 +451,6 @@ void ssh_connect_dialog(FM *fm)
     d->dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(d->str_list), NULL));
     gtk_widget_set_hexpand(GTK_WIDGET(d->dropdown), TRUE);
     FORM_ROW("Saved:", GTK_WIDGET(d->dropdown), grid, row++)
-    ssh_dlg_dropdown_fill(d, d->bookmarks ? 0 : -1);
     g_signal_connect(d->dropdown, "notify::selected",
                      G_CALLBACK(on_ssh_dropdown_selected), d);
 
@@ -460,6 +480,9 @@ void ssh_connect_dialog(FM *fm)
 
 #undef FORM_ROW
 
+    /* Fill dropdown after all form entries exist */
+    ssh_dlg_dropdown_fill(d, d->bookmarks ? 0 : -1);
+
     GtkWidget *hint = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hint),
         "<small>Empty password = SSH key authentication (~/.ssh/id_rsa)</small>");
@@ -484,7 +507,7 @@ void ssh_connect_dialog(FM *fm)
     gtk_box_append(GTK_BOX(vbox), btn_box);
 
     GtkWidget *new_btn     = gtk_button_new_with_label("New");
-    GtkWidget *del_btn     = gtk_button_new_with_label("Delete");
+    GtkWidget *del_btn     = gtk_button_new_with_label("Remove");
     GtkWidget *save_btn    = gtk_button_new_with_label("Save");
     GtkWidget *close_btn   = gtk_button_new_with_label("Close");
     GtkWidget *connect_btn = gtk_button_new_with_label("Connect");
@@ -553,6 +576,11 @@ void ssh_connect_dialog(FM *fm)
     gtk_window_destroy(GTK_WINDOW(dlg));
     g_list_free_full(d->bookmarks, ssh_bookmark_free);
     g_free(d);
+
+    /* Restore focus to active panel */
+    Panel *fp = &fm->panels[fm->active];
+    fp->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(fp->column_view);
 }
 
 #else  /* !HAVE_LIBSSH2 */
@@ -562,7 +590,7 @@ void ssh_connect_dialog(FM *fm)
 void panel_load_remote(Panel *p, const char *path)
 {
     (void)p; (void)path;
-    fm_status(p->fm, "SFTP not available – install libssh2-devel");
+    fm_status(p->fm, "SFTP is not available – install libssh2-devel");
 }
 
 void ssh_panel_close(Panel *p)
@@ -592,7 +620,7 @@ void ssh_connect_dialog(FM *fm)
     dlg_ctx_init(&ctx);
 
     GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "SFTP not available");
+    gtk_window_set_title(GTK_WINDOW(dlg), "SFTP is not available");
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
     gtk_window_set_default_size(GTK_WINDOW(dlg), 400, -1);

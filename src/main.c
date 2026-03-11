@@ -100,7 +100,7 @@ GList *panel_selection(Panel *p)
         gtk_bitset_unref(bs);
         gchar *name = panel_cursor_name(p);
         if (name && strcmp(name, "..") != 0)
-            return g_list_append(NULL, name);
+            return g_list_prepend(NULL, name);
         g_free(name);
         return NULL;
     }
@@ -114,13 +114,13 @@ GList *panel_selection(Panel *p)
                                  G_LIST_MODEL(p->sort_model), pos);
             if (item) {
                 if (strcmp(item->name, "..") != 0)
-                    result = g_list_append(result, g_strdup(item->name));
+                    result = g_list_prepend(result, g_strdup(item->name));
                 g_object_unref(item);
             }
         } while (gtk_bitset_iter_next(&iter, &pos));
     }
     gtk_bitset_unref(bs);
-    return result;
+    return g_list_reverse(result);  /* O(n) reverse instead of O(n²) append */
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -133,6 +133,9 @@ void panel_load(Panel *p, const char *path)
 
     struct stat st;
     if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+    /* Suppress selection events during entire load */
+    p->inhibit_sel = TRUE;
 
     g_strlcpy(p->cwd, path, sizeof(p->cwd));
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), path);
@@ -171,8 +174,6 @@ void panel_load(Panel *p, const char *path)
             gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
 
             const char *icon = icon_for_entry(is_dir, is_link, is_exec, FALSE);
-            gchar *sz_str = is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size);
-            gchar *dt_str = fmt_date(fst.st_mtime);
 
             const gchar *fg = NULL;
             gint         wt = PANGO_WEIGHT_NORMAL;
@@ -180,12 +181,13 @@ void panel_load(Panel *p, const char *path)
             else if (is_link) { fg = "#7B1FA2"; }
             else if (is_exec) { fg = "#2E7D32"; }
 
+            /* file_item_new_take takes ownership of size/date strings */
             g_ptr_array_add(items,
-                file_item_new(icon, de->d_name, sz_str, dt_str,
+                file_item_new_take(icon, de->d_name,
+                              is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
+                              fmt_date(fst.st_mtime),
                               is_dir, fg, wt,
                               (gint64)fst.st_size, (gint64)fst.st_mtime));
-            g_free(sz_str);
-            g_free(dt_str);
         }
         closedir(dir);
     }
@@ -201,11 +203,16 @@ void panel_load(Panel *p, const char *path)
     /* move cursor to first row */
     p->cursor_pos = 0;
     if (p->column_view && g_list_model_get_n_items(G_LIST_MODEL(p->sort_model)) > 0) {
-        p->inhibit_sel = TRUE;
+        /* Only select (show cursor) on active panel */
+        gboolean is_active = (p->fm->active == p->idx);
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
-                                  NULL, GTK_LIST_SCROLL_SELECT, NULL);
-        p->inhibit_sel = FALSE;
+                                  NULL,
+                                  is_active ? GTK_LIST_SCROLL_SELECT
+                                            : GTK_LIST_SCROLL_NONE,
+                                  NULL);
     }
+
+    p->inhibit_sel = FALSE;
 }
 
 void panel_reload(Panel *p)
@@ -216,10 +223,14 @@ void panel_reload(Panel *p)
     }
 
     gchar *saved = panel_cursor_name(p);
-    panel_load(p, p->cwd);
+    panel_load(p, p->cwd);  /* inhibit_sel is handled inside panel_load */
 
     if (!saved) return;
 
+    /* Only select (show cursor) on active panel */
+    gboolean is_active = (p->fm->active == p->idx);
+
+    p->inhibit_sel = TRUE;
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
     for (guint i = 0; i < n; i++) {
         FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
@@ -227,11 +238,15 @@ void panel_reload(Panel *p)
             g_object_unref(item);
             p->cursor_pos = i;
             gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
-                                      NULL, GTK_LIST_SCROLL_SELECT, NULL);
+                                      NULL,
+                                      is_active ? GTK_LIST_SCROLL_SELECT
+                                                : GTK_LIST_SCROLL_NONE,
+                                      NULL);
             break;
         }
         if (item) g_object_unref(item);
     }
+    p->inhibit_sel = FALSE;
     g_free(saved);
 }
 
@@ -467,7 +482,7 @@ static void activate_item(Panel *p)
                 }
                 g_free(tmp);
             } else {
-                fm_status(p->fm, "Download error: '%s'", name);
+                fm_status(p->fm, "Error downloading '%s'", name);
             }
             g_free(data);
 #else
@@ -660,14 +675,99 @@ static void on_focus_enter(GtkEventControllerFocus *ctrl, Panel *p)
     p->inhibit_sel = FALSE;
 }
 
+static void do_path_activate(Panel *p)
+{
+    /* IMPORTANT: copy text because gtk_editable_get_text returns internal buffer
+     * that becomes invalid when we modify the entry */
+    gchar *text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(p->path_entry)));
+
+    if (!text || !text[0]) {
+        g_free(text);
+        gtk_editable_set_text(GTK_EDITABLE(p->path_entry), p->cwd);
+        return;
+    }
+
+    if (p->ssh_conn) {
+        /* SSH connected – parse path from entry or use as-is */
+        const char *remote_path = text;
+
+        /* If user typed sftp://user@host/path, extract just the path */
+        if (g_str_has_prefix(text, "sftp://")) {
+            const char *host_start = text + 7;
+            const char *path_start = strchr(host_start, '/');
+            if (path_start)
+                remote_path = path_start;
+            else
+                remote_path = "/";
+        }
+
+        /* Handle relative paths for SSH */
+        gchar *full_path = NULL;
+        if (remote_path[0] != '/') {
+            /* Relative path – prepend current remote directory */
+            const char *base = p->ssh_conn->remote_path;
+            if (base[strlen(base)-1] == '/')
+                full_path = g_strdup_printf("%s%s", base, remote_path);
+            else
+                full_path = g_strdup_printf("%s/%s", base, remote_path);
+            remote_path = full_path;
+        }
+
+        panel_load_remote(p, remote_path);
+        g_free(full_path);
+    } else {
+        /* Local panel – build full path */
+        gchar *full_path = NULL;
+
+        /* Handle ~ expansion */
+        if (text[0] == '~') {
+            if (text[1] == '\0' || text[1] == '/')
+                full_path = g_strdup_printf("%s%s", g_get_home_dir(), text + 1);
+            else
+                full_path = g_strdup(text);  /* ~user not supported, try as-is */
+        }
+        /* Handle relative paths */
+        else if (text[0] != '/') {
+            if (p->cwd[strlen(p->cwd)-1] == '/')
+                full_path = g_strdup_printf("%s%s", p->cwd, text);
+            else
+                full_path = g_strdup_printf("%s/%s", p->cwd, text);
+        }
+
+        const char *path_to_check = full_path ? full_path : text;
+        struct stat st;
+        if (stat(path_to_check, &st) == 0 && S_ISDIR(st.st_mode))
+            panel_load(p, path_to_check);
+        else
+            gtk_editable_set_text(GTK_EDITABLE(p->path_entry), p->cwd);
+
+        g_free(full_path);
+    }
+    g_free(text);
+}
+
+static gboolean on_path_key_press(GtkEventControllerKey *ctrl,
+                                   guint keyval, guint keycode,
+                                   GdkModifierType state, Panel *p)
+{
+    (void)ctrl; (void)keycode; (void)state;
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        do_path_activate(p);
+        gtk_widget_grab_focus(p->column_view);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Escape) {
+        gtk_editable_set_text(GTK_EDITABLE(p->path_entry), p->cwd);
+        gtk_widget_grab_focus(p->column_view);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void on_path_activate(GtkEntry *entry, Panel *p)
 {
-    const gchar *text = gtk_editable_get_text(GTK_EDITABLE(entry));
-    struct stat st;
-    if (stat(text, &st) == 0 && S_ISDIR(st.st_mode))
-        panel_load(p, text);
-    else
-        gtk_editable_set_text(GTK_EDITABLE(entry), p->cwd);
+    (void)entry;
+    do_path_activate(p);
 }
 
 static void on_up_clicked(GtkButton *btn, Panel *p) { (void)btn; panel_go_up(p); }
@@ -894,6 +994,11 @@ void panel_setup(Panel *p, FM *fm, int idx)
     g_signal_connect(key_ctrl, "key-pressed", G_CALLBACK(on_tree_key_press), p);
     gtk_widget_add_controller(p->column_view, key_ctrl);
 
+    /* Key controller on path entry (for Enter/Escape) */
+    GtkEventController *path_key = gtk_event_controller_key_new();
+    g_signal_connect(path_key, "key-pressed", G_CALLBACK(on_path_key_press), p);
+    gtk_widget_add_controller(p->path_entry, path_key);
+
     /* Focus controller */
     GtkEventController *focus_ctrl = gtk_event_controller_focus_new();
     g_signal_connect(focus_ctrl, "enter", G_CALLBACK(on_focus_enter), p);
@@ -925,16 +1030,16 @@ static GtkWidget *create_toolbar(FM *fm)
         const char *tooltip;
         void (*cb)(GtkButton *, gpointer);
     } btns[] = {
-        { "F5 Copy",    "Copy to other panel",       btn_copy   },
-        { "F6 Move",    "Move to other panel",       btn_move   },
-        { "F7 Mkdir",   "Create new directory",      btn_mkdir  },
-        { "F8 Delete",  "Delete selected files",     btn_delete },
-        { "F9 Rename",  "Rename current file",       btn_rename },
-        { "F2 Search",  "Search files",              btn_find   },
-        { "F3 View",    "View file contents",        btn_view   },
-        { "F4 Editor",  "Open file in editor",       btn_editor },
-        { "SSH",        "Connect via SSH/SFTP",       btn_ssh    },
-        { "F10 Quit",   "Quit application",          btn_quit   },
+        { "F5 Copy",  "Copy to other panel",    btn_copy   },
+        { "F6 Move",   "Move to other panel",     btn_move   },
+        { "F7 MkDir",    "Create new directory",          btn_mkdir  },
+        { "F8 Delete",     "Delete selected files",          btn_delete },
+        { "F9 Rename", "Rename current file",      btn_rename },
+        { "F2 Search",     "Search files",                btn_find   },
+        { "F3 View",   "View file contents",          btn_view   },
+        { "F4 Editor",     "Open file in editor",        btn_editor },
+        { "SSH",           "Connect via SSH/SFTP",          btn_ssh    },
+        { "F10 Quit",    "Quit application",              btn_quit   },
     };
 
     GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
@@ -995,7 +1100,7 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
         if (state & GDK_CONTROL_MASK) {
             panel_reload(&fm->panels[0]);
             panel_reload(&fm->panels[1]);
-            fm_status(fm, "Panels reloaded");
+            fm_status(fm, "Panels refreshed");
             return TRUE;
         }
         break;
@@ -1076,7 +1181,7 @@ static void on_activate(GtkApplication *app, gpointer data)
 
     /* reload button in header */
     GtkWidget *reload_btn = gtk_button_new_from_icon_name("view-refresh-symbolic");
-    gtk_widget_set_tooltip_text(reload_btn, "Reload both panels (Ctrl+R)");
+    gtk_widget_set_tooltip_text(reload_btn, "Refresh both panels (Ctrl+R)");
     g_signal_connect_swapped(reload_btn, "clicked", G_CALLBACK(panel_reload), &fm->panels[0]);
     g_signal_connect_swapped(reload_btn, "clicked", G_CALLBACK(panel_reload), &fm->panels[1]);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), reload_btn);

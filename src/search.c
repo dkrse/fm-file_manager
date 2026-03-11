@@ -299,7 +299,7 @@ void search_run(FM *fm)
 
     /* info bar */
     GtkWidget *info_box  = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gchar *info_text = g_strdup_printf("Searching  <b>%s</b>  in  %s", pattern, search_dir_path);
+    gchar *info_text = g_strdup_printf("Searching for <b>%s</b> in %s", pattern, search_dir_path);
     GtkWidget *info_lbl  = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(info_lbl), info_text);
     g_free(info_text);
