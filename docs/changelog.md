@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.6.0] — 2026-03-12
+
+### File marking, remote-to-remote copy/move, directory appearance settings, sort fix
+
+**File marking (Insert/Space):**
+- Proper Total Commander-style file marking — independent of GTK selection model
+- Insert / Space toggles mark on current file (colored + bold) and moves cursor down
+- `+` marks/unmarks all files
+- Marked files are used for Copy (F5), Move (F6), Delete (F8); if no marks, cursor item is used
+- Marks survive panel reload but are cleared on directory change or after operations
+- Marks stored in `Panel.marks` (`GHashTable`) — per-panel, persistent across reloads
+- Marked items rendered with configurable color (default red `#D32F2F`)
+- Mark color configurable in Settings → Panels → "Marked files (Insert/Space)"
+- Status bar shows mark count ("N marked | M items")
+
+**Remote→Remote copy/move (SFTP→SFTP):**
+- Copy and move between two different SSH connections now works
+- Implementation: download to temp directory, upload to destination, clean up temp
+- Progress bar tracks both download and upload phases (total bytes × 2)
+- Move additionally deletes source after successful transfer
+
+**Directory appearance in Settings:**
+- New "Directories" section in Settings → Panels tab
+- Configurable directory color (default `#1565C0` blue)
+- Configurable bold/normal font for directories
+- Applied to both local and SFTP panels
+
+**Sort fix — directories always on top:**
+- Directories now stay on top regardless of sort direction (ascending or descending)
+- Implementation: `GtkMultiSorter` with standalone `dirs_first_func` as primary sorter, column view sorter as secondary — direction toggle only affects the secondary sorter
+
+---
+
 ## [2.5.0] — 2026-03-11
 
 ### Recursive SFTP directory operations, SSH dialog and cursor fixes

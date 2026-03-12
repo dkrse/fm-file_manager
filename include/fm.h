@@ -28,6 +28,7 @@ struct _FileItem {
     gint      weight;      /* PangoWeight                     */
     gint64    size_raw;    /* for sorting                     */
     gint64    date_raw;    /* for sorting                     */
+    gboolean  marked;     /* user-toggled mark for ops       */
 };
 
 FileItem *file_item_new(const char *icon_name, const char *name,
@@ -91,6 +92,7 @@ typedef struct {
     SshConn            *ssh_conn;       /* NULL = local panel                 */
     guint               cursor_pos;     /* current cursor position            */
     gboolean            inhibit_sel;    /* TRUE while we scroll/unselect programmatically */
+    GHashTable         *marks;          /* set of marked filenames (survives reload) */
 } Panel;
 
 struct _FM {
@@ -136,6 +138,11 @@ struct _FM {
     gboolean        viewer_syntax_highlight;  /* viewer syntax highlighting   */
     gboolean        viewer_line_numbers;      /* viewer line numbers          */
     gchar          *editor_style_scheme;      /* GtkSourceView style scheme id */
+    /* directory appearance */
+    gchar          *dir_color;                /* hex color for directories      */
+    gboolean        dir_bold;                 /* bold font for directories      */
+    /* mark color */
+    gchar          *mark_color;               /* hex color for marked items     */
 };
 
 /* ── Dialog helper (replaces gtk_dialog_run with GMainLoop) ───────── */

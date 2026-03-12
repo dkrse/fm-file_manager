@@ -526,13 +526,6 @@ void fo_copy(FM *fm)
     Panel *src = active_panel(fm);
     Panel *dst = other_panel(fm);
 
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn && dst->ssh_conn) {
-        fm_status(fm, "Remote→Remote copy is not supported");
-        return;
-    }
-#endif
-
     GList *targets = panel_selection(src);
     if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -552,15 +545,15 @@ void fo_copy(FM *fm)
     gint64 total_bytes = 0;
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn) {
-        /* SSH download: get sizes via SFTP stat (recursive for dirs) */
         for (GList *l = targets; l; l = l->next) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
                                         (const char *)l->data);
             total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
             g_free(rp);
         }
+        /* Remote→Remote: bytes are transferred twice (download + upload) */
+        if (dst->ssh_conn) total_bytes *= 2;
     } else if (dst->ssh_conn) {
-        /* SSH upload: local sizes */
         for (GList *l = targets; l; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
             total_bytes += calc_size_r(sp);
@@ -585,7 +578,31 @@ void fo_copy(FM *fm)
         int r = -1;
 
 #ifdef HAVE_LIBSSH2
-        if (src->ssh_conn) {
+        if (src->ssh_conn && dst->ssh_conn) {
+            /* Remote→Remote: download to temp, then upload */
+            gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
+            if (!tmpdir) { fail++; continue; }
+            gchar *rp_src = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
+            gchar *lp_tmp = g_build_filename(tmpdir, name, NULL);
+            gchar *rp_dst = g_strdup_printf("%s/%s", dest, name);
+            LIBSSH2_SFTP_ATTRIBUTES ra;
+            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp_src, &ra) == 0 &&
+                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
+                r = sftp_download_dir_r(src->ssh_conn, rp_src, lp_tmp, &cp);
+            else
+                r = sftp_download(src->ssh_conn, rp_src, lp_tmp, &cp);
+            if (r == 0) {
+                struct stat tst;
+                if (lstat(lp_tmp, &tst) == 0 && S_ISDIR(tst.st_mode))
+                    r = sftp_upload_dir_r(dst->ssh_conn, lp_tmp, rp_dst, &cp);
+                else
+                    r = sftp_upload(dst->ssh_conn, lp_tmp, rp_dst, &cp);
+            }
+            /* clean up temp */
+            delete_r(lp_tmp, NULL, NULL);
+            rmdir(tmpdir);
+            g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
+        } else if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
             gchar *lp = g_build_filename(dest, name, NULL);
             LIBSSH2_SFTP_ATTRIBUTES ra;
@@ -624,6 +641,7 @@ void fo_copy(FM *fm)
     g_free(dest);
 
     fm_status(fm, "Copied: %d  errors: %d", ok, fail);
+    if (src->marks) g_hash_table_remove_all(src->marks);
 
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn && fail > 0) {
@@ -661,13 +679,6 @@ void fo_move(FM *fm)
     Panel *src = active_panel(fm);
     Panel *dst = other_panel(fm);
 
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn && dst->ssh_conn) {
-        fm_status(fm, "Remote→Remote move is not supported");
-        return;
-    }
-#endif
-
     GList *targets = panel_selection(src);
     if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -693,6 +704,7 @@ void fo_move(FM *fm)
             total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
             g_free(rp);
         }
+        if (dst->ssh_conn) total_bytes *= 2;
     } else if (dst->ssh_conn) {
         for (GList *l = targets; l; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
@@ -718,7 +730,32 @@ void fo_move(FM *fm)
         int r = -1;
 
 #ifdef HAVE_LIBSSH2
-        if (src->ssh_conn) {
+        if (src->ssh_conn && dst->ssh_conn) {
+            /* Remote→Remote: download to temp, upload, delete source */
+            gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
+            if (!tmpdir) { fail++; continue; }
+            gchar *rp_src = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
+            gchar *lp_tmp = g_build_filename(tmpdir, name, NULL);
+            gchar *rp_dst = g_strdup_printf("%s/%s", dest, name);
+            LIBSSH2_SFTP_ATTRIBUTES ra;
+            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp_src, &ra) == 0 &&
+                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
+                r = sftp_download_dir_r(src->ssh_conn, rp_src, lp_tmp, &cp);
+            else
+                r = sftp_download(src->ssh_conn, rp_src, lp_tmp, &cp);
+            if (r == 0) {
+                struct stat tst;
+                if (lstat(lp_tmp, &tst) == 0 && S_ISDIR(tst.st_mode))
+                    r = sftp_upload_dir_r(dst->ssh_conn, lp_tmp, rp_dst, &cp);
+                else
+                    r = sftp_upload(dst->ssh_conn, lp_tmp, rp_dst, &cp);
+            }
+            if (r == 0)
+                sftp_delete_r(src->ssh_conn, rp_src, NULL, NULL);
+            delete_r(lp_tmp, NULL, NULL);
+            rmdir(tmpdir);
+            g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
+        } else if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
             gchar *lp = g_build_filename(dest, name, NULL);
             LIBSSH2_SFTP_ATTRIBUTES ra;
@@ -767,6 +804,7 @@ void fo_move(FM *fm)
     g_free(dest);
 
     fm_status(fm, "Moved: %d  errors: %d", ok, fail);
+    if (src->marks) g_hash_table_remove_all(src->marks);
 
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn && fail > 0) {
@@ -888,6 +926,7 @@ void fo_delete(FM *fm)
     progress_free(pd);
     g_list_free_full(targets, g_free);
     fm_status(fm, "Deleted: %d  errors: %d", ok2, fail);
+    if (p->marks) g_hash_table_remove_all(p->marks);
     panel_reload(p);
 
     /* Restore focus to active panel */

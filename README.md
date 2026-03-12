@@ -7,7 +7,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Two panels** — navigation like in Total Commander
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2)
-- **Copy, move, delete** — F5/F6/F8 with progress bar (byte-level tracking); full recursive directory support over SFTP
+- **File marking** — Insert/Space marks files (colored), `+` marks all; marks used for copy/move/delete
+- **Copy, move, delete** — F5/F6/F8 with progress bar (byte-level tracking); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
 - **File search** — F2, recursive glob search with no result limit
 - **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
@@ -25,8 +26,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Enter | Open file/directory (or confirm path in path entry) |
 | Escape | Cancel path editing (in path entry) |
 | Backspace | Go up one level |
-| Space / Insert | Select + move cursor |
-| + | Select/deselect all |
+| Space / Insert | Mark file + move cursor |
+| + | Mark/unmark all |
 | F2 | Search files |
 | F3 | View file |
 | F4 | Text editor |
@@ -98,7 +99,7 @@ Makefile            — build system
 
 Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear icon):
 
-**Panels** — panel font, GUI font, column widths (name/size/date), hidden files
+**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, directory color and bold, mark color
 
 **Cursor** — style (filled color or outline only), cursor color
 

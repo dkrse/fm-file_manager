@@ -62,16 +62,13 @@ static const char *icon_for_entry(gboolean is_dir, gboolean is_link,
 
 void panel_update_status(Panel *p)
 {
-    GtkBitset *sel = gtk_selection_model_get_selection(
-                         GTK_SELECTION_MODEL(p->selection));
-    guint64 n_sel = gtk_bitset_get_size(sel);
+    guint n_marks = p->marks ? g_hash_table_size(p->marks) : 0;
     guint total = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
-    gtk_bitset_unref(sel);
 
     gchar *msg;
-    if (n_sel > 0)
-        msg = g_strdup_printf("%lu selected  |  %u items",
-                              (unsigned long)n_sel, total > 0 ? total - 1 : 0);
+    if (n_marks > 0)
+        msg = g_strdup_printf("%u marked  |  %u items",
+                              n_marks, total > 0 ? total - 1 : 0);
     else
         msg = g_strdup_printf("%u items", total > 0 ? total - 1 : 0);
     gtk_label_set_text(GTK_LABEL(p->status_label), msg);
@@ -92,35 +89,27 @@ gchar *panel_cursor_name(Panel *p)
 
 GList *panel_selection(Panel *p)
 {
-    GtkBitset *bs = gtk_selection_model_get_selection(
-                        GTK_SELECTION_MODEL(p->selection));
-    guint64 n_sel = gtk_bitset_get_size(bs);
-
-    if (n_sel == 0) {
-        gtk_bitset_unref(bs);
-        gchar *name = panel_cursor_name(p);
-        if (name && strcmp(name, "..") != 0)
-            return g_list_prepend(NULL, name);
-        g_free(name);
-        return NULL;
-    }
-
+    /* Collect marked items */
     GList *result = NULL;
-    GtkBitsetIter iter;
-    guint pos;
-    if (gtk_bitset_iter_init_first(&iter, bs, &pos)) {
-        do {
-            FileItem *item = g_list_model_get_item(
-                                 G_LIST_MODEL(p->sort_model), pos);
+    if (p->marks && g_hash_table_size(p->marks) > 0) {
+        guint count = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+        for (guint i = 0; i < count; i++) {
+            FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
             if (item) {
-                if (strcmp(item->name, "..") != 0)
+                if (item->marked && strcmp(item->name, "..") != 0)
                     result = g_list_prepend(result, g_strdup(item->name));
                 g_object_unref(item);
             }
-        } while (gtk_bitset_iter_next(&iter, &pos));
+        }
+        if (result) return g_list_reverse(result);
     }
-    gtk_bitset_unref(bs);
-    return g_list_reverse(result);  /* O(n) reverse instead of O(n²) append */
+
+    /* No marks → fall back to cursor item */
+    gchar *name = panel_cursor_name(p);
+    if (name && strcmp(name, "..") != 0)
+        return g_list_prepend(NULL, name);
+    g_free(name);
+    return NULL;
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -133,6 +122,10 @@ void panel_load(Panel *p, const char *path)
 
     struct stat st;
     if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+    /* Clear marks when entering a different directory */
+    if (strcmp(p->cwd, path) != 0 && p->marks)
+        g_hash_table_remove_all(p->marks);
 
     /* Suppress selection events during entire load */
     p->inhibit_sel = TRUE;
@@ -150,7 +143,7 @@ void panel_load(Panel *p, const char *path)
     /* ".." entry always first */
     g_ptr_array_add(items,
         file_item_new("go-up-symbolic", "..", "", "",
-                      TRUE, "#1565C0", PANGO_WEIGHT_BOLD,
+                      TRUE, p->fm->dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
                       (gint64)-2, (gint64)0));
 
     if (dir) {
@@ -177,17 +170,19 @@ void panel_load(Panel *p, const char *path)
 
             const gchar *fg = NULL;
             gint         wt = PANGO_WEIGHT_NORMAL;
-            if      (is_dir)  { fg = "#1565C0"; wt = PANGO_WEIGHT_BOLD; }
+            if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
             else if (is_link) { fg = "#7B1FA2"; }
             else if (is_exec) { fg = "#2E7D32"; }
 
             /* file_item_new_take takes ownership of size/date strings */
-            g_ptr_array_add(items,
-                file_item_new_take(icon, de->d_name,
+            FileItem *fi = file_item_new_take(icon, de->d_name,
                               is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
                               fmt_date(fst.st_mtime),
                               is_dir, fg, wt,
-                              (gint64)fst.st_size, (gint64)fst.st_mtime));
+                              (gint64)fst.st_size, (gint64)fst.st_mtime);
+            if (p->marks && g_hash_table_contains(p->marks, de->d_name))
+                fi->marked = TRUE;
+            g_ptr_array_add(items, fi);
         }
         closedir(dir);
     }
@@ -304,12 +299,17 @@ void panel_go_up(Panel *p)
  *  Sort comparators
  * ─────────────────────────────────────────────────────────────────── */
 
-static int sort_base(FileItem *a, FileItem *b)
+/* Directories-first sorter – used as primary in GtkMultiSorter so it is
+ * never affected by the column view's ascending/descending toggle. */
+static int dirs_first_func(gconstpointer a, gconstpointer b, gpointer data)
 {
-    if (strcmp(a->name, "..") == 0) return -1;
-    if (strcmp(b->name, "..") == 0) return  1;
-    if (a->is_dir && !b->is_dir)   return -1;
-    if (!a->is_dir && b->is_dir)   return  1;
+    (void)data;
+    FileItem *fa = FILE_ITEM((gpointer)a);
+    FileItem *fb = FILE_ITEM((gpointer)b);
+    if (strcmp(fa->name, "..") == 0) return -1;
+    if (strcmp(fb->name, "..") == 0) return  1;
+    if (fa->is_dir && !fb->is_dir)  return -1;
+    if (!fa->is_dir && fb->is_dir)  return  1;
     return 0;
 }
 
@@ -318,8 +318,6 @@ static int name_sort_func(gconstpointer a, gconstpointer b, gpointer data)
     (void)data;
     FileItem *fa = FILE_ITEM((gpointer)a);
     FileItem *fb = FILE_ITEM((gpointer)b);
-    int r = sort_base(fa, fb);
-    if (r != 0) return r;
     return g_utf8_collate(fa->name, fb->name);
 }
 
@@ -328,8 +326,6 @@ static int size_sort_func(gconstpointer a, gconstpointer b, gpointer data)
     (void)data;
     FileItem *fa = FILE_ITEM((gpointer)a);
     FileItem *fb = FILE_ITEM((gpointer)b);
-    int r = sort_base(fa, fb);
-    if (r != 0) return r;
     return (fa->size_raw < fb->size_raw) ? -1 : (fa->size_raw > fb->size_raw) ? 1 : 0;
 }
 
@@ -338,8 +334,6 @@ static int date_sort_func(gconstpointer a, gconstpointer b, gpointer data)
     (void)data;
     FileItem *fa = FILE_ITEM((gpointer)a);
     FileItem *fb = FILE_ITEM((gpointer)b);
-    int r = sort_base(fa, fb);
-    if (r != 0) return r;
     return (fa->date_raw < fb->date_raw) ? -1 : (fa->date_raw > fb->date_raw) ? 1 : 0;
 }
 
@@ -363,7 +357,8 @@ static void name_setup(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 
 static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 {
-    (void)f; (void)d;
+    (void)f;
+    Panel     *p     = d;
     GtkWidget *box   = gtk_list_item_get_child(li);
     GtkWidget *image = gtk_widget_get_first_child(box);
     GtkWidget *label = gtk_widget_get_next_sibling(image);
@@ -371,10 +366,12 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 
     gtk_image_set_from_icon_name(GTK_IMAGE(image), item->icon_name);
 
-    if (item->fg_color) {
+    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    gint wt = item->marked ? PANGO_WEIGHT_BOLD : item->weight;
+    if (fg) {
         gchar *markup = g_markup_printf_escaped(
             "<span foreground='%s' weight='%d'>%s</span>",
-            item->fg_color, item->weight, item->name);
+            fg, wt, item->name);
         gtk_label_set_markup(GTK_LABEL(label), markup);
         g_free(markup);
     } else {
@@ -394,13 +391,15 @@ static void size_setup(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 
 static void size_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 {
-    (void)f; (void)d;
+    (void)f;
+    Panel     *p     = d;
     GtkWidget *label = gtk_list_item_get_child(li);
     FileItem  *item  = gtk_list_item_get_item(li);
 
-    if (item->fg_color) {
+    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    if (fg) {
         gchar *markup = g_markup_printf_escaped(
-            "<span foreground='%s'>%s</span>", item->fg_color, item->size);
+            "<span foreground='%s'>%s</span>", fg, item->size);
         gtk_label_set_markup(GTK_LABEL(label), markup);
         g_free(markup);
     } else {
@@ -420,13 +419,15 @@ static void date_setup(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 
 static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 {
-    (void)f; (void)d;
+    (void)f;
+    Panel     *p     = d;
     GtkWidget *label = gtk_list_item_get_child(li);
     FileItem  *item  = gtk_list_item_get_item(li);
 
-    if (item->fg_color) {
+    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    if (fg) {
         gchar *markup = g_markup_printf_escaped(
-            "<span foreground='%s'>%s</span>", item->fg_color, item->date);
+            "<span foreground='%s'>%s</span>", fg, item->date);
         gtk_label_set_markup(GTK_LABEL(label), markup);
         g_free(markup);
     } else {
@@ -566,14 +567,31 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
 
     case GDK_KEY_space:
     case GDK_KEY_Insert: {
-        GtkSelectionModel *sm = GTK_SELECTION_MODEL(p->selection);
-        if (gtk_selection_model_is_selected(sm, p->cursor_pos))
-            gtk_selection_model_unselect_item(sm, p->cursor_pos);
-        else
-            gtk_selection_model_select_item(sm, p->cursor_pos, FALSE);
+        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model),
+                                                p->cursor_pos);
+        if (item && strcmp(item->name, "..") != 0) {
+            item->marked = !item->marked;
+            if (!p->marks)
+                p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+            if (item->marked)
+                g_hash_table_add(p->marks, g_strdup(item->name));
+            else
+                g_hash_table_remove(p->marks, item->name);
+            /* Force re-render: remove and re-insert in store */
+            guint sp;
+            if (g_list_store_find(p->store, item, &sp)) {
+                g_object_ref(item);
+                g_list_store_remove(p->store, sp);
+                g_list_store_insert(p->store, sp, item);
+                g_object_unref(item);
+            }
+        }
+        if (item) g_object_unref(item);
         if (p->cursor_pos < n - 1) p->cursor_pos++;
+        p->inhibit_sel = TRUE;
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
             p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
+        p->inhibit_sel = FALSE;
         panel_update_status(p);
         return TRUE;
     }
@@ -589,15 +607,22 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
 
     case GDK_KEY_plus:
     case GDK_KEY_KP_Add: {
-        GtkSelectionModel *sm = GTK_SELECTION_MODEL(p->selection);
-        GtkBitset *sel = gtk_selection_model_get_selection(sm);
-        guint64 n_sel = gtk_bitset_get_size(sel);
-        gtk_bitset_unref(sel);
-        if (n_sel >= n - 1)
-            gtk_selection_model_unselect_all(sm);
-        else
-            gtk_selection_model_select_all(sm);
-        panel_update_status(p);
+        /* Toggle mark all: if any are marked, unmark all; otherwise mark all */
+        if (!p->marks)
+            p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        gboolean has_marks = g_hash_table_size(p->marks) > 0;
+        if (has_marks) {
+            g_hash_table_remove_all(p->marks);
+        } else {
+            guint count = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+            for (guint i = 0; i < count; i++) {
+                FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+                if (it && strcmp(it->name, "..") != 0)
+                    g_hash_table_add(p->marks, g_strdup(it->name));
+                if (it) g_object_unref(it);
+            }
+        }
+        panel_reload(p);
         return TRUE;
     }
 
@@ -859,6 +884,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
 {
     p->fm  = fm;
     p->idx = idx;
+    p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
     /* outer vertical box */
     p->frame = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
@@ -903,7 +929,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     /* Name column */
     GtkListItemFactory *name_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(name_factory, "setup", G_CALLBACK(name_setup), NULL);
-    g_signal_connect(name_factory, "bind",  G_CALLBACK(name_bind),  NULL);
+    g_signal_connect(name_factory, "bind",  G_CALLBACK(name_bind),  p);
     GtkColumnViewColumn *col_name = gtk_column_view_column_new("Name", name_factory);
     gtk_column_view_column_set_resizable(col_name, TRUE);
     gtk_column_view_column_set_expand(col_name, TRUE);
@@ -917,7 +943,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     /* Size column */
     GtkListItemFactory *size_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(size_factory, "setup", G_CALLBACK(size_setup), NULL);
-    g_signal_connect(size_factory, "bind",  G_CALLBACK(size_bind),  NULL);
+    g_signal_connect(size_factory, "bind",  G_CALLBACK(size_bind),  p);
     GtkColumnViewColumn *col_size = gtk_column_view_column_new("Size", size_factory);
     gtk_column_view_column_set_resizable(col_size, TRUE);
     gtk_column_view_column_set_fixed_width(col_size,
@@ -930,7 +956,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     /* Date column */
     GtkListItemFactory *date_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(date_factory, "setup", G_CALLBACK(date_setup), NULL);
-    g_signal_connect(date_factory, "bind",  G_CALLBACK(date_bind),  NULL);
+    g_signal_connect(date_factory, "bind",  G_CALLBACK(date_bind),  p);
     GtkColumnViewColumn *col_date = gtk_column_view_column_new("Modified", date_factory);
     gtk_column_view_column_set_resizable(col_date, TRUE);
     gtk_column_view_column_set_fixed_width(col_date,
@@ -940,13 +966,16 @@ void panel_setup(Panel *p, FM *fm, int idx)
     g_object_unref(ds);
     gtk_column_view_append_column(GTK_COLUMN_VIEW(p->column_view), col_date);
 
-    /* Sort model + selection model */
+    /* Sort model: dirs-first (always) + column sort (respects asc/desc) */
     GtkSorter *cv_sorter = gtk_column_view_get_sorter(
                                GTK_COLUMN_VIEW(p->column_view));
+    GtkMultiSorter *multi = gtk_multi_sorter_new();
+    gtk_multi_sorter_append(multi,
+        GTK_SORTER(gtk_custom_sorter_new(dirs_first_func, NULL, NULL)));
+    gtk_multi_sorter_append(multi, g_object_ref(cv_sorter));
     p->sort_model = gtk_sort_list_model_new(
         g_object_ref(G_LIST_MODEL(p->store)),
-        g_object_ref(cv_sorter));
-    /* Incremental sort: UI stays responsive during large-directory loads */
+        GTK_SORTER(multi));
     gtk_sort_list_model_set_incremental(p->sort_model, FALSE);
     p->selection = gtk_multi_selection_new(
         g_object_ref(G_LIST_MODEL(p->sort_model)));

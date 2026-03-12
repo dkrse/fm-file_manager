@@ -46,14 +46,14 @@ Each `Panel` has:
 - `cursor_pos` — manual cursor position tracking
 - `inhibit_sel` — flag preventing `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
 
-**Sort:** Always `..` first, then directories, then files. Within each group by active column.
+**Sort:** Always `..` first, then directories, then files (enforced via `GtkMultiSorter`: a standalone `dirs_first_func` sorter as primary, column view sorter as secondary — direction toggle never affects directory-first ordering). Within each group by active column.
 
-**Selection:** `panel_selection()` returns GTK multi-selection if rows are selected, otherwise falls back to cursor row (TC style).
+**Marking:** Files/directories are marked via Insert/Space (toggle) or `+` (all). Marks are stored in `Panel.marks` (`GHashTable<gchar*,NULL>`) — independent of GTK selection model. Marks survive panel reload but are cleared on directory change or after file operations (copy/move/delete). `panel_selection()` returns marked items if any exist, otherwise falls back to cursor row (TC style). Marked items are rendered with configurable `mark_color` (default red `#D32F2F`), bold.
 
 ## Key handling hierarchy
 
 1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (skipped if `GtkEntry` has focus)
-2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (select toggle), Backspace (go up), Enter (activate), `+` (select all)
+2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+` (mark/unmark all)
 3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
 
 ## Dialog pattern
@@ -127,11 +127,15 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `show_hidden` | Hidden files |
 | `terminal_app` | Terminal emulator |
 | `cursor_color`, `cursor_outline` | Cursor style |
+| `dir_color`, `dir_bold` | Directory appearance (color, bold) |
+| `mark_color` | Marked files color |
 | `viewer_font_family`, `viewer_font_size` | Viewer font |
 | `editor_font_family`, `editor_font_size` | Editor text font |
 | `editor_gui_font_family`, `editor_gui_font_size` | Editor GUI font |
 | `editor_line_numbers`, `editor_linenum_font_size` | Line numbers |
 | `syntax_highlight` | Syntax highlighting enabled |
+| `viewer_syntax_highlight` | Viewer syntax highlighting |
+| `viewer_line_numbers` | Viewer line numbers |
 | `editor_style_scheme` | Color scheme (GtkSourceView) |
 
 ## Dependencies
@@ -155,4 +159,6 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - `EditorCtx.filepath` is NULL for SFTP editing; `EditorCtx.remote_path` is NULL for local — always use `title = remote_path ?: filepath`
 - `do_path_activate`: text from `gtk_editable_get_text` must be copied (`g_strdup`) before calling `panel_load`, because it modifies the entry and invalidates the internal buffer
 - SFTP directory operations: `sftp_upload_dir_r` / `sftp_download_dir_r` recurse locally/remotely; `sftp_delete_r` walks remote dirs depth-first
+- Remote→Remote (SFTP→SFTP) copy/move: download to temp dir (`g_dir_make_tmp`), upload to destination, clean up temp; progress tracks both phases (total_bytes × 2)
+- Mark re-render: Insert/Space uses `g_list_store_find` + `g_object_ref` + remove + insert to force view re-bind; `+` (all) uses `panel_reload` (marks survive in hash table)
 - `ssh_dlg_dropdown_fill` must be called AFTER all form entry widgets are created (otherwise `ssh_dlg_fill_form` writes to NULL widgets)

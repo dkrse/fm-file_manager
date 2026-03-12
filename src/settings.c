@@ -37,6 +37,11 @@
 #define KEY_VIEWER_LINE_NUMBERS      "viewer_line_numbers"
 #define KEY_STYLE_SCHEME         "editor_style_scheme"
 #define DEFAULT_STYLE_SCHEME     "classic"
+#define KEY_DIR_COLOR            "dir_color"
+#define KEY_DIR_BOLD             "dir_bold"
+#define DEFAULT_DIR_COLOR        "#1565C0"
+#define KEY_MARK_COLOR           "mark_color"
+#define DEFAULT_MARK_COLOR       "#D32F2F"
 
 #define DEFAULT_TERMINAL       "gnome-terminal"
 #define DEFAULT_CURSOR_COLOR   "#1A73E8"
@@ -315,6 +320,24 @@ void settings_load(FM *fm)
         fm->editor_style_scheme = g_strdup(DEFAULT_STYLE_SCHEME);
     }
 
+    g_free(fm->dir_color);
+    fm->dir_color = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_DIR_COLOR, NULL);
+    if (!fm->dir_color || !fm->dir_color[0]) {
+        g_free(fm->dir_color);
+        fm->dir_color = g_strdup(DEFAULT_DIR_COLOR);
+    }
+
+    GError *dberr = NULL;
+    fm->dir_bold = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_DIR_BOLD, &dberr);
+    if (dberr) { g_clear_error(&dberr); fm->dir_bold = TRUE; }
+
+    g_free(fm->mark_color);
+    fm->mark_color = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_MARK_COLOR, NULL);
+    if (!fm->mark_color || !fm->mark_color[0]) {
+        g_free(fm->mark_color);
+        fm->mark_color = g_strdup(DEFAULT_MARK_COLOR);
+    }
+
     g_key_file_free(kf);
 
     apply_font_css(fm);
@@ -373,6 +396,11 @@ void settings_save(FM *fm)
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_LINE_NUMBERS, fm->viewer_line_numbers);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_STYLE_SCHEME,
                           fm->editor_style_scheme ? fm->editor_style_scheme : DEFAULT_STYLE_SCHEME);
+    g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_DIR_COLOR,
+                          fm->dir_color ? fm->dir_color : DEFAULT_DIR_COLOR);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_DIR_BOLD, fm->dir_bold);
+    g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_MARK_COLOR,
+                          fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
 
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {
@@ -615,6 +643,48 @@ void settings_dialog(FM *fm)
     GtkWidget *chk_hidden = gtk_check_button_new_with_label("Show hidden files");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hidden), fm->show_hidden);
     gtk_grid_attach(GTK_GRID(g1), chk_hidden, 0, row++, 2, 1);
+
+    /* ── Directory appearance ── */
+    GtkWidget *hdr_dir = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr_dir), "<b>Directories</b>");
+    gtk_widget_set_halign(hdr_dir, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(hdr_dir, 10);
+    gtk_grid_attach(GTK_GRID(g1), hdr_dir, 0, row++, 2, 1);
+
+    GtkWidget *lbl_dcolor = gtk_label_new("Color:");
+    gtk_widget_set_halign(lbl_dcolor, GTK_ALIGN_END);
+    GdkRGBA dir_rgba = {0};
+    gdk_rgba_parse(&dir_rgba, fm->dir_color ? fm->dir_color : DEFAULT_DIR_COLOR);
+    GtkColorDialog *dir_cdiag = gtk_color_dialog_new();
+    gtk_color_dialog_set_with_alpha(dir_cdiag, FALSE);
+    GtkWidget *dir_color_btn = gtk_color_dialog_button_new(dir_cdiag);
+    gtk_color_dialog_button_set_rgba(GTK_COLOR_DIALOG_BUTTON(dir_color_btn), &dir_rgba);
+    gtk_widget_set_hexpand(dir_color_btn, TRUE);
+    gtk_grid_attach(GTK_GRID(g1), lbl_dcolor,    0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g1), dir_color_btn, 1, row++, 1, 1);
+
+    GtkWidget *chk_dir_bold = gtk_check_button_new_with_label("Bold font");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_dir_bold), fm->dir_bold);
+    gtk_grid_attach(GTK_GRID(g1), chk_dir_bold, 0, row++, 2, 1);
+
+    /* ── Mark color ── */
+    GtkWidget *hdr_mark = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr_mark), "<b>Marked files (Insert/Space)</b>");
+    gtk_widget_set_halign(hdr_mark, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(hdr_mark, 10);
+    gtk_grid_attach(GTK_GRID(g1), hdr_mark, 0, row++, 2, 1);
+
+    GtkWidget *lbl_mcolor = gtk_label_new("Color:");
+    gtk_widget_set_halign(lbl_mcolor, GTK_ALIGN_END);
+    GdkRGBA mark_rgba = {0};
+    gdk_rgba_parse(&mark_rgba, fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
+    GtkColorDialog *mark_cdiag = gtk_color_dialog_new();
+    gtk_color_dialog_set_with_alpha(mark_cdiag, FALSE);
+    GtkWidget *mark_color_btn = gtk_color_dialog_button_new(mark_cdiag);
+    gtk_color_dialog_button_set_rgba(GTK_COLOR_DIALOG_BUTTON(mark_color_btn), &mark_rgba);
+    gtk_widget_set_hexpand(mark_color_btn, TRUE);
+    gtk_grid_attach(GTK_GRID(g1), lbl_mcolor,     0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g1), mark_color_btn,  1, row++, 1, 1);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g1,
                              gtk_label_new("Panels"));
@@ -887,6 +957,35 @@ void settings_dialog(FM *fm)
 
         /* show hidden */
         fm->show_hidden = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_hidden));
+
+        /* directory appearance */
+        {
+            const GdkRGBA *drgba =
+                gtk_color_dialog_button_get_rgba(GTK_COLOR_DIALOG_BUTTON(dir_color_btn));
+            g_free(fm->dir_color);
+            if (drgba)
+                fm->dir_color = g_strdup_printf("#%02x%02x%02x",
+                    (int)(drgba->red   * 255 + 0.5),
+                    (int)(drgba->green * 255 + 0.5),
+                    (int)(drgba->blue  * 255 + 0.5));
+            else
+                fm->dir_color = g_strdup(DEFAULT_DIR_COLOR);
+        }
+        fm->dir_bold = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_dir_bold));
+
+        /* mark color */
+        {
+            const GdkRGBA *mrgba =
+                gtk_color_dialog_button_get_rgba(GTK_COLOR_DIALOG_BUTTON(mark_color_btn));
+            g_free(fm->mark_color);
+            if (mrgba)
+                fm->mark_color = g_strdup_printf("#%02x%02x%02x",
+                    (int)(mrgba->red   * 255 + 0.5),
+                    (int)(mrgba->green * 255 + 0.5),
+                    (int)(mrgba->blue  * 255 + 0.5));
+            else
+                fm->mark_color = g_strdup(DEFAULT_MARK_COLOR);
+        }
 
         /* terminal */
         const gchar *term_txt = gtk_editable_get_text(GTK_EDITABLE(entry_term));

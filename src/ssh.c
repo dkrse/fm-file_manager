@@ -185,6 +185,10 @@ void panel_load_remote(Panel *p, const char *path)
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
 
+    /* Clear marks when entering a different directory */
+    if (conn->remote_path && strcmp(conn->remote_path, path) != 0 && p->marks)
+        g_hash_table_remove_all(p->marks);
+
     /* Suppress selection events during load */
     p->inhibit_sel = TRUE;
 
@@ -213,7 +217,7 @@ void panel_load_remote(Panel *p, const char *path)
     /* ".." entry */
     g_ptr_array_add(items,
         file_item_new("go-up-symbolic", "..", "", "",
-                      TRUE, "#1565C0", PANGO_WEIGHT_BOLD,
+                      TRUE, p->fm->dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
                       (gint64)-2, (gint64)0));
 
     char name_buf[512];
@@ -244,16 +248,18 @@ void panel_load_remote(Panel *p, const char *path)
 
         const gchar *fg = NULL;
         gint         wt = PANGO_WEIGHT_NORMAL;
-        if      (is_dir)  { fg = "#1565C0"; wt = PANGO_WEIGHT_BOLD; }
+        if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
         else if (is_link) { fg = "#7B1FA2"; }
         else if (is_exec) { fg = "#2E7D32"; }
 
         /* file_item_new_take takes ownership of size/date strings */
-        g_ptr_array_add(items,
-            file_item_new_take(icon, name_buf,
+        FileItem *fi = file_item_new_take(icon, name_buf,
                                is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
                                fmt_date(mtime),
-                               is_dir, fg, wt, size_raw, mtime));
+                               is_dir, fg, wt, size_raw, mtime);
+        if (p->marks && g_hash_table_contains(p->marks, name_buf))
+            fi->marked = TRUE;
+        g_ptr_array_add(items, fi);
     }
     libssh2_sftp_closedir(handle);
 
