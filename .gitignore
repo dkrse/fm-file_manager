@@ -21,3 +21,5 @@ core
 # Backup files
 *.bak
 *.orig
+# Vibe Coder project data
+.LLM/
