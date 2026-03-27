@@ -469,19 +469,26 @@ static void activate_item(Panel *p)
             gchar *data = ssh_read_file(p->ssh_conn, remote_path, &len);
             g_free(remote_path);
             if (data && len > 0) {
-                gchar *tmp = g_build_filename(g_get_tmp_dir(), name, NULL);
-                if (g_file_set_contents(tmp, data, (gssize)len, NULL)) {
-                    gchar *uri = g_filename_to_uri(tmp, NULL, NULL);
-                    if (uri) {
-                        gtk_show_uri(GTK_WINDOW(p->fm->window),
-                            uri, GDK_CURRENT_TIME);
-                        g_free(uri);
+                /* Create unique temp dir to prevent symlink attacks */
+                gchar *tmpdir = g_dir_make_tmp("fm-view-XXXXXX", NULL);
+                if (tmpdir) {
+                    gchar *tmp = g_build_filename(tmpdir, name, NULL);
+                    if (g_file_set_contents(tmp, data, (gssize)len, NULL)) {
+                        gchar *uri = g_filename_to_uri(tmp, NULL, NULL);
+                        if (uri) {
+                            gtk_show_uri(GTK_WINDOW(p->fm->window),
+                                uri, GDK_CURRENT_TIME);
+                            g_free(uri);
+                        }
+                        fm_status(p->fm, "Opened: %s", name);
+                    } else {
+                        fm_status(p->fm, "Error writing to temp directory");
                     }
-                    fm_status(p->fm, "Opened: %s", name);
+                    g_free(tmp);
+                    g_free(tmpdir);
                 } else {
-                    fm_status(p->fm, "Error writing to /tmp");
+                    fm_status(p->fm, "Error creating temp directory");
                 }
-                g_free(tmp);
             } else {
                 fm_status(p->fm, "Error downloading '%s'", name);
             }
@@ -810,20 +817,20 @@ static void on_terminal_clicked(GtkButton *btn, Panel *p)
     const char *term = p->fm->terminal_app;
     if (!term || !term[0]) term = "gnome-terminal";
 
-    gchar *cmd = NULL;
-
     if (p->ssh_conn) {
         const char *rpath = p->ssh_conn->remote_path;
 
-        /* ssh command to cd into remote dir and stay in shell */
+        /* Shell-quote remote path to prevent command injection */
+        gchar *quoted_path = g_shell_quote(rpath);
         gchar *sh_cmd = (p->ssh_conn->port != 22)
             ? g_strdup_printf("ssh -t -p %d %s@%s 'cd %s && exec $SHELL -l'",
                               p->ssh_conn->port,
-                              p->ssh_conn->user, p->ssh_conn->host, rpath)
+                              p->ssh_conn->user, p->ssh_conn->host, quoted_path)
             : g_strdup_printf("ssh -t %s@%s 'cd %s && exec $SHELL -l'",
-                              p->ssh_conn->user, p->ssh_conn->host, rpath);
+                              p->ssh_conn->user, p->ssh_conn->host, quoted_path);
+        g_free(quoted_path);
 
-        /* Universal: term ... bash -c "ssh_cmd" — works with any terminal */
+        /* Use argv array — no shell parsing, no injection */
         const gchar *argv[7];
         int a = 0;
         argv[a++] = term;
@@ -847,27 +854,37 @@ static void on_terminal_clicked(GtkButton *btn, Panel *p)
         g_free(sh_cmd);
         return;
     }
-    {
-        /* Local terminal in current directory */
-        if (strstr(term, "ptyxis"))
-            cmd = g_strdup_printf("%s --new-window -d %s", term, p->cwd);
-        else if (strstr(term, "gnome-terminal") || strstr(term, "mate-terminal"))
-            cmd = g_strdup_printf("%s --working-directory=%s", term, p->cwd);
-        else if (strstr(term, "konsole"))
-            cmd = g_strdup_printf("%s --workdir %s", term, p->cwd);
-        else if (strstr(term, "xfce4-terminal"))
-            cmd = g_strdup_printf("%s --default-working-directory=%s", term, p->cwd);
-        else
-            cmd = g_strdup_printf("%s", term);
-    }
 
-    GError *err = NULL;
-    if (!g_spawn_command_line_async(cmd, &err)) {
-        fm_status(p->fm, "Failed to open terminal: %s",
-                  err ? err->message : "?");
-        g_clear_error(&err);
+    /* Local terminal — use g_spawn_async with argv to prevent injection */
+    {
+        const gchar *argv[5];
+        int a = 0;
+        argv[a++] = term;
+        if (strstr(term, "ptyxis")) {
+            argv[a++] = "--new-window";
+            argv[a++] = "-d";
+            argv[a++] = p->cwd;
+        } else if (strstr(term, "gnome-terminal") || strstr(term, "mate-terminal")) {
+            argv[a++] = "--working-directory";
+            argv[a++] = p->cwd;
+        } else if (strstr(term, "konsole")) {
+            argv[a++] = "--workdir";
+            argv[a++] = p->cwd;
+        } else if (strstr(term, "xfce4-terminal")) {
+            argv[a++] = "--default-working-directory";
+            argv[a++] = p->cwd;
+        }
+        argv[a] = NULL;
+
+        GError *err = NULL;
+        if (!g_spawn_async(p->cwd, (gchar **)argv, NULL,
+                           G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                           NULL, NULL, NULL, &err)) {
+            fm_status(p->fm, "Failed to open terminal: %s",
+                      err ? err->message : "?");
+            g_clear_error(&err);
+        }
     }
-    g_free(cmd);
 }
 
 static void on_home_clicked(GtkButton *btn, Panel *p)

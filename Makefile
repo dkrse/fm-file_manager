@@ -58,23 +58,55 @@ SRCS   := $(SRCDIR)/main.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
           $(SRCDIR)/viewer.c $(SRCDIR)/editor.c $(SRCDIR)/highlight.c
 OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 TARGET := fm
+BIN    := $(BUILDDIR)/$(TARGET)
 
-.PHONY: all clean install
+.PHONY: all clean install user-install uninstall
 
-all: $(BUILDDIR) $(TARGET)
+all: $(BIN)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(TARGET): $(OBJS)
+$(BIN): $(OBJS)
 	$(CC) $(OBJS) -o $@ $(LIBS)
-	@echo "Done: ./$(TARGET)"
+	@echo "Done: $(BIN)"
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/fm.h
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/fm.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(BUILDDIR)
 
-install: $(TARGET)
-	install -Dm755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
+PREFIX  ?= /usr/local
+DATADIR ?= $(PREFIX)/share
+
+install: $(BIN)
+	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	install -Dm644 data/sk.km.fm.desktop $(DESTDIR)$(DATADIR)/applications/sk.km.fm.desktop
+	install -Dm644 data/icons/hicolor/scalable/apps/sk.km.fm.svg $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/sk.km.fm.svg
+	@for size in 16 24 32 48 64 128 256; do \
+		install -Dm644 data/icons/hicolor/$${size}x$${size}/apps/sk.km.fm.png \
+			$(DESTDIR)$(DATADIR)/icons/hicolor/$${size}x$${size}/apps/sk.km.fm.png; \
+	done
+	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null
+	@echo "Installed: $(DESTDIR)$(PREFIX)/bin/$(TARGET)"
+
+user-install: $(BIN)
+	install -Dm755 $(BIN) $(HOME)/.local/bin/$(TARGET)
+	install -Dm644 data/sk.km.fm.desktop $(HOME)/.local/share/applications/sk.km.fm.desktop
+	install -Dm644 data/icons/hicolor/scalable/apps/sk.km.fm.svg $(HOME)/.local/share/icons/hicolor/scalable/apps/sk.km.fm.svg
+	@for size in 16 24 32 48 64 128 256; do \
+		install -Dm644 data/icons/hicolor/$${size}x$${size}/apps/sk.km.fm.png \
+			$(HOME)/.local/share/icons/hicolor/$${size}x$${size}/apps/sk.km.fm.png; \
+	done
+	-gtk-update-icon-cache -f -t $(HOME)/.local/share/icons/hicolor 2>/dev/null
+	@echo "Installed for user: $(HOME)/.local/bin/$(TARGET)"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	rm -f $(DESTDIR)$(DATADIR)/applications/sk.km.fm.desktop
+	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/sk.km.fm.svg
+	@for size in 16 24 32 48 64 128 256; do \
+		rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/$${size}x$${size}/apps/sk.km.fm.png; \
+	done
+	-gtk-update-icon-cache -f -t $(DESTDIR)$(DATADIR)/icons/hicolor 2>/dev/null

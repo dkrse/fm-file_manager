@@ -9,15 +9,64 @@
 
 #define COPY_BUF (256 * 1024)
 
+/* ── Path traversal guard ─────────────────────────────────────────── */
+
+/* Reject filenames that could escape the target directory */
+static gboolean name_is_safe(const char *name)
+{
+    if (!name || !name[0]) return FALSE;
+    if (strcmp(name, "..") == 0) return FALSE;
+    if (strchr(name, '/') != NULL) return FALSE;
+    if (strstr(name, "..") != NULL) return FALSE;
+    return TRUE;
+}
+
 /* ─────────────────────────────────────────────────────────────────── *
- *  Progress dialog (GTK4 – custom window + GMainLoop)
+ *  Progress dialog (GTK4 – custom window + auto-pulse timer)
+ *
+ *  Two modes:
+ *   - Indeterminate: auto-pulsing bar (for scanning / calculating)
+ *   - Determinate:   fraction 0..1 with percentage text
+ *
+ *  progress_new()        → creates in indeterminate mode
+ *  progress_set_phase()  → change the phase label (e.g. "Calculating…")
+ *  progress_set_total()  → switch to determinate mode
+ *  progress_tick()       → add bytes, update bar + speed display
+ *  progress_set_file()   → set current filename being processed
+ *  progress_pulse()      → manual pulse (for delete counters etc.)
+ *  progress_free()       → destroy window + stop timer
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef struct {
     GtkWidget *window;
-    GtkWidget *label;
+    GtkWidget *phase_lbl;    /* "Calculating…" / "Copying…" */
+    GtkWidget *file_lbl;     /* current filename */
     GtkWidget *bar;
+    GtkWidget *detail_lbl;   /* "1.2 MB / 5.0 MB  —  2.3 MB/s" */
+    guint      pulse_id;     /* auto-pulse timer source id */
+    gint64     total_bytes;
+    gint64     done_bytes;
+    gint64     start_time;   /* g_get_monotonic_time at start */
+    gboolean   determinate;
+    gboolean   cancelled;    /* TRUE after user clicks Cancel */
 } ProgressDlg;
+
+static gboolean pulse_tick(gpointer data)
+{
+    ProgressDlg *pd = data;
+    if (!pd->determinate) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
+        while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_progress_cancel(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    ProgressDlg *pd = data;
+    pd->cancelled = TRUE;
+}
 
 static ProgressDlg *progress_new(GtkWindow *parent, const char *title)
 {
@@ -27,43 +76,131 @@ static ProgressDlg *progress_new(GtkWindow *parent, const char *title)
     gtk_window_set_modal(GTK_WINDOW(pd->window), TRUE);
     gtk_window_set_transient_for(GTK_WINDOW(pd->window), parent);
     gtk_window_set_resizable(GTK_WINDOW(pd->window), FALSE);
-    gtk_window_set_default_size(GTK_WINDOW(pd->window), 400, -1);
+    gtk_window_set_default_size(GTK_WINDOW(pd->window), 420, -1);
     gtk_window_set_deletable(GTK_WINDOW(pd->window), FALSE);
 
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_margin_start(vbox, 16);
     gtk_widget_set_margin_end(vbox, 16);
-    gtk_widget_set_margin_top(vbox, 16);
-    gtk_widget_set_margin_bottom(vbox, 16);
+    gtk_widget_set_margin_top(vbox, 14);
+    gtk_widget_set_margin_bottom(vbox, 14);
 
-    pd->label = gtk_label_new("");
-    gtk_widget_set_halign(pd->label, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(pd->label), PANGO_ELLIPSIZE_MIDDLE);
+    pd->phase_lbl = gtk_label_new(title);
+    gtk_widget_set_halign(pd->phase_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(pd->phase_lbl), PANGO_ELLIPSIZE_MIDDLE);
+
+    pd->file_lbl = gtk_label_new("");
+    gtk_widget_set_halign(pd->file_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(pd->file_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_add_css_class(pd->file_lbl, "dim-label");
+
     pd->bar = gtk_progress_bar_new();
-    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(pd->bar), TRUE);
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(pd->bar), FALSE);
+    gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(pd->bar), 0.03);
 
-    gtk_box_append(GTK_BOX(vbox), pd->label);
+    pd->detail_lbl = gtk_label_new("");
+    gtk_widget_set_halign(pd->detail_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(pd->detail_lbl), PANGO_ELLIPSIZE_END);
+
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
+    gtk_widget_set_halign(cancel_btn, GTK_ALIGN_END);
+    gtk_widget_set_margin_top(cancel_btn, 4);
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_progress_cancel), pd);
+
+    gtk_box_append(GTK_BOX(vbox), pd->phase_lbl);
+    gtk_box_append(GTK_BOX(vbox), pd->file_lbl);
     gtk_box_append(GTK_BOX(vbox), pd->bar);
+    gtk_box_append(GTK_BOX(vbox), pd->detail_lbl);
+    gtk_box_append(GTK_BOX(vbox), cancel_btn);
     gtk_window_set_child(GTK_WINDOW(pd->window), vbox);
+
+    pd->determinate = FALSE;
+    pd->cancelled   = FALSE;
+    pd->start_time  = g_get_monotonic_time();
+
+    /* Auto-pulse every 80ms — keeps the bar animated during blocking work */
+    pd->pulse_id = g_timeout_add(80, pulse_tick, pd);
+
     gtk_window_present(GTK_WINDOW(pd->window));
-    /* pump event loop so the window actually renders before first update */
     while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
     return pd;
 }
 
-static void progress_update(ProgressDlg *pd, const char *text, double frac)
+static void progress_set_phase(ProgressDlg *pd, const char *phase)
 {
-    gtk_label_set_text(GTK_LABEL(pd->label), text);
-    double f = CLAMP(frac, 0.0, 1.0);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), f);
-    gchar *pct = g_strdup_printf("%.0f %%", f * 100.0);
+    gtk_label_set_text(GTK_LABEL(pd->phase_lbl), phase);
+    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+}
+
+static void progress_set_file(ProgressDlg *pd, const char *name)
+{
+    gtk_label_set_text(GTK_LABEL(pd->file_lbl), name ? name : "");
+    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+}
+
+static void progress_set_total(ProgressDlg *pd, gint64 total)
+{
+    pd->total_bytes = total;
+    pd->done_bytes  = 0;
+    pd->determinate = TRUE;
+    pd->start_time  = g_get_monotonic_time();
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), 0.0);
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(pd->bar), TRUE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), "0 %");
+}
+
+static void progress_tick(ProgressDlg *pd, gint64 chunk)
+{
+    pd->done_bytes += chunk;
+    double frac = pd->total_bytes > 0
+                  ? (double)pd->done_bytes / pd->total_bytes : 0.0;
+    frac = CLAMP(frac, 0.0, 1.0);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), frac);
+
+    gchar *pct = g_strdup_printf("%.0f %%", frac * 100.0);
     gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), pct);
     g_free(pct);
+
+    /* Speed + transferred / total */
+    gchar *s_done  = fmt_size(pd->done_bytes);
+    gchar *s_total = fmt_size(pd->total_bytes);
+    gint64 elapsed = g_get_monotonic_time() - pd->start_time;
+    if (elapsed > 500000) {  /* show speed after 0.5s */
+        double speed = (double)pd->done_bytes / (elapsed / 1e6);
+        gchar *s_speed = fmt_size((goffset)speed);
+        gchar *detail = g_strdup_printf("%s / %s  —  %s/s", s_done, s_total, s_speed);
+        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
+        g_free(detail); g_free(s_speed);
+    } else {
+        gchar *detail = g_strdup_printf("%s / %s", s_done, s_total);
+        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
+        g_free(detail);
+    }
+    g_free(s_done); g_free(s_total);
+
     while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+}
+
+static void progress_pulse(ProgressDlg *pd, const char *detail)
+{
+    if (pd->determinate) return;
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
+    if (detail)
+        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
+    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+}
+
+static void progress_finish(ProgressDlg *pd)
+{
+    pd->determinate = TRUE;   /* stop auto-pulse from overwriting */
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), 1.0);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), "100 %");
+    progress_set_phase(pd, "Done");
 }
 
 static void progress_free(ProgressDlg *pd)
 {
+    if (pd->pulse_id) g_source_remove(pd->pulse_id);
     gtk_window_destroy(GTK_WINDOW(pd->window));
     g_free(pd);
 }
@@ -83,21 +220,25 @@ static void cp_tick(CopyProgress *cp, gint64 chunk)
 {
     if (!cp || !cp->pd) return;
     cp->done_bytes += chunk;
-    double frac = cp->total_bytes > 0
-                  ? (double)cp->done_bytes / cp->total_bytes : 0.0;
-    gchar *s_done = fmt_size(cp->done_bytes);
-    gchar *s_total = fmt_size(cp->total_bytes);
-    gchar *msg = g_strdup_printf("%s  (%s / %s)",
-        cp->current_name ? cp->current_name : "", s_done, s_total);
-    progress_update(cp->pd, msg, frac);
-    g_free(msg); g_free(s_done); g_free(s_total);
+    progress_set_file(cp->pd, cp->current_name);
+    progress_tick(cp->pd, chunk);
 }
 
-static gint64 calc_size_r(const char *path)
+/* Shared scan counter — pumps GTK events every N files so the pulse
+ * timer keeps the progress bar animated during size calculation. */
+static int scan_counter;
+
+static gint64 calc_size_r(const char *path, ProgressDlg *pd)
 {
+    if (pd && pd->cancelled) return 0;
+
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
-    if (!S_ISDIR(st.st_mode)) return st.st_size;
+    if (!S_ISDIR(st.st_mode)) {
+        if (pd && (++scan_counter & 127) == 0)
+            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+        return st.st_size;
+    }
 
     gint64 total = 0;
     DIR *dir = opendir(path);
@@ -105,14 +246,18 @@ static gint64 calc_size_r(const char *path)
     struct dirent *de;
     char sub[4096];
     while ((de = readdir(dir)) != NULL) {
+        if (pd && pd->cancelled) break;
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
         g_snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-        total += calc_size_r(sub);
+        total += calc_size_r(sub, pd);
     }
     closedir(dir);
     return total;
 }
+
+/* Cancel return code — distinguishable from I/O errors */
+#define ERR_CANCELLED 2
 
 static int copy_file(const char *src, const char *dst, CopyProgress *cp)
 {
@@ -129,6 +274,7 @@ static int copy_file(const char *src, const char *dst, CopyProgress *cp)
     ssize_t n;
     int err = 0;
     while ((n = read(fin, buf, COPY_BUF)) > 0) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         ssize_t w = 0;
         while (w < n) {
             ssize_t r = write(fout, buf + w, (size_t)(n - w));
@@ -138,10 +284,11 @@ static int copy_file(const char *src, const char *dst, CopyProgress *cp)
         if (err) break;
         cp_tick(cp, n);
     }
-    if (n < 0) err = -1;
+    if (n < 0 && !err) err = -1;
     g_free(buf);
     close(fin);
     close(fout);
+    if (err == ERR_CANCELLED) unlink(dst);   /* clean up partial file */
     return err;
 }
 
@@ -157,13 +304,14 @@ static int copy_dir_r(const char *src, const char *dst, CopyProgress *cp)
     struct stat st;
     int err = 0;
 
-    while ((de = readdir(dir)) != NULL) {
+    while ((de = readdir(dir)) != NULL && !err) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
         g_snprintf(sp, sizeof(sp), "%s/%s", src, de->d_name);
         g_snprintf(dp, sizeof(dp), "%s/%s", dst, de->d_name);
         if (lstat(sp, &st) != 0) continue;
-        err |= S_ISDIR(st.st_mode) ? copy_dir_r(sp, dp, cp) : copy_file(sp, dp, cp);
+        err = S_ISDIR(st.st_mode) ? copy_dir_r(sp, dp, cp) : copy_file(sp, dp, cp);
     }
     closedir(dir);
     return err;
@@ -171,6 +319,8 @@ static int copy_dir_r(const char *src, const char *dst, CopyProgress *cp)
 
 static int delete_r(const char *path, ProgressDlg *pd, int *del_count)
 {
+    if (pd && pd->cancelled) return ERR_CANCELLED;
+
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
     if (!S_ISDIR(st.st_mode)) {
@@ -179,10 +329,8 @@ static int delete_r(const char *path, ProgressDlg *pd, int *del_count)
             (*del_count)++;
             if (*del_count % 50 == 0) {
                 gchar *msg = g_strdup_printf("Deleted: %d files", *del_count);
-                gtk_label_set_text(GTK_LABEL(pd->label), msg);
+                progress_pulse(pd, msg);
                 g_free(msg);
-                gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
-                while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
             }
         }
         return r;
@@ -193,13 +341,16 @@ static int delete_r(const char *path, ProgressDlg *pd, int *del_count)
 
     struct dirent *de;
     char sub[4096];
-    while ((de = readdir(dir)) != NULL) {
+    int err = 0;
+    while ((de = readdir(dir)) != NULL && !err) {
+        if (pd && pd->cancelled) { err = ERR_CANCELLED; break; }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
         g_snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-        delete_r(sub, pd, del_count);
+        err = delete_r(sub, pd, del_count);
     }
     closedir(dir);
+    if (err == ERR_CANCELLED) return err;
     return rmdir(path);
 }
 
@@ -227,6 +378,7 @@ static int sftp_upload(SshConn *conn, const char *local_path,
     ssize_t n;
     int err = 0;
     while ((n = read(fin, buf, COPY_BUF)) > 0) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         ssize_t w = 0;
         while (w < n) {
             ssize_t r = libssh2_sftp_write(fout, buf + w, (size_t)(n - w));
@@ -236,7 +388,7 @@ static int sftp_upload(SshConn *conn, const char *local_path,
         if (err) break;
         cp_tick(cp, n);
     }
-    if (n < 0) err = -1;
+    if (n < 0 && !err) err = -1;
     g_free(buf);
     close(fin);
     libssh2_sftp_close(fout);
@@ -259,6 +411,7 @@ static int sftp_download(SshConn *conn, const char *remote_path,
     ssize_t n;
     int err = 0;
     while ((n = libssh2_sftp_read(fin, buf, COPY_BUF)) > 0) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         ssize_t w = 0;
         while (w < n) {
             ssize_t r = write(fout, buf + w, (size_t)(n - w));
@@ -268,20 +421,27 @@ static int sftp_download(SshConn *conn, const char *remote_path,
         if (err) break;
         cp_tick(cp, n);
     }
-    if (n < 0) err = -1;
+    if (n < 0 && !err) err = -1;
     g_free(buf);
     libssh2_sftp_close(fin);
     close(fout);
+    if (err == ERR_CANCELLED) unlink(local_path);
     return err;
 }
 
 /* Recursive SFTP size calculation for progress */
-static gint64 sftp_calc_size_r(SshConn *conn, const char *remote_path)
+static gint64 sftp_calc_size_r(SshConn *conn, const char *remote_path,
+                                ProgressDlg *pd)
 {
+    if (pd && pd->cancelled) return 0;
+
     LIBSSH2_SFTP_ATTRIBUTES a;
     if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return 0;
-    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions))
+    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions)) {
+        if (pd && (++scan_counter & 63) == 0)
+            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
         return (gint64)a.filesize;
+    }
 
     gint64 total = 0;
     LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
@@ -292,11 +452,12 @@ static gint64 sftp_calc_size_r(SshConn *conn, const char *remote_path)
     LIBSSH2_SFTP_ATTRIBUTES attrs;
     while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
                                     longentry, sizeof(longentry), &attrs) > 0) {
+        if (pd && pd->cancelled) break;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
         if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
             LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
-            total += sftp_calc_size_r(conn, sub);
+            total += sftp_calc_size_r(conn, sub, pd);
         else if (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
             total += (gint64)attrs.filesize;
         g_free(sub);
@@ -322,16 +483,16 @@ static int sftp_upload_dir_r(SshConn *conn, const char *local_path,
     struct stat st;
     int err = 0;
 
-    while ((de = readdir(dir)) != NULL) {
+    while ((de = readdir(dir)) != NULL && !err) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
         gchar *lp = g_build_filename(local_path, de->d_name, NULL);
         gchar *rp = g_strdup_printf("%s/%s", remote_path, de->d_name);
         if (lstat(lp, &st) == 0) {
-            if (S_ISDIR(st.st_mode))
-                err |= sftp_upload_dir_r(conn, lp, rp, cp);
-            else
-                err |= sftp_upload(conn, lp, rp, cp);
+            err = S_ISDIR(st.st_mode)
+                ? sftp_upload_dir_r(conn, lp, rp, cp)
+                : sftp_upload(conn, lp, rp, cp);
         }
         g_free(lp); g_free(rp);
     }
@@ -354,15 +515,16 @@ static int sftp_download_dir_r(SshConn *conn, const char *remote_path,
     int err = 0;
 
     while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
-                                    longentry, sizeof(longentry), &attrs) > 0) {
+                                    longentry, sizeof(longentry), &attrs) > 0 && !err) {
+        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         gchar *rp = g_strdup_printf("%s/%s", remote_path, name);
         gchar *lp = g_build_filename(local_path, name, NULL);
         if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
             LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
-            err |= sftp_download_dir_r(conn, rp, lp, cp);
+            err = sftp_download_dir_r(conn, rp, lp, cp);
         else
-            err |= sftp_download(conn, rp, lp, cp);
+            err = sftp_download(conn, rp, lp, cp);
         g_free(rp); g_free(lp);
     }
     libssh2_sftp_closedir(handle);
@@ -373,6 +535,8 @@ static int sftp_download_dir_r(SshConn *conn, const char *remote_path,
 static int sftp_delete_r(SshConn *conn, const char *remote_path,
                           ProgressDlg *pd, int *del_count)
 {
+    if (pd && pd->cancelled) return ERR_CANCELLED;
+
     LIBSSH2_SFTP_ATTRIBUTES a;
     if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return -1;
 
@@ -382,10 +546,8 @@ static int sftp_delete_r(SshConn *conn, const char *remote_path,
             (*del_count)++;
             if (*del_count % 50 == 0) {
                 gchar *msg = g_strdup_printf("Deleted: %d files", *del_count);
-                gtk_label_set_text(GTK_LABEL(pd->label), msg);
+                progress_pulse(pd, msg);
                 g_free(msg);
-                gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
-                while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
             }
         }
         return r;
@@ -397,15 +559,18 @@ static int sftp_delete_r(SshConn *conn, const char *remote_path,
     char name[512];
     char longentry[512];
     LIBSSH2_SFTP_ATTRIBUTES attrs;
+    int err = 0;
 
     while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
-                                    longentry, sizeof(longentry), &attrs) > 0) {
+                                    longentry, sizeof(longentry), &attrs) > 0 && !err) {
+        if (pd && pd->cancelled) { err = ERR_CANCELLED; break; }
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
         gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
-        sftp_delete_r(conn, sub, pd, del_count);
+        err = sftp_delete_r(conn, sub, pd, del_count);
         g_free(sub);
     }
     libssh2_sftp_closedir(handle);
+    if (err == ERR_CANCELLED) return err;
     return libssh2_sftp_rmdir(conn->sftp, remote_path);
 }
 
@@ -539,41 +704,53 @@ void fo_copy(FM *fm)
     if (!dest) { g_list_free_full(targets, g_free); return; }
 
     int ok = 0, fail = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Copying...");
+    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Copying");
+    progress_set_phase(pd, "Calculating size…");
 
     /* Pre-calculate total bytes for progress */
     gint64 total_bytes = 0;
+    scan_counter = 0;
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn) {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
                                         (const char *)l->data);
-            total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += sftp_calc_size_r(src->ssh_conn, rp, pd);
             g_free(rp);
         }
         /* Remote→Remote: bytes are transferred twice (download + upload) */
         if (dst->ssh_conn) total_bytes *= 2;
     } else if (dst->ssh_conn) {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            total_bytes += calc_size_r(sp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += calc_size_r(sp, pd);
             g_free(sp);
         }
     } else
 #endif
     {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            total_bytes += calc_size_r(sp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += calc_size_r(sp, pd);
             g_free(sp);
         }
     }
 
+    if (pd->cancelled) goto copy_done;
+
+    progress_set_phase(pd, "Copying…");
+    progress_set_total(pd, total_bytes);
+
     CopyProgress cp = { .pd = pd, .total_bytes = total_bytes, .done_bytes = 0 };
 
-    for (GList *l = targets; l; l = l->next) {
+    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
         const char *name = l->data;
+        if (!name_is_safe(name)) { fail++; continue; }
         cp.current_name = name;
+        progress_set_file(pd, name);
 
         int r = -1;
 
@@ -632,15 +809,19 @@ void fo_copy(FM *fm)
             g_free(sp); g_free(dp);
         }
 
-        if (r == 0) ok++; else fail++;
+        if (r == 0) ok++; else if (r != ERR_CANCELLED) fail++;
     }
 
-    progress_update(pd, "Done", 1.0);
-    progress_free(pd);
-    g_list_free_full(targets, g_free);
-    g_free(dest);
+copy_done:
+    progress_finish(pd);
+    {   gboolean was_cancelled = pd->cancelled;
+        progress_free(pd);
+        g_list_free_full(targets, g_free);
+        g_free(dest);
 
-    fm_status(fm, "Copied: %d  errors: %d", ok, fail);
+        fm_status(fm, was_cancelled ? "Copy cancelled (%d copied, %d errors)"
+                                    : "Copied: %d  errors: %d", ok, fail);
+    }
     if (src->marks) g_hash_table_remove_all(src->marks);
 
 #ifdef HAVE_LIBSSH2
@@ -692,40 +873,52 @@ void fo_move(FM *fm)
     if (!dest) { g_list_free_full(targets, g_free); return; }
 
     int ok = 0, fail = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Moving...");
+    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Moving");
+    progress_set_phase(pd, "Calculating size…");
 
     /* Pre-calculate total bytes for progress */
     gint64 total_bytes = 0;
+    scan_counter = 0;
 #ifdef HAVE_LIBSSH2
     if (src->ssh_conn) {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
                                         (const char *)l->data);
-            total_bytes += sftp_calc_size_r(src->ssh_conn, rp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += sftp_calc_size_r(src->ssh_conn, rp, pd);
             g_free(rp);
         }
         if (dst->ssh_conn) total_bytes *= 2;
     } else if (dst->ssh_conn) {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            total_bytes += calc_size_r(sp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += calc_size_r(sp, pd);
             g_free(sp);
         }
     } else
 #endif
     {
-        for (GList *l = targets; l; l = l->next) {
+        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
             gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            total_bytes += calc_size_r(sp);
+            progress_set_file(pd, (const char *)l->data);
+            total_bytes += calc_size_r(sp, pd);
             g_free(sp);
         }
     }
 
+    if (pd->cancelled) goto move_done;
+
+    progress_set_phase(pd, "Moving…");
+    progress_set_total(pd, total_bytes);
+
     CopyProgress cp = { .pd = pd, .total_bytes = total_bytes, .done_bytes = 0 };
 
-    for (GList *l = targets; l; l = l->next) {
+    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
         const char *name = l->data;
+        if (!name_is_safe(name)) { fail++; continue; }
         cp.current_name = name;
+        progress_set_file(pd, name);
 
         int r = -1;
 
@@ -796,14 +989,19 @@ void fo_move(FM *fm)
             g_free(sp); g_free(dp);
         }
 
-        if (r == 0) ok++; else fail++;
+        if (r == 0) ok++; else if (r != ERR_CANCELLED) fail++;
     }
 
-    progress_free(pd);
-    g_list_free_full(targets, g_free);
-    g_free(dest);
+move_done:
+    progress_finish(pd);
+    {   gboolean was_cancelled = pd->cancelled;
+        progress_free(pd);
+        g_list_free_full(targets, g_free);
+        g_free(dest);
 
-    fm_status(fm, "Moved: %d  errors: %d", ok, fail);
+        fm_status(fm, was_cancelled ? "Move cancelled (%d moved, %d errors)"
+                                    : "Moved: %d  errors: %d", ok, fail);
+    }
     if (src->marks) g_hash_table_remove_all(src->marks);
 
 #ifdef HAVE_LIBSSH2
@@ -898,16 +1096,14 @@ void fo_delete(FM *fm)
     if (!go) { g_list_free_full(targets, g_free); return; }
 
     int ok2 = 0, fail = 0, del_count = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Deleting...");
+    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Deleting");
+    progress_set_phase(pd, "Deleting…");
 
-    for (GList *l = targets; l; l = l->next) {
+    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
         const char *name = l->data;
+        if (!name_is_safe(name)) { fail++; continue; }
 
-        gchar *msg = g_strdup_printf("Deleting: %s", name);
-        gtk_label_set_text(GTK_LABEL(pd->label), msg);
-        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
-        g_free(msg);
-        while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+        progress_set_file(pd, name);
 
 #ifdef HAVE_LIBSSH2
         if (p->ssh_conn) {
@@ -923,9 +1119,14 @@ void fo_delete(FM *fm)
         }
     }
 
-    progress_free(pd);
-    g_list_free_full(targets, g_free);
-    fm_status(fm, "Deleted: %d  errors: %d", ok2, fail);
+    progress_finish(pd);
+    {   gboolean was_cancelled = pd->cancelled;
+        progress_free(pd);
+        g_list_free_full(targets, g_free);
+
+        fm_status(fm, was_cancelled ? "Delete cancelled (%d deleted, %d errors)"
+                                    : "Deleted: %d  errors: %d", ok2, fail);
+    }
     if (p->marks) g_hash_table_remove_all(p->marks);
     panel_reload(p);
 
@@ -985,7 +1186,7 @@ void fo_mkdir(FM *fm)
 
     if (dlg_ctx_run(&ctx) == 1) {
         const gchar *name = gtk_editable_get_text(GTK_EDITABLE(entry));
-        if (name && name[0]) {
+        if (name && name[0] && name_is_safe(name)) {
 #ifdef HAVE_LIBSSH2
             if (p->ssh_conn) {
                 gchar *rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
@@ -1084,7 +1285,8 @@ void fo_rename(FM *fm)
 
     if (dlg_ctx_run(&ctx) == 1) {
         const gchar *new_name = gtk_editable_get_text(GTK_EDITABLE(entry));
-        if (new_name && new_name[0] && strcmp(new_name, old_name) != 0) {
+        if (new_name && new_name[0] && strcmp(new_name, old_name) != 0
+            && name_is_safe(new_name)) {
 #ifdef HAVE_LIBSSH2
             if (p->ssh_conn) {
                 gchar *old_rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, old_name);

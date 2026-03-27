@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.7.0] — 2026-03-27
+
+### Security fixes, progress dialog redesign, cancel support, async SSH, app icon
+
+**Security fixes:**
+- **Command injection prevention:** Terminal launch rewritten to use `g_spawn_async()` with argv array instead of `g_spawn_command_line_async()` (shell string parsing); SSH remote paths quoted via `g_shell_quote()`
+- **Temp file race condition:** Remote file preview now creates unique temp directory via `g_dir_make_tmp("fm-view-XXXXXX")` instead of writing directly to `/tmp/filename` (prevents symlink attacks)
+- **Path traversal guard:** New `name_is_safe()` function rejects filenames containing `/`, `..`, or empty — applied to copy, move, delete, rename, mkdir
+
+**Progress dialog redesign:**
+- New layout: phase label + current file + progress bar + detail line (size + speed) + Cancel button
+- Two modes: indeterminate (auto-pulsing 80ms timer) and determinate (fraction + percentage + MB/s)
+- Animated "Calculating size…" phase — GTK events pumped every 64–128 files during recursive size calculation, keeping the pulse animation alive
+- Transfer speed display after 0.5 seconds elapsed
+
+**Cancel support:**
+- Cancel button in all progress dialogs (copy, move, delete)
+- Cancellation checked at multiple levels: read/write loops (every 256KB), recursive traversal, main file loop, size calculation phase
+- Partial files cleaned up on cancel (incomplete destinations deleted)
+- Status bar shows "Copy cancelled (N copied, M errors)" etc.
+
+**Async SSH connect:**
+- SSH connection (DNS + TCP + handshake + auth) runs in background thread via `GTask`
+- UI stays responsive during connection — no more frozen window
+
+**Application icon and desktop integration:**
+- New SVG icon (dual-panel file manager) + PNG in all sizes (16–256px)
+- Desktop entry file (`data/sk.km.fm.desktop`)
+- Makefile: new `user-install`, `uninstall` targets; `install` now includes icons + .desktop
+
+**Build changes:**
+- Binary output moved to `build/fm` (was `./fm` in project root)
+- `make clean` removes entire `build/` directory
+
+---
+
 ## [2.6.0] — 2026-03-12
 
 ### File marking, remote-to-remote copy/move, directory appearance settings, sort fix

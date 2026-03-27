@@ -6,9 +6,9 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 - **Two panels** — navigation like in Total Commander
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
-- **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2)
+- **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI)
 - **File marking** — Insert/Space marks files (colored), `+` marks all; marks used for copy/move/delete
-- **Copy, move, delete** — F5/F6/F8 with progress bar (byte-level tracking); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
+- **Copy, move, delete** — F5/F6/F8 with progress dialog (animated phases, byte-level tracking, speed display, cancel button); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
 - **File search** — F2, recursive glob search with no result limit
 - **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
@@ -71,10 +71,12 @@ sudo dnf install gtksourceview5-devel # optional, for syntax highlighting
 ### Compilation
 
 ```bash
-make              # compile (auto-detects libssh2 and gtksourceview5)
-./fm              # run
-make install      # install to /usr/local/bin/fm
-make clean        # clean build artifacts
+make                  # compile (output: build/fm)
+build/fm              # run
+sudo make install     # install to /usr/local/bin/fm + icons + .desktop
+make user-install     # install for current user (~/.local/)
+make uninstall        # remove system install
+make clean            # clean build artifacts
 ```
 
 ## Project structure
@@ -90,8 +92,11 @@ src/settings.c      — settings (font, cursor, editor, viewer, terminal)
 src/viewer.c        — file viewer (F3)
 src/editor.c        — text editor (F4)
 src/highlight.c     — syntax highlighting (GtkSourceView wrapper / custom regex)
+data/sk.km.fm.desktop — desktop entry
+data/icons/         — application icons (SVG + PNG 16–256px)
 docs/architecture.md — detailed architecture
 docs/changelog.md   — changelog
+build/              — compiled binary and object files
 Makefile            — build system
 ```
 
@@ -118,7 +123,7 @@ The dialog (SSH icon) allows:
 - **New** — clears the form for entering a new connection
 - **Save** — saves/updates the connection (password is not saved)
 - **Remove** — deletes the selected connection
-- **Connect** — connects with the current details and password
+- **Connect** — connects with the current details and password (async, non-blocking UI)
 
 ## License
 

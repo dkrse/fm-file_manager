@@ -413,6 +413,80 @@ static void on_ssh_bm_delete(GtkButton *btn, SshDlgData *d)
     ssh_dlg_dropdown_fill(d, (int)new_sel == (int)GTK_INVALID_LIST_POSITION ? -1 : 0);
 }
 
+/* ── Async SSH connect via GTask ──────────────────────────────────── */
+
+typedef struct {
+    gchar *host;
+    gchar *user;
+    gchar *password;
+    int    port;
+} SshConnectArgs;
+
+static void ssh_connect_args_free(gpointer p)
+{
+    SshConnectArgs *a = p;
+    g_free(a->host);
+    g_free(a->user);
+    g_free(a->password);
+    g_free(a);
+}
+
+static void ssh_connect_thread(GTask *task, gpointer source,
+                                gpointer task_data, GCancellable *cancel)
+{
+    (void)source; (void)cancel;
+    SshConnectArgs *args = task_data;
+    gchar *errmsg = NULL;
+    SshConn *conn = ssh_conn_new(args->host, args->user, args->port,
+                                  args->password, &errmsg);
+    if (conn) {
+        g_task_return_pointer(task, conn, NULL);
+    } else {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "%s", errmsg ? errmsg : "unknown error");
+        g_free(errmsg);
+    }
+}
+
+typedef struct {
+    FM    *fm;
+    Panel *panel;
+    gchar *user;
+} SshConnectCtx;
+
+static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    (void)source;
+    SshConnectCtx *ctx = user_data;
+    GError *err = NULL;
+    SshConn *conn = g_task_propagate_pointer(G_TASK(res), &err);
+
+    if (conn) {
+        ctx->panel->ssh_conn = conn;
+        gchar *start = g_strdup_printf("/home/%s", ctx->user);
+        LIBSSH2_SFTP_ATTRIBUTES a;
+        if (libssh2_sftp_stat(conn->sftp, start, &a) != 0) {
+            g_free(start);
+            start = g_strdup("/");
+        }
+        panel_load_remote(ctx->panel, start);
+        g_free(start);
+        gtk_widget_set_visible(ctx->panel->disconnect_btn, TRUE);
+        fm_status(ctx->fm, "Connected: %s@%s", conn->user, conn->host);
+    } else {
+        fm_status(ctx->fm, "SSH error: %s", err ? err->message : "unknown");
+        g_clear_error(&err);
+    }
+
+    /* Restore focus */
+    Panel *fp = &ctx->fm->panels[ctx->fm->active];
+    fp->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(fp->column_view);
+
+    g_free(ctx->user);
+    g_free(ctx);
+}
+
 /* ── Connection dialog (full version) ────────────────────────────── */
 
 void ssh_connect_dialog(FM *fm)
@@ -555,38 +629,29 @@ void ssh_connect_dialog(FM *fm)
             if (p->ssh_conn) ssh_panel_close(p);
 
             fm_status(fm, "Connecting to %s@%s:%d …", user, host, port);
-            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
 
-            gchar *errmsg = NULL;
-            SshConn *conn = ssh_conn_new(host, user, port, pw, &errmsg);
-            if (conn) {
-                p->ssh_conn = conn;
+            /* Async connect — UI stays responsive during handshake */
+            SshConnectArgs *args = g_new0(SshConnectArgs, 1);
+            args->host     = g_strdup(host);
+            args->user     = g_strdup(user);
+            args->password = g_strdup(pw);
+            args->port     = port;
 
-                gchar *start = g_strdup_printf("/home/%s", user);
-                LIBSSH2_SFTP_ATTRIBUTES a;
-                if (libssh2_sftp_stat(conn->sftp, start, &a) != 0) {
-                    g_free(start);
-                    start = g_strdup("/");
-                }
-                panel_load_remote(p, start);
-                g_free(start);
-                gtk_widget_set_visible(p->disconnect_btn, TRUE);
-                fm_status(fm, "Connected: %s@%s", user, host);
-            } else {
-                fm_status(fm, "SSH error: %s", errmsg ? errmsg : "unknown error");
-                g_free(errmsg);
-            }
+            SshConnectCtx *cctx = g_new0(SshConnectCtx, 1);
+            cctx->fm    = fm;
+            cctx->panel = p;
+            cctx->user  = g_strdup(user);
+
+            GTask *task = g_task_new(NULL, NULL, ssh_connect_done, cctx);
+            g_task_set_task_data(task, args, ssh_connect_args_free);
+            g_task_run_in_thread(task, ssh_connect_thread);
+            g_object_unref(task);
         }
     }
 
     gtk_window_destroy(GTK_WINDOW(dlg));
     g_list_free_full(d->bookmarks, ssh_bookmark_free);
     g_free(d);
-
-    /* Restore focus to active panel */
-    Panel *fp = &fm->panels[fm->active];
-    fp->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(fp->column_view);
 }
 
 #else  /* !HAVE_LIBSSH2 */

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=FM
+GenericName=File Manager
+Comment=Dual-panel file manager
+Exec=fm
+Icon=sk.km.fm
+Terminal=false
+Type=Application
+Categories=System;FileManager;Utility;GTK;
+Keywords=file;manager;files;folders;dual;panel;commander;sftp;ssh;
+StartupNotify=true
+StartupWMClass=sk.km.fm

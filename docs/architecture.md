@@ -11,13 +11,25 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
 | `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, icon name resolving, path entry navigation (`do_path_activate`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
-| `src/fileops.c` | copy/move/delete/mkdir/rename + progress dialog + `on_browse_clicked`; recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
+| `src/fileops.c` | copy/move/delete/mkdir/rename + progress dialog with cancel + path traversal guard; recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Recursive glob search dialog, `SearchItem` GObject |
-| `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; connect dialog with GtkDropDown, `SshDlgData` helpers |
+| `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, `apply_*_css`; SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
 | `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators |
 | `src/editor.c` | Text editor (F4) with menu bar, find/replace (Ctrl+F/H), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
 | `src/highlight.c` | Syntax highlighting: GtkSourceView wrapper or custom regex highlighter |
+| `data/sk.km.fm.desktop` | Desktop entry for application launchers |
+| `data/icons/` | Application icons: SVG (scalable) + PNG (16–256px) |
+
+## Build
+
+```
+make              → build/fm  (binary + .o files in build/)
+make clean        → rm -rf build/
+make install      → /usr/local/bin/fm + icons + .desktop
+make user-install → ~/.local/bin/fm + ~/.local/share/icons + ~/.local/share/applications
+make uninstall    → removes system install
+```
 
 ## Data flow
 
@@ -28,7 +40,7 @@ FM (g_fm)
 │   ├── GtkSortListModel  (wraps store)
 │   ├── GtkMultiSelection (wraps sort model)
 │   └── GtkColumnView
-└── CSS providers (3 priority levels)
+└── CSS providers (4, different priority levels)
     ├── css_provider          APPLICATION+0  (* global GUI font, cursor CSS)
     ├── font_css_provider     APPLICATION+1  (columnview panel font)
     ├── editor_css_provider   APPLICATION+2  (textview.fm-editor + label.fm-editor-status)
@@ -66,6 +78,31 @@ if (dlg_ctx_run(&ctx) == 1) { /* OK pressed */ }
 gtk_window_destroy(GTK_WINDOW(dlg));
 ```
 
+## Progress dialog
+
+`ProgressDlg` in `fileops.c` — used by copy, move, delete operations:
+
+```
+┌─ Copying ──────────────────────────┐
+│ Copying…                           │  phase_lbl
+│ document.pdf                       │  file_lbl
+│ ████████████░░░░░░░░░░  54 %       │  progress bar
+│ 12.3 MB / 22.8 MB  —  4.5 MB/s    │  detail_lbl
+│                          [Cancel]  │  cancel button
+└────────────────────────────────────┘
+```
+
+**Features:**
+- Two modes: indeterminate (auto-pulsing, 80ms timer) and determinate (fraction + percentage)
+- Phases: "Calculating size…" → "Copying…" / "Moving…" / "Deleting…" → "Done"
+- During size calculation, GTK events pumped every 64–128 files to keep pulse animation alive
+- Speed display (MB/s) after 0.5 seconds elapsed
+- Cancel button: sets `pd->cancelled` flag, checked at multiple levels:
+  - Read/write loops (every 256KB chunk) — partial files cleaned up
+  - Recursive directory traversal — stops before next entry
+  - Main operation loop — skips remaining files
+  - Size calculation phase — skips to end
+
 ## CSS architecture
 
 Four CSS providers with different priorities ensure correct specificity:
@@ -99,6 +136,14 @@ Without GtkSourceView (fallback):
 - **After closing viewer/editor:** `inhibit_sel = TRUE` + `gtk_widget_grab_focus(panel->column_view)` → `on_focus_enter` restores cursor
 - **After dialogs (SSH connect, mkdir, rename, delete, copy, move):** same `inhibit_sel + grab_focus` pattern restores cursor
 
+## SSH — async connect
+
+SSH connection runs in a background thread via `GTask`:
+1. User fills in host/user/port/password in dialog, clicks Connect
+2. `ssh_connect_thread` runs `ssh_conn_new()` off the main thread (DNS, TCP, handshake, auth)
+3. `ssh_connect_done` callback on main thread sets `panel->ssh_conn` and loads remote directory
+4. UI stays responsive during the entire connection process
+
 ## SSH connections — data model
 
 ```
@@ -114,6 +159,12 @@ settings.ini [ssh]
 - `dropdown` + `str_list` — GtkDropDown over GtkStringList
 - `block_sel` — flag suppressing `notify::selected` during `ssh_dlg_dropdown_fill`
 - `bookmarks` — GList<SshBookmark*>, owned
+
+## Security
+
+- **Path traversal guard:** `name_is_safe()` in fileops.c rejects filenames containing `/`, `..`, or empty strings — applied to all file operations (copy, move, delete, rename, mkdir)
+- **Command injection prevention:** Terminal launch uses `g_spawn_async()` with argv array (no shell parsing); SSH remote paths quoted via `g_shell_quote()`
+- **Temp file safety:** Remote file preview creates unique temp directory via `g_dir_make_tmp()` to prevent symlink attacks
 
 ## Settings
 
@@ -162,3 +213,5 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - Remote→Remote (SFTP→SFTP) copy/move: download to temp dir (`g_dir_make_tmp`), upload to destination, clean up temp; progress tracks both phases (total_bytes × 2)
 - Mark re-render: Insert/Space uses `g_list_store_find` + `g_object_ref` + remove + insert to force view re-bind; `+` (all) uses `panel_reload` (marks survive in hash table)
 - `ssh_dlg_dropdown_fill` must be called AFTER all form entry widgets are created (otherwise `ssh_dlg_fill_form` writes to NULL widgets)
+- Cancel during copy/move cleans up partial files (`unlink` on incomplete destination)
+- Cancel during delete stops immediately — already-deleted files remain deleted
