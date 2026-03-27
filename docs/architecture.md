@@ -9,9 +9,9 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | File | Responsibility |
 |------|---------------|
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
-| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, icon name resolving, path entry navigation (`do_path_activate`) |
+| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), file filter (Ctrl+S), hamburger menu, path entry navigation (`do_path_activate`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
-| `src/fileops.c` | copy/move/delete/mkdir/rename + progress dialog with cancel + path traversal guard; recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
+| `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Recursive glob search dialog, `SearchItem` GObject |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, `apply_*_css`; SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
@@ -37,8 +37,9 @@ make uninstall    → removes system install
 FM (g_fm)
 ├── panels[0..1]  Panel
 │   ├── GListStore<FileItem>
-│   ├── GtkSortListModel  (wraps store)
-│   ├── GtkMultiSelection (wraps sort model)
+│   ├── GtkSortListModel    (wraps store)
+│   ├── GtkFilterListModel  (wraps sort model — Ctrl+S filter)
+│   ├── GtkMultiSelection   (wraps filter model)
 │   └── GtkColumnView
 └── CSS providers (4, different priority levels)
     ├── css_provider          APPLICATION+0  (* global GUI font, cursor CSS)
@@ -53,10 +54,12 @@ Each `Panel` has:
 - `path_entry` — editable path; Enter navigates, Escape restores; supports `~` and relative paths
 - `GListStore<FileItem>` — raw data
 - `GtkSortListModel` — sorts store (synchronous, `incremental=FALSE`)
-- `GtkMultiSelection` — selection over sort model
+- `GtkFilterListModel` — wraps sort model; filters by `filter_text` (Ctrl+S)
+- `GtkMultiSelection` — selection over filter model
 - `GtkColumnView` — 3 columns (Name, Size, Date) via `GtkSignalListItemFactory`
 - `cursor_pos` — manual cursor position tracking
 - `inhibit_sel` — flag preventing `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
+- `filter_bar`, `filter_entry`, `filter_text` — Ctrl+S filter UI and state
 
 **Sort:** Always `..` first, then directories, then files (enforced via `GtkMultiSorter`: a standalone `dirs_first_func` sorter as primary, column view sorter as secondary — direction toggle never affects directory-first ordering). Within each group by active column.
 
@@ -64,9 +67,10 @@ Each `Panel` has:
 
 ## Key handling hierarchy
 
-1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (skipped if `GtkEntry` has focus)
+1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global, Ctrl+S (filter), Alt+E (extract), Alt+P (pack) (skipped if `GtkEntry` has focus)
 2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+` (mark/unmark all)
 3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
+4. `on_filter_key` (filter entry) — Enter/Escape (close filter, restore full list)
 
 ## Dialog pattern
 
@@ -102,6 +106,40 @@ gtk_window_destroy(GTK_WINDOW(dlg));
   - Recursive directory traversal — stops before next entry
   - Main operation loop — skips remaining files
   - Size calculation phase — skips to end
+
+## File filter (Ctrl+S)
+
+Each panel has a hidden filter bar (below file list). Ctrl+S shows it, typing filters immediately:
+- `GtkCustomFilter` with `filter_match_func` — case-insensitive substring match on `FileItem.name`
+- `..` always passes filter
+- `GtkFilterListModel` sits between `GtkSortListModel` and `GtkMultiSelection` in the model chain
+- `Panel.filter_text` stores lowercase search string; NULL when filter is inactive
+- Enter/Escape clears filter text, hides bar, calls `gtk_filter_changed` to restore full list
+- Cursor resets to 0 on each filter change
+
+## Archive support
+
+`fo_extract()` and `fo_pack()` in `fileops.c`:
+
+**Detection:** `arc_detect(name)` returns `ArcType` enum based on file extension (double extensions like `.tar.gz` checked first).
+
+**Execution:** `run_archive_cmd()` — spawns external tool via `g_spawn_async`, polls child with `waitpid(WNOHANG)` in a loop, pumps GTK events every 50ms to keep pulse animation alive. Cancel sends `SIGTERM` to child process.
+
+**Extract:** Detects format → builds appropriate argv (`tar xf`, `unzip`, `7z x`, `unrar x`) → runs with destination `-C`/`-d`/`-o` flag.
+
+**Pack:** Dialog with format dropdown (6 options), archive name entry, destination entry. Builds argv based on selected format: `tar czf/cjf/cJf/--zstd`, `zip -r`, `7z a`.
+
+## Hamburger menu
+
+`GSimpleActionGroup` ("fm") with `GMenu` model, attached to `GtkMenuButton` in header bar. Actions: `fm.extract`, `fm.pack`, `fm.filter`, `fm.ssh`.
+
+## Content-type icons
+
+`icon_for_entry(name, is_dir, is_link, is_exec)` in `main.c` (declared in `fm.h`):
+- **Directories:** well-known names (Desktop, Documents, Downloads, Music, Pictures, Videos, Templates, Public, .git) → themed folder icons; others → `folder`
+- **Files:** ~80 extensions mapped to freedesktop icon names (image-x-generic, audio-x-generic, video-x-generic, package-x-generic, application-pdf, x-office-document/spreadsheet/presentation, text-html, text-x-csrc, text-x-python, application-javascript, text-x-script, etc.)
+- **Special:** symlinks → `emblem-symbolic-link`, executables → `application-x-executable`
+- Icon pixel size configurable via `FM.icon_size` (Settings → Panels → Icons, 8–64 px)
 
 ## CSS architecture
 
@@ -176,6 +214,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `gui_font_family`, `gui_font_size` | GUI font |
 | `col_name_width`, `col_size_width`, `col_date_width` | Column widths |
 | `show_hidden` | Hidden files |
+| `icon_size` | File icon pixel size (8–64, default 16) |
 | `terminal_app` | Terminal emulator |
 | `cursor_color`, `cursor_outline` | Cursor style |
 | `dir_color`, `dir_bold` | Directory appearance (color, bold) |
@@ -215,3 +254,6 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - `ssh_dlg_dropdown_fill` must be called AFTER all form entry widgets are created (otherwise `ssh_dlg_fill_form` writes to NULL widgets)
 - Cancel during copy/move cleans up partial files (`unlink` on incomplete destination)
 - Cancel during delete stops immediately — already-deleted files remain deleted
+- Archive commands run async via `g_spawn_async` + `waitpid(WNOHANG)` poll loop — cancel sends `SIGTERM`
+- Filter model uses `filter_model` (not `sort_model`) for all item access: `panel_cursor_name`, `panel_selection`, cursor navigation, search result lookup
+- `icon_for_entry()` returns static string constants — safe for `FileItem.icon_name` (not freed in finalize)

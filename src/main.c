@@ -43,17 +43,184 @@ void fm_status(FM *fm, const char *fmt, ...)
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
- *  Icon name helpers (replaces GdkPixbuf cache)
+ *  Icon name helpers — freedesktop standard content-type icons
  * ─────────────────────────────────────────────────────────────────── */
 
-static const char *icon_for_entry(gboolean is_dir, gboolean is_link,
-                                  gboolean is_exec, gboolean is_up)
+/* Well-known directory names → themed folder icons */
+static const char *icon_for_dir(const char *name)
 {
-    if (is_up)   return "go-up-symbolic";
+    static const struct { const char *name; const char *icon; } dirs[] = {
+        { "Desktop",       "folder-desktop"       },
+        { "Documents",     "folder-documents"     },
+        { "Downloads",     "folder-download"      },
+        { "Music",         "folder-music"         },
+        { "Pictures",      "folder-pictures"      },
+        { "Videos",        "folder-videos"        },
+        { "Templates",     "folder-templates"     },
+        { "Public",        "folder-publicshare"   },
+        { ".git",          "folder-git"           },
+        { NULL, NULL }
+    };
+    if (!name) return "folder";
+    for (int i = 0; dirs[i].name; i++)
+        if (strcmp(name, dirs[i].name) == 0) return dirs[i].icon;
+    return "folder";
+}
+
+/* File extension → standard freedesktop icon name */
+static const char *icon_for_file(const char *name)
+{
+    if (!name) return "text-x-generic";
+
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) {
+        /* No extension — check special filenames */
+        if (g_str_has_prefix(name, "Makefile") ||
+            g_str_has_prefix(name, "CMakeLists") ||
+            g_str_has_prefix(name, "Dockerfile") ||
+            g_str_has_prefix(name, "Vagrantfile"))
+            return "text-x-script";
+        if (strcmp(name, "LICENSE") == 0 || strcmp(name, "COPYING") == 0)
+            return "text-x-copying";
+        if (strcmp(name, "README") == 0)
+            return "text-x-readme";
+        return "text-x-generic";
+    }
+
+    const char *ext = dot + 1;
+
+    /* Images */
+    if (!g_ascii_strcasecmp(ext, "png")  || !g_ascii_strcasecmp(ext, "jpg") ||
+        !g_ascii_strcasecmp(ext, "jpeg") || !g_ascii_strcasecmp(ext, "gif") ||
+        !g_ascii_strcasecmp(ext, "bmp")  || !g_ascii_strcasecmp(ext, "svg") ||
+        !g_ascii_strcasecmp(ext, "webp") || !g_ascii_strcasecmp(ext, "ico") ||
+        !g_ascii_strcasecmp(ext, "tiff") || !g_ascii_strcasecmp(ext, "tif") ||
+        !g_ascii_strcasecmp(ext, "raw")  || !g_ascii_strcasecmp(ext, "psd"))
+        return "image-x-generic";
+
+    /* Audio */
+    if (!g_ascii_strcasecmp(ext, "mp3")  || !g_ascii_strcasecmp(ext, "ogg") ||
+        !g_ascii_strcasecmp(ext, "flac") || !g_ascii_strcasecmp(ext, "wav") ||
+        !g_ascii_strcasecmp(ext, "aac")  || !g_ascii_strcasecmp(ext, "wma") ||
+        !g_ascii_strcasecmp(ext, "m4a")  || !g_ascii_strcasecmp(ext, "opus"))
+        return "audio-x-generic";
+
+    /* Video */
+    if (!g_ascii_strcasecmp(ext, "mp4")  || !g_ascii_strcasecmp(ext, "mkv") ||
+        !g_ascii_strcasecmp(ext, "avi")  || !g_ascii_strcasecmp(ext, "mov") ||
+        !g_ascii_strcasecmp(ext, "wmv")  || !g_ascii_strcasecmp(ext, "flv") ||
+        !g_ascii_strcasecmp(ext, "webm") || !g_ascii_strcasecmp(ext, "m4v"))
+        return "video-x-generic";
+
+    /* Archives */
+    if (!g_ascii_strcasecmp(ext, "zip")  || !g_ascii_strcasecmp(ext, "tar") ||
+        !g_ascii_strcasecmp(ext, "gz")   || !g_ascii_strcasecmp(ext, "bz2") ||
+        !g_ascii_strcasecmp(ext, "xz")   || !g_ascii_strcasecmp(ext, "7z")  ||
+        !g_ascii_strcasecmp(ext, "rar")  || !g_ascii_strcasecmp(ext, "zst") ||
+        !g_ascii_strcasecmp(ext, "tgz")  || !g_ascii_strcasecmp(ext, "tbz2") ||
+        !g_ascii_strcasecmp(ext, "txz")  || !g_ascii_strcasecmp(ext, "deb") ||
+        !g_ascii_strcasecmp(ext, "rpm"))
+        return "package-x-generic";
+
+    /* PDF */
+    if (!g_ascii_strcasecmp(ext, "pdf"))
+        return "application-pdf";
+
+    /* Office documents */
+    if (!g_ascii_strcasecmp(ext, "doc")  || !g_ascii_strcasecmp(ext, "docx") ||
+        !g_ascii_strcasecmp(ext, "odt")  || !g_ascii_strcasecmp(ext, "rtf"))
+        return "x-office-document";
+    if (!g_ascii_strcasecmp(ext, "xls")  || !g_ascii_strcasecmp(ext, "xlsx") ||
+        !g_ascii_strcasecmp(ext, "ods")  || !g_ascii_strcasecmp(ext, "csv"))
+        return "x-office-spreadsheet";
+    if (!g_ascii_strcasecmp(ext, "ppt")  || !g_ascii_strcasecmp(ext, "pptx") ||
+        !g_ascii_strcasecmp(ext, "odp"))
+        return "x-office-presentation";
+
+    /* Web / markup */
+    if (!g_ascii_strcasecmp(ext, "html") || !g_ascii_strcasecmp(ext, "htm") ||
+        !g_ascii_strcasecmp(ext, "xhtml"))
+        return "text-html";
+    if (!g_ascii_strcasecmp(ext, "css"))
+        return "text-css";
+    if (!g_ascii_strcasecmp(ext, "xml")  || !g_ascii_strcasecmp(ext, "xsl") ||
+        !g_ascii_strcasecmp(ext, "xslt"))
+        return "text-xml";
+    if (!g_ascii_strcasecmp(ext, "json"))
+        return "application-json";
+
+    /* Source code */
+    if (!g_ascii_strcasecmp(ext, "c")    || !g_ascii_strcasecmp(ext, "h") ||
+        !g_ascii_strcasecmp(ext, "cpp")  || !g_ascii_strcasecmp(ext, "cc") ||
+        !g_ascii_strcasecmp(ext, "cxx")  || !g_ascii_strcasecmp(ext, "hpp"))
+        return "text-x-csrc";
+    if (!g_ascii_strcasecmp(ext, "py")   || !g_ascii_strcasecmp(ext, "pyw"))
+        return "text-x-python";
+    if (!g_ascii_strcasecmp(ext, "java")  || !g_ascii_strcasecmp(ext, "class") ||
+        !g_ascii_strcasecmp(ext, "jar"))
+        return "application-x-java";
+    if (!g_ascii_strcasecmp(ext, "js")   || !g_ascii_strcasecmp(ext, "mjs") ||
+        !g_ascii_strcasecmp(ext, "ts")   || !g_ascii_strcasecmp(ext, "jsx") ||
+        !g_ascii_strcasecmp(ext, "tsx"))
+        return "application-javascript";
+    if (!g_ascii_strcasecmp(ext, "rs"))
+        return "text-x-rust";
+    if (!g_ascii_strcasecmp(ext, "go"))
+        return "text-x-go";
+    if (!g_ascii_strcasecmp(ext, "rb"))
+        return "application-x-ruby";
+    if (!g_ascii_strcasecmp(ext, "php"))
+        return "application-x-php";
+    if (!g_ascii_strcasecmp(ext, "sql"))
+        return "text-x-sql";
+
+    /* Shell / scripts */
+    if (!g_ascii_strcasecmp(ext, "sh")   || !g_ascii_strcasecmp(ext, "bash") ||
+        !g_ascii_strcasecmp(ext, "zsh")  || !g_ascii_strcasecmp(ext, "fish") ||
+        !g_ascii_strcasecmp(ext, "pl")   || !g_ascii_strcasecmp(ext, "lua"))
+        return "text-x-script";
+
+    /* Config / data */
+    if (!g_ascii_strcasecmp(ext, "conf") || !g_ascii_strcasecmp(ext, "cfg") ||
+        !g_ascii_strcasecmp(ext, "ini")  || !g_ascii_strcasecmp(ext, "toml") ||
+        !g_ascii_strcasecmp(ext, "yaml") || !g_ascii_strcasecmp(ext, "yml"))
+        return "text-x-generic";
+
+    /* Markdown / docs */
+    if (!g_ascii_strcasecmp(ext, "md")   || !g_ascii_strcasecmp(ext, "rst") ||
+        !g_ascii_strcasecmp(ext, "txt")  || !g_ascii_strcasecmp(ext, "log"))
+        return "text-x-generic";
+
+    /* Fonts */
+    if (!g_ascii_strcasecmp(ext, "ttf")  || !g_ascii_strcasecmp(ext, "otf") ||
+        !g_ascii_strcasecmp(ext, "woff") || !g_ascii_strcasecmp(ext, "woff2"))
+        return "font-x-generic";
+
+    /* Shared libraries */
+    if (!g_ascii_strcasecmp(ext, "so")   || !g_ascii_strcasecmp(ext, "dll") ||
+        !g_ascii_strcasecmp(ext, "dylib"))
+        return "application-x-sharedlib";
+
+    /* Disk images */
+    if (!g_ascii_strcasecmp(ext, "iso")  || !g_ascii_strcasecmp(ext, "img"))
+        return "application-x-cd-image";
+
+    /* Database */
+    if (!g_ascii_strcasecmp(ext, "db")   || !g_ascii_strcasecmp(ext, "sqlite") ||
+        !g_ascii_strcasecmp(ext, "sqlite3"))
+        return "application-vnd.oasis.opendocument.database";
+
+    return "text-x-generic";
+}
+
+/* Combined: pick icon based on entry type + name */
+const char *icon_for_entry(const char *name, gboolean is_dir,
+                           gboolean is_link, gboolean is_exec)
+{
     if (is_link) return "emblem-symbolic-link";
-    if (is_dir)  return "folder-symbolic";
-    if (is_exec) return "application-x-executable-symbolic";
-    return "text-x-generic-symbolic";
+    if (is_dir)  return icon_for_dir(name);
+    if (is_exec) return "application-x-executable";
+    return icon_for_file(name);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -63,7 +230,7 @@ static const char *icon_for_entry(gboolean is_dir, gboolean is_link,
 void panel_update_status(Panel *p)
 {
     guint n_marks = p->marks ? g_hash_table_size(p->marks) : 0;
-    guint total = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint total = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
 
     gchar *msg;
     if (n_marks > 0)
@@ -77,9 +244,9 @@ void panel_update_status(Panel *p)
 
 gchar *panel_cursor_name(Panel *p)
 {
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (p->cursor_pos >= n) return NULL;
-    FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model),
+    FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
                                            p->cursor_pos);
     if (!item) return NULL;
     gchar *name = g_strdup(item->name);
@@ -92,9 +259,9 @@ GList *panel_selection(Panel *p)
     /* Collect marked items */
     GList *result = NULL;
     if (p->marks && g_hash_table_size(p->marks) > 0) {
-        guint count = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+        guint count = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
         for (guint i = 0; i < count; i++) {
-            FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
+            FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
             if (item) {
                 if (item->marked && strcmp(item->name, "..") != 0)
                     result = g_list_prepend(result, g_strdup(item->name));
@@ -166,7 +333,7 @@ void panel_load(Panel *p, const char *path)
             gboolean is_link = S_ISLNK(fst.st_mode);
             gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
 
-            const char *icon = icon_for_entry(is_dir, is_link, is_exec, FALSE);
+            const char *icon = icon_for_entry(de->d_name, is_dir, is_link, is_exec);
 
             const gchar *fg = NULL;
             gint         wt = PANGO_WEIGHT_NORMAL;
@@ -197,7 +364,7 @@ void panel_load(Panel *p, const char *path)
 
     /* move cursor to first row */
     p->cursor_pos = 0;
-    if (p->column_view && g_list_model_get_n_items(G_LIST_MODEL(p->sort_model)) > 0) {
+    if (p->column_view && g_list_model_get_n_items(G_LIST_MODEL(p->filter_model)) > 0) {
         /* Only select (show cursor) on active panel */
         gboolean is_active = (p->fm->active == p->idx);
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
@@ -226,9 +393,9 @@ void panel_reload(Panel *p)
     gboolean is_active = (p->fm->active == p->idx);
 
     p->inhibit_sel = TRUE;
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     for (guint i = 0; i < n; i++) {
-        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
+        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
         if (item && strcmp(item->name, saved) == 0) {
             g_object_unref(item);
             p->cursor_pos = i;
@@ -253,9 +420,9 @@ void panel_go_up(Panel *p)
         gchar *basename = g_path_get_basename(p->ssh_conn->remote_path);
         panel_load_remote(p, parent);
         /* restore cursor */
-        guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+        guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
         for (guint i = 0; i < n; i++) {
-            FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
+            FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
             if (item && strcmp(item->name, basename) == 0) {
                 g_object_unref(item);
                 p->cursor_pos = i;
@@ -277,9 +444,9 @@ void panel_go_up(Panel *p)
     panel_load(p, parent);
 
     /* restore cursor to dir we came from */
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     for (guint i = 0; i < n; i++) {
-        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
+        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
         if (item && strcmp(item->name, basename) == 0) {
             g_object_unref(item);
             p->cursor_pos = i;
@@ -365,6 +532,8 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     FileItem  *item  = gtk_list_item_get_item(li);
 
     gtk_image_set_from_icon_name(GTK_IMAGE(image), item->icon_name);
+    gtk_image_set_pixel_size(GTK_IMAGE(image),
+        p->fm->icon_size > 0 ? p->fm->icon_size : 16);
 
     const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
     gint wt = item->marked ? PANGO_WEIGHT_BOLD : item->weight;
@@ -441,10 +610,10 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
 
 static void activate_item(Panel *p)
 {
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (p->cursor_pos >= n) return;
 
-    FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model),
+    FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
                                            p->cursor_pos);
     if (!item) return;
 
@@ -531,7 +700,7 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
                                    GdkModifierType state, Panel *p)
 {
     (void)ctrl; (void)keycode; (void)state;
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (n == 0) return FALSE;
 
     switch (keyval) {
@@ -574,7 +743,7 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
 
     case GDK_KEY_space:
     case GDK_KEY_Insert: {
-        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->sort_model),
+        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
                                                 p->cursor_pos);
         if (item && strcmp(item->name, "..") != 0) {
             item->marked = !item->marked;
@@ -697,7 +866,7 @@ static void on_focus_enter(GtkEventControllerFocus *ctrl, Panel *p)
     if (!p->inhibit_sel) return;
 
     /* Keyboard focus: restore saved cursor position. */
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (n > 0) {
         if (p->cursor_pos >= n) p->cursor_pos = 0;
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
@@ -894,6 +1063,69 @@ static void on_home_clicked(GtkButton *btn, Panel *p)
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
+ *  Panel filter (Ctrl+S)
+ * ─────────────────────────────────────────────────────────────────── */
+
+static gboolean filter_match_func(gpointer item, gpointer user_data)
+{
+    Panel *p = user_data;
+    if (!p->filter_text || !p->filter_text[0]) return TRUE;
+    FileItem *fi = FILE_ITEM(item);
+    if (strcmp(fi->name, "..") == 0) return TRUE;  /* always show ".." */
+
+    gchar *lower = g_utf8_strdown(fi->name, -1);
+    gboolean match = (strstr(lower, p->filter_text) != NULL);
+    g_free(lower);
+    return match;
+}
+
+static void on_filter_changed(GtkEditable *editable, Panel *p)
+{
+    g_free(p->filter_text);
+    const gchar *text = gtk_editable_get_text(editable);
+    p->filter_text = (text && text[0]) ? g_utf8_strdown(text, -1) : NULL;
+
+    gtk_filter_changed(GTK_FILTER(p->custom_filter), GTK_FILTER_CHANGE_DIFFERENT);
+
+    /* Reset cursor to top */
+    p->cursor_pos = 0;
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    if (n > 0) {
+        p->inhibit_sel = TRUE;
+        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
+                                  NULL, GTK_LIST_SCROLL_SELECT, NULL);
+        p->inhibit_sel = FALSE;
+    }
+    panel_update_status(p);
+}
+
+static gboolean on_filter_key(GtkEventControllerKey *ctrl,
+                               guint keyval, guint keycode,
+                               GdkModifierType state, Panel *p)
+{
+    (void)ctrl; (void)keycode; (void)state;
+    if (keyval == GDK_KEY_Escape || keyval == GDK_KEY_Return ||
+        keyval == GDK_KEY_KP_Enter) {
+        /* Close filter bar */
+        gtk_widget_set_visible(p->filter_bar, FALSE);
+        g_free(p->filter_text);
+        p->filter_text = NULL;
+        gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
+        gtk_filter_changed(GTK_FILTER(p->custom_filter), GTK_FILTER_CHANGE_DIFFERENT);
+        gtk_widget_grab_focus(p->column_view);
+        panel_update_status(p);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void panel_show_filter(Panel *p)
+{
+    gtk_widget_set_visible(p->filter_bar, TRUE);
+    gtk_widget_grab_focus(p->filter_entry);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
  *  Panel: widget setup
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -994,8 +1226,16 @@ void panel_setup(Panel *p, FM *fm, int idx)
         g_object_ref(G_LIST_MODEL(p->store)),
         GTK_SORTER(multi));
     gtk_sort_list_model_set_incremental(p->sort_model, FALSE);
+
+    /* Filter model (Ctrl+S) — between sort and selection */
+    p->custom_filter = gtk_custom_filter_new(filter_match_func, p, NULL);
+    p->filter_model = gtk_filter_list_model_new(
+        g_object_ref(G_LIST_MODEL(p->sort_model)),
+        GTK_FILTER(g_object_ref(p->custom_filter)));
+    p->filter_text = NULL;
+
     p->selection = gtk_multi_selection_new(
-        g_object_ref(G_LIST_MODEL(p->sort_model)));
+        g_object_ref(G_LIST_MODEL(p->filter_model)));
     gtk_column_view_set_model(GTK_COLUMN_VIEW(p->column_view),
                               GTK_SELECTION_MODEL(p->selection));
 
@@ -1019,9 +1259,28 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_widget_set_halign(p->status_label, GTK_ALIGN_START);
     gtk_widget_set_margin_start(p->status_label, 4);
 
+    /* filter bar (Ctrl+S) — initially hidden */
+    p->filter_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(p->filter_bar, 4);
+    gtk_widget_set_margin_end(p->filter_bar, 4);
+    gtk_widget_set_margin_top(p->filter_bar, 2);
+    gtk_widget_set_visible(p->filter_bar, FALSE);
+    GtkWidget *filter_lbl = gtk_label_new("Filter:");
+    p->filter_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(p->filter_entry), "type to filter…");
+    gtk_widget_set_hexpand(p->filter_entry, TRUE);
+    gtk_box_append(GTK_BOX(p->filter_bar), filter_lbl);
+    gtk_box_append(GTK_BOX(p->filter_bar), p->filter_entry);
+
+    g_signal_connect(p->filter_entry, "changed", G_CALLBACK(on_filter_changed), p);
+    GtkEventController *filt_key = gtk_event_controller_key_new();
+    g_signal_connect(filt_key, "key-pressed", G_CALLBACK(on_filter_key), p);
+    gtk_widget_add_controller(p->filter_entry, filt_key);
+
     /* pack */
     gtk_box_append(GTK_BOX(p->frame), path_box);
     gtk_box_append(GTK_BOX(p->frame), scroll);
+    gtk_box_append(GTK_BOX(p->frame), p->filter_bar);
     gtk_box_append(GTK_BOX(p->frame), p->status_label);
 
     /* signals */
@@ -1058,16 +1317,18 @@ void panel_setup(Panel *p, FM *fm, int idx)
  *  Bottom toolbar – F-key buttons
  * ─────────────────────────────────────────────────────────────────── */
 
-static void btn_copy(GtkButton *b, gpointer d)   { (void)b; fo_copy(d);   }
-static void btn_move(GtkButton *b, gpointer d)   { (void)b; fo_move(d);   }
-static void btn_mkdir(GtkButton *b, gpointer d)  { (void)b; fo_mkdir(d);  }
-static void btn_delete(GtkButton *b, gpointer d) { (void)b; fo_delete(d); }
-static void btn_rename(GtkButton *b, gpointer d) { (void)b; fo_rename(d); }
-static void btn_find(GtkButton *b, gpointer d)   { (void)b; search_run(d); }
-static void btn_view(GtkButton *b, gpointer d)   { (void)b; viewer_show(d); }
-static void btn_editor(GtkButton *b, gpointer d) { (void)b; editor_show(d); }
-static void btn_ssh(GtkButton *b, gpointer d)    { (void)b; ssh_connect_dialog(d); }
-static void btn_quit(GtkButton *b, gpointer d)   { (void)b; g_application_quit(G_APPLICATION(((FM*)d)->app)); }
+static void btn_copy(GtkButton *b, gpointer d)    { (void)b; fo_copy(d);   }
+static void btn_move(GtkButton *b, gpointer d)    { (void)b; fo_move(d);   }
+static void btn_mkdir(GtkButton *b, gpointer d)   { (void)b; fo_mkdir(d);  }
+static void btn_delete(GtkButton *b, gpointer d)  { (void)b; fo_delete(d); }
+static void btn_rename(GtkButton *b, gpointer d)  { (void)b; fo_rename(d); }
+static void btn_find(GtkButton *b, gpointer d)    { (void)b; search_run(d); }
+static void btn_view(GtkButton *b, gpointer d)    { (void)b; viewer_show(d); }
+static void btn_editor(GtkButton *b, gpointer d)  { (void)b; editor_show(d); }
+static void btn_extract(GtkButton *b, gpointer d) { (void)b; fo_extract(d); }
+static void btn_pack(GtkButton *b, gpointer d)    { (void)b; fo_pack(d);  }
+static void btn_ssh(GtkButton *b, gpointer d)     { (void)b; ssh_connect_dialog(d); }
+static void btn_quit(GtkButton *b, gpointer d)    { (void)b; g_application_quit(G_APPLICATION(((FM*)d)->app)); }
 
 static GtkWidget *create_toolbar(FM *fm)
 {
@@ -1076,16 +1337,18 @@ static GtkWidget *create_toolbar(FM *fm)
         const char *tooltip;
         void (*cb)(GtkButton *, gpointer);
     } btns[] = {
-        { "F5 Copy",  "Copy to other panel",    btn_copy   },
-        { "F6 Move",   "Move to other panel",     btn_move   },
-        { "F7 MkDir",    "Create new directory",          btn_mkdir  },
-        { "F8 Delete",     "Delete selected files",          btn_delete },
-        { "F9 Rename", "Rename current file",      btn_rename },
-        { "F2 Search",     "Search files",                btn_find   },
-        { "F3 View",   "View file contents",          btn_view   },
-        { "F4 Editor",     "Open file in editor",        btn_editor },
-        { "SSH",           "Connect via SSH/SFTP",          btn_ssh    },
-        { "F10 Quit",    "Quit application",              btn_quit   },
+        { "F5 Copy",    "Copy to other panel",      btn_copy    },
+        { "F6 Move",    "Move to other panel",       btn_move    },
+        { "F7 MkDir",   "Create new directory",      btn_mkdir   },
+        { "F8 Delete",  "Delete selected files",     btn_delete  },
+        { "F9 Rename",  "Rename current file",       btn_rename  },
+        { "F2 Search",  "Search files",              btn_find    },
+        { "F3 View",    "View file contents",        btn_view    },
+        { "F4 Editor",  "Open file in editor",       btn_editor  },
+        { "Extract",    "Extract archive (Alt+E)",   btn_extract },
+        { "Pack",       "Create archive (Alt+P)",    btn_pack    },
+        { "SSH",        "Connect via SSH/SFTP",      btn_ssh     },
+        { "F10 Quit",   "Quit application",          btn_quit    },
     };
 
     GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1140,6 +1403,27 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     case GDK_KEY_F4:  editor_show(fm);        return TRUE;
     case GDK_KEY_F10: g_application_quit(G_APPLICATION(fm->app)); return TRUE;
 
+    /* Alt+E – extract archive */
+    case GDK_KEY_e:
+    case GDK_KEY_E:
+        if (state & GDK_ALT_MASK) { fo_extract(fm); return TRUE; }
+        break;
+
+    /* Alt+P – pack (create archive) */
+    case GDK_KEY_p:
+    case GDK_KEY_P:
+        if (state & GDK_ALT_MASK) { fo_pack(fm); return TRUE; }
+        break;
+
+    /* Ctrl+S – filter panel */
+    case GDK_KEY_s:
+    case GDK_KEY_S:
+        if (state & GDK_CONTROL_MASK) {
+            panel_show_filter(active_panel(fm));
+            return TRUE;
+        }
+        break;
+
     /* Ctrl+R – reload both panels */
     case GDK_KEY_r:
     case GDK_KEY_R:
@@ -1183,6 +1467,19 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
 /* ─────────────────────────────────────────────────────────────────── *
  *  Application activate
  * ─────────────────────────────────────────────────────────────────── */
+
+/* ── Hamburger menu action callbacks ──────────────────────────────── */
+
+static void menu_extract(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; fo_extract(d); }
+static void menu_pack(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; fo_pack(d); }
+static void menu_filter(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; panel_show_filter(active_panel(d)); }
+static void menu_ssh(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; ssh_connect_dialog(d); }
+
+/* ─────────────────────────────────────────────────────────────────── */
 
 static void on_activate(GtkApplication *app, gpointer data)
 {
@@ -1238,6 +1535,47 @@ static void on_activate(GtkApplication *app, gpointer data)
     g_signal_connect_swapped(settings_btn, "clicked",
         G_CALLBACK(settings_dialog), fm);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), settings_btn);
+
+    /* ── Hamburger menu ── */
+    {
+        GSimpleActionGroup *win_actions = g_simple_action_group_new();
+
+        GSimpleAction *a_extract = g_simple_action_new("extract", NULL);
+        g_signal_connect(a_extract, "activate", G_CALLBACK(menu_extract), fm);
+        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_extract));
+
+        GSimpleAction *a_pack = g_simple_action_new("pack", NULL);
+        g_signal_connect(a_pack, "activate", G_CALLBACK(menu_pack), fm);
+        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_pack));
+
+        GSimpleAction *a_filter = g_simple_action_new("filter", NULL);
+        g_signal_connect(a_filter, "activate", G_CALLBACK(menu_filter), fm);
+        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_filter));
+
+        GSimpleAction *a_ssh = g_simple_action_new("ssh", NULL);
+        g_signal_connect(a_ssh, "activate", G_CALLBACK(menu_ssh), fm);
+        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_ssh));
+
+        gtk_widget_insert_action_group(fm->window, "fm", G_ACTION_GROUP(win_actions));
+
+        GMenu *menu = g_menu_new();
+
+        GMenu *archive_section = g_menu_new();
+        g_menu_append(archive_section, "Extract archive…    Alt+E", "fm.extract");
+        g_menu_append(archive_section, "Create archive…     Alt+P", "fm.pack");
+        g_menu_append_section(menu, NULL, G_MENU_MODEL(archive_section));
+
+        GMenu *tools_section = g_menu_new();
+        g_menu_append(tools_section, "Filter files…        Ctrl+S", "fm.filter");
+        g_menu_append(tools_section, "SSH / SFTP…", "fm.ssh");
+        g_menu_append_section(menu, NULL, G_MENU_MODEL(tools_section));
+
+        GtkWidget *hamburger = gtk_menu_button_new();
+        gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(hamburger), "open-menu-symbolic");
+        gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(hamburger), G_MENU_MODEL(menu));
+        gtk_widget_set_tooltip_text(hamburger, "Menu");
+        gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), hamburger);
+    }
 
     gtk_window_set_titlebar(GTK_WINDOW(fm->window), hbar);
 

@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <dirent.h>
 
 #define COPY_BUF (256 * 1024)
@@ -1318,6 +1320,417 @@ void fo_rename(FM *fm)
     g_free(old_name);
 
     /* Restore focus to active panel */
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Archive helpers
+ * ─────────────────────────────────────────────────────────────────── */
+
+typedef enum {
+    ARC_UNKNOWN,
+    ARC_TAR_GZ,
+    ARC_TAR_BZ2,
+    ARC_TAR_XZ,
+    ARC_TAR_ZST,
+    ARC_TAR,
+    ARC_ZIP,
+    ARC_7Z,
+    ARC_RAR,
+} ArcType;
+
+static ArcType arc_detect(const char *name)
+{
+    if (!name) return ARC_UNKNOWN;
+    const char *d = strrchr(name, '.');
+    if (!d) return ARC_UNKNOWN;
+
+    /* double extensions first */
+    if (g_str_has_suffix(name, ".tar.gz")  || g_str_has_suffix(name, ".tar.GZ"))  return ARC_TAR_GZ;
+    if (g_str_has_suffix(name, ".tar.bz2") || g_str_has_suffix(name, ".tar.BZ2")) return ARC_TAR_BZ2;
+    if (g_str_has_suffix(name, ".tar.xz")  || g_str_has_suffix(name, ".tar.XZ"))  return ARC_TAR_XZ;
+    if (g_str_has_suffix(name, ".tar.zst") || g_str_has_suffix(name, ".tar.ZST")) return ARC_TAR_ZST;
+
+    const char *ext = d + 1;
+    if (!g_ascii_strcasecmp(ext, "tgz"))   return ARC_TAR_GZ;
+    if (!g_ascii_strcasecmp(ext, "tbz2"))  return ARC_TAR_BZ2;
+    if (!g_ascii_strcasecmp(ext, "txz"))   return ARC_TAR_XZ;
+    if (!g_ascii_strcasecmp(ext, "tar"))   return ARC_TAR;
+    if (!g_ascii_strcasecmp(ext, "zip"))   return ARC_ZIP;
+    if (!g_ascii_strcasecmp(ext, "7z"))    return ARC_7Z;
+    if (!g_ascii_strcasecmp(ext, "rar"))   return ARC_RAR;
+    if (!g_ascii_strcasecmp(ext, "gz"))    return ARC_TAR_GZ;  /* might be plain gz */
+    if (!g_ascii_strcasecmp(ext, "bz2"))   return ARC_TAR_BZ2;
+    if (!g_ascii_strcasecmp(ext, "xz"))    return ARC_TAR_XZ;
+    if (!g_ascii_strcasecmp(ext, "zst"))   return ARC_TAR_ZST;
+    return ARC_UNKNOWN;
+}
+
+static gboolean arc_is_archive(const char *name)
+{
+    return arc_detect(name) != ARC_UNKNOWN;
+}
+
+/* Run a command with a progress dialog, return TRUE on success */
+static gboolean run_archive_cmd(FM *fm, const char *title,
+                                 const char *phase, const gchar **argv)
+{
+    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), title);
+    progress_set_phase(pd, phase);
+
+    /* Show the command target */
+    progress_set_file(pd, argv[0]);
+
+    GPid pid;
+    GError *err = NULL;
+    gboolean spawned = g_spawn_async(NULL, (gchar **)argv, NULL,
+        G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+        NULL, NULL, &pid, &err);
+
+    if (!spawned) {
+        fm_status(fm, "%s error: %s", title, err ? err->message : "?");
+        g_clear_error(&err);
+        progress_free(pd);
+        return FALSE;
+    }
+
+    /* Poll child process while keeping UI alive */
+    gboolean done = FALSE;
+    int status = 0;
+    while (!done && !pd->cancelled) {
+        int r = waitpid(pid, &status, WNOHANG);
+        if (r > 0) {
+            done = TRUE;
+        } else {
+            /* Pump events — keeps pulse animation + cancel button working */
+            while (g_main_context_pending(NULL))
+                g_main_context_iteration(NULL, FALSE);
+            g_usleep(50000); /* 50ms */
+        }
+    }
+
+    if (pd->cancelled && !done) {
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        progress_free(pd);
+        fm_status(fm, "%s cancelled", title);
+        return FALSE;
+    }
+
+    gboolean ok = done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    progress_finish(pd);
+    progress_free(pd);
+    return ok;
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Extract archive
+ * ─────────────────────────────────────────────────────────────────── */
+
+void fo_extract(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    if (p->ssh_conn) {
+        fm_status(fm, "Extract is not supported on SFTP panels");
+        return;
+    }
+
+    gchar *name = panel_cursor_name(p);
+    if (!name || strcmp(name, "..") == 0 || !arc_is_archive(name)) {
+        g_free(name);
+        fm_status(fm, "No archive selected");
+        return;
+    }
+
+    gchar *archive = g_build_filename(p->cwd, name, NULL);
+    ArcType type = arc_detect(name);
+
+    /* Ask destination */
+    Panel *dst = other_panel(fm);
+    gchar *dest = ask_destination(fm, "Extract to", dst->cwd);
+    if (!dest) { g_free(name); g_free(archive); return; }
+
+    const gchar *argv[10];
+    int a = 0;
+    gboolean ok = FALSE;
+
+    switch (type) {
+    case ARC_TAR_GZ:
+    case ARC_TAR_BZ2:
+    case ARC_TAR_XZ:
+    case ARC_TAR_ZST:
+    case ARC_TAR:
+        argv[a++] = "tar";
+        argv[a++] = "xf";
+        argv[a++] = archive;
+        argv[a++] = "-C";
+        argv[a++] = dest;
+        argv[a]   = NULL;
+        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
+        break;
+    case ARC_ZIP:
+        argv[a++] = "unzip";
+        argv[a++] = "-o";
+        argv[a++] = archive;
+        argv[a++] = "-d";
+        argv[a++] = dest;
+        argv[a]   = NULL;
+        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
+        break;
+    case ARC_7Z:
+        argv[a++] = "7z";
+        argv[a++] = "x";
+        argv[a++] = archive;
+        argv[a++] = "-y";
+        {
+            gchar *outdir = g_strdup_printf("-o%s", dest);
+            argv[a++] = outdir;
+            argv[a]   = NULL;
+            ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
+            g_free(outdir);
+        }
+        break;
+    case ARC_RAR:
+        argv[a++] = "unrar";
+        argv[a++] = "x";
+        argv[a++] = "-y";
+        argv[a++] = archive;
+        argv[a++] = dest;
+        argv[a]   = NULL;
+        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
+        break;
+    default:
+        fm_status(fm, "Unknown archive format");
+        break;
+    }
+
+    if (ok) fm_status(fm, "Extracted: %s", name);
+    else if (type != ARC_UNKNOWN) fm_status(fm, "Extract failed: %s", name);
+
+    g_free(name);
+    g_free(archive);
+    g_free(dest);
+    panel_reload(&fm->panels[0]);
+    panel_reload(&fm->panels[1]);
+
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Pack (create archive)
+ * ─────────────────────────────────────────────────────────────────── */
+
+void fo_pack(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    if (p->ssh_conn) {
+        fm_status(fm, "Pack is not supported on SFTP panels");
+        return;
+    }
+
+    GList *targets = panel_selection(p);
+    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
+
+    /* Dialog: archive name + format */
+    DlgCtx ctx;
+    dlg_ctx_init(&ctx);
+
+    GtkWidget *dlg = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dlg), "Create archive");
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 460, -1);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_start(vbox, 12);
+    gtk_widget_set_margin_end(vbox, 12);
+    gtk_widget_set_margin_top(vbox, 12);
+    gtk_widget_set_margin_bottom(vbox, 12);
+
+    /* Format dropdown */
+    GtkWidget *lbl_fmt = gtk_label_new("Format:");
+    gtk_widget_set_halign(lbl_fmt, GTK_ALIGN_END);
+
+    static const char *fmt_labels[] = {
+        "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "zip", "7z", NULL
+    };
+    GtkStringList *fmt_list = gtk_string_list_new(fmt_labels);
+    GtkWidget *fmt_dd = gtk_drop_down_new(G_LIST_MODEL(fmt_list), NULL);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(fmt_dd), 0);  /* default: tar.gz */
+    gtk_widget_set_hexpand(fmt_dd, TRUE);
+
+    /* Archive name */
+    GtkWidget *lbl_name = gtk_label_new("Archive name:");
+    gtk_widget_set_halign(lbl_name, GTK_ALIGN_END);
+
+    GtkWidget *name_entry = gtk_entry_new();
+    gtk_widget_set_hexpand(name_entry, TRUE);
+
+    /* Default name from first selected item */
+    const char *first = targets->data;
+    gchar *default_name = g_strdup_printf("%s.tar.gz", first);
+    gtk_editable_set_text(GTK_EDITABLE(name_entry), default_name);
+    g_free(default_name);
+
+    /* Destination */
+    GtkWidget *lbl_dst = gtk_label_new("Save in:");
+    gtk_widget_set_halign(lbl_dst, GTK_ALIGN_END);
+
+    GtkWidget *dst_entry = gtk_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(dst_entry), other_panel(fm)->cwd);
+    gtk_widget_set_hexpand(dst_entry, TRUE);
+
+    GtkWidget *browse = gtk_button_new_with_label("...");
+    g_signal_connect(browse, "clicked", G_CALLBACK(on_browse_clicked), dst_entry);
+
+    GtkWidget *dst_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_append(GTK_BOX(dst_box), dst_entry);
+    gtk_box_append(GTK_BOX(dst_box), browse);
+
+    /* Layout */
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    int row = 0;
+    gtk_grid_attach(GTK_GRID(grid), lbl_fmt,    0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), fmt_dd,     1, row++, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), lbl_name,   0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), name_entry, 1, row++, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), lbl_dst,    0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), dst_box,    1, row++, 1, 1);
+
+    /* Update name extension when format changes */
+    /* (done manually after dialog, simpler) */
+
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
+    gtk_widget_set_margin_top(btn_box, 8);
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
+    GtkWidget *ok_btn = gtk_button_new_with_label("Create");
+    gtk_widget_add_css_class(ok_btn, "suggested-action");
+    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
+    gtk_box_append(GTK_BOX(btn_box), ok_btn);
+
+    gtk_box_append(GTK_BOX(vbox), grid);
+    gtk_box_append(GTK_BOX(vbox), btn_box);
+    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
+
+    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),       &ctx);
+    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel),   &ctx);
+    g_signal_connect(name_entry, "activate",      G_CALLBACK(dlg_ctx_entry_ok), &ctx);
+    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),    &ctx);
+
+    gtk_window_present(GTK_WINDOW(dlg));
+
+    if (dlg_ctx_run(&ctx) != 1) {
+        gtk_window_destroy(GTK_WINDOW(dlg));
+        g_list_free_full(targets, g_free);
+        return;
+    }
+
+    const gchar *arc_name = gtk_editable_get_text(GTK_EDITABLE(name_entry));
+    const gchar *dst_dir  = gtk_editable_get_text(GTK_EDITABLE(dst_entry));
+    guint fmt_sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(fmt_dd));
+
+    if (!arc_name || !arc_name[0] || !dst_dir || !dst_dir[0]) {
+        gtk_window_destroy(GTK_WINDOW(dlg));
+        g_list_free_full(targets, g_free);
+        return;
+    }
+
+    gchar *arc_path = g_build_filename(dst_dir, arc_name, NULL);
+    gchar *s_arc_name = g_strdup(arc_name);
+
+    gtk_window_destroy(GTK_WINDOW(dlg));
+
+    /* Build command */
+    gboolean ok = FALSE;
+
+    if (fmt_sel <= 3 || fmt_sel == ARC_TAR) {
+        /* tar-based: tar cf archive.tar.gz -C srcdir file1 file2 ... */
+        static const char *tar_flags[] = {
+            "czf",   /* 0: tar.gz  */
+            "cjf",   /* 1: tar.bz2 */
+            "cJf",   /* 2: tar.xz  */
+            NULL,    /* 3: tar.zst (needs --zstd) */
+        };
+
+        /* argv: tar + flag + archive + -C + srcdir + files... + NULL */
+        int n_targets = g_list_length(targets);
+        const gchar **argv = g_new0(const gchar *, n_targets + 6);
+        int a = 0;
+        argv[a++] = "tar";
+        if (fmt_sel == 3) {
+            argv[a++] = "--zstd";
+            argv[a++] = "-cf";
+        } else {
+            argv[a++] = tar_flags[fmt_sel];
+        }
+        argv[a++] = arc_path;
+        argv[a++] = "-C";
+        argv[a++] = p->cwd;
+        for (GList *l = targets; l; l = l->next)
+            argv[a++] = (const char *)l->data;
+        argv[a] = NULL;
+
+        ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
+        g_free(argv);
+
+    } else if (fmt_sel == 4) {
+        /* zip -r archive.zip file1 file2 ... (run from srcdir) */
+        int n_targets = g_list_length(targets);
+        const gchar **argv = g_new0(const gchar *, n_targets + 4);
+        int a = 0;
+        argv[a++] = "zip";
+        argv[a++] = "-r";
+        argv[a++] = arc_path;
+        for (GList *l = targets; l; l = l->next)
+            argv[a++] = (const char *)l->data;
+        argv[a] = NULL;
+
+        /* zip needs to run from source directory */
+        gchar *saved_cwd = g_get_current_dir();
+        if (chdir(p->cwd) == 0) {
+            ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
+            if (saved_cwd) chdir(saved_cwd);
+        }
+        g_free(saved_cwd);
+        g_free(argv);
+
+    } else if (fmt_sel == 5) {
+        /* 7z a archive.7z file1 file2 ... */
+        int n_targets = g_list_length(targets);
+        const gchar **argv = g_new0(const gchar *, n_targets + 4);
+        int a = 0;
+        argv[a++] = "7z";
+        argv[a++] = "a";
+        argv[a++] = arc_path;
+        for (GList *l = targets; l; l = l->next) {
+            gchar *full = g_build_filename(p->cwd, (const char *)l->data, NULL);
+            argv[a++] = full;
+        }
+        argv[a] = NULL;
+
+        ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
+
+        /* Free full paths (stored starting at argv[3]) */
+        for (int i = 3; argv[i]; i++)
+            g_free((gchar *)argv[i]);
+        g_free(argv);
+    }
+
+    if (ok) fm_status(fm, "Created: %s", s_arc_name);
+    else    fm_status(fm, "Pack failed: %s", s_arc_name);
+
+    g_free(arc_path);
+    g_free(s_arc_name);
+    g_list_free_full(targets, g_free);
+    if (p->marks) g_hash_table_remove_all(p->marks);
+    panel_reload(&fm->panels[0]);
+    panel_reload(&fm->panels[1]);
+
     p->inhibit_sel = TRUE;
     gtk_widget_grab_focus(p->column_view);
 }

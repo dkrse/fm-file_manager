@@ -86,7 +86,9 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
             gboolean is_dir = S_ISDIR(st.st_mode);
             gchar *sz = is_dir ? g_strdup("<DIR>") : fmt_size(st.st_size);
             gchar *dt = fmt_date(st.st_mtime);
-            const char *icon = is_dir ? "folder-symbolic" : "text-x-generic-symbolic";
+            gboolean is_link = S_ISLNK(st.st_mode);
+            gboolean is_exec = !is_dir && (st.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
+            const char *icon = icon_for_entry(de->d_name, is_dir, is_link, is_exec);
 
             SearchItem *item = search_item_new(base, de->d_name, sz, dt, is_dir, icon);
             g_list_store_append(ctx->store, item);
@@ -176,9 +178,9 @@ static void on_result_activated(GtkColumnView *cv, guint pos, SearchDlgData *d)
     panel_load(p, item->dir_path);
 
     /* position cursor on found file */
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->sort_model));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     for (guint i = 0; i < n; i++) {
-        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->sort_model), i);
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
         if (fi && strcmp(fi->name, item->name) == 0) {
             g_object_unref(fi);
             p->cursor_pos = i;

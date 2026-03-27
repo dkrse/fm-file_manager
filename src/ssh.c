@@ -170,15 +170,7 @@ gboolean ssh_write_file(SshConn *conn, const char *path,
 
 /* ── panel_load_remote ────────────────────────────────────────────── */
 
-static const char *remote_icon(gboolean is_dir, gboolean is_link,
-                                gboolean is_exec, gboolean is_up)
-{
-    if (is_up)   return "go-up-symbolic";
-    if (is_link) return "emblem-symbolic-link";
-    if (is_dir)  return "folder-symbolic";
-    if (is_exec) return "application-x-executable-symbolic";
-    return "text-x-generic-symbolic";
-}
+/* remote_icon removed — using shared icon_for_entry() from main.c */
 
 void panel_load_remote(Panel *p, const char *path)
 {
@@ -239,7 +231,7 @@ void panel_load_remote(Panel *p, const char *path)
                             (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
                             (attrs.permissions & (S_IXUSR | S_IXGRP | S_IXOTH));
 
-        const char *icon = remote_icon(is_dir, is_link, is_exec, FALSE);
+        const char *icon = icon_for_entry(name_buf, is_dir, is_link, is_exec);
 
         gint64 size_raw = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
                           ? (gint64)attrs.filesize : 0;

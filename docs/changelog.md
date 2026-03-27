@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.8.0] — 2026-03-27
+
+### Archive support, file filter, hamburger menu, content-type icons, configurable icon size
+
+**Archive support (extract + pack):**
+- **Extract** (Alt+E): select archive file → choose destination → extract using system tools
+- **Pack** (Alt+P): select files → choose format, name, destination → create archive
+- Supported formats: tar.gz, tar.bz2, tar.xz, tar.zst, tar, zip, 7z, rar (extract only)
+- Async execution with progress dialog (pulse animation + cancel button)
+- Uses standard system tools: `tar`, `zip`/`unzip`, `7z`, `unrar`
+
+**File filter (Ctrl+S):**
+- Ctrl+S opens filter bar at the bottom of the active panel
+- Instant case-insensitive substring filtering as you type
+- `..` always visible regardless of filter
+- Enter or Escape closes filter and restores full file list
+- Model chain: GListStore → GtkSortListModel → GtkFilterListModel → GtkMultiSelection → GtkColumnView
+
+**Hamburger menu:**
+- New menu button (☰) in header bar with grouped actions:
+  - Archive: Extract archive (Alt+E), Create archive (Alt+P)
+  - Tools: Filter files (Ctrl+S), SSH / SFTP
+- Uses GSimpleActionGroup + GMenu (standard GTK4 pattern)
+
+**Content-type icons:**
+- Files and folders now show freedesktop standard icons based on file extension
+- ~80 extensions mapped: images, audio, video, archives, PDF, office documents, web (HTML/CSS/XML/JSON), source code (C, Python, Java, JS/TS, Rust, Go, Ruby, PHP, SQL, Shell), fonts, shared libraries, disk images, databases
+- Special folder icons: Desktop, Documents, Downloads, Music, Pictures, Videos, Templates, Public, .git
+- Symlinks: `emblem-symbolic-link`, executables: `application-x-executable`
+- Shared `icon_for_entry()` function used by panels (local + SFTP) and search results
+
+**Configurable icon size:**
+- New setting in Settings → Panels → Icons: "Icon size (px)" — range 8–64 px, default 16
+- Stored in `settings.ini` as `icon_size`
+
+---
+
 ## [2.7.0] — 2026-03-27
 
 ### Security fixes, progress dialog redesign, cancel support, async SSH, app icon

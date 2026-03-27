@@ -42,6 +42,8 @@
 #define DEFAULT_DIR_COLOR        "#1565C0"
 #define KEY_MARK_COLOR           "mark_color"
 #define DEFAULT_MARK_COLOR       "#D32F2F"
+#define KEY_ICON_SIZE            "icon_size"
+#define DEFAULT_ICON_SIZE        16
 
 #define DEFAULT_TERMINAL       "gnome-terminal"
 #define DEFAULT_CURSOR_COLOR   "#1A73E8"
@@ -338,6 +340,10 @@ void settings_load(FM *fm)
         fm->mark_color = g_strdup(DEFAULT_MARK_COLOR);
     }
 
+    fm->icon_size = load_int(kf, KEY_ICON_SIZE, DEFAULT_ICON_SIZE);
+    if (fm->icon_size < 8)  fm->icon_size = 8;
+    if (fm->icon_size > 64) fm->icon_size = 64;
+
     g_key_file_free(kf);
 
     apply_font_css(fm);
@@ -401,6 +407,8 @@ void settings_save(FM *fm)
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_DIR_BOLD, fm->dir_bold);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_MARK_COLOR,
                           fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
+    g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_ICON_SIZE,
+                           fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
 
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {
@@ -685,6 +693,21 @@ void settings_dialog(FM *fm)
     gtk_widget_set_hexpand(mark_color_btn, TRUE);
     gtk_grid_attach(GTK_GRID(g1), lbl_mcolor,     0, row, 1, 1);
     gtk_grid_attach(GTK_GRID(g1), mark_color_btn,  1, row++, 1, 1);
+
+    /* ── Icon size ── */
+    GtkWidget *hdr_icon = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr_icon), "<b>Icons</b>");
+    gtk_widget_set_halign(hdr_icon, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(hdr_icon, 10);
+    gtk_grid_attach(GTK_GRID(g1), hdr_icon, 0, row++, 2, 1);
+
+    GtkWidget *lbl_iconsz = gtk_label_new("Icon size (px):");
+    gtk_widget_set_halign(lbl_iconsz, GTK_ALIGN_END);
+    GtkWidget *spin_iconsz = gtk_spin_button_new_with_range(8, 64, 2);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_iconsz),
+        fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
+    gtk_grid_attach(GTK_GRID(g1), lbl_iconsz,  0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g1), spin_iconsz, 1, row++, 1, 1);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g1,
                              gtk_label_new("Panels"));
@@ -986,6 +1009,9 @@ void settings_dialog(FM *fm)
             else
                 fm->mark_color = g_strdup(DEFAULT_MARK_COLOR);
         }
+
+        /* icon size */
+        fm->icon_size = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin_iconsz));
 
         /* terminal */
         const gchar *term_txt = gtk_editable_get_text(GTK_EDITABLE(entry_term));

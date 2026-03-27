@@ -93,6 +93,12 @@ typedef struct {
     guint               cursor_pos;     /* current cursor position            */
     gboolean            inhibit_sel;    /* TRUE while we scroll/unselect programmatically */
     GHashTable         *marks;          /* set of marked filenames (survives reload) */
+    /* filter (Ctrl+S) */
+    GtkWidget          *filter_bar;    /* GtkBox with entry, hidden by default */
+    GtkWidget          *filter_entry;
+    GtkFilterListModel *filter_model;  /* sits between sort_model and selection */
+    GtkCustomFilter    *custom_filter;
+    gchar              *filter_text;   /* current filter string (lowercase)    */
 } Panel;
 
 struct _FM {
@@ -119,6 +125,7 @@ struct _FM {
     int             col_date_width;
     /* display options */
     gboolean        show_hidden;
+    int             icon_size;          /* pixel size for file icons (16–48) */
     /* application settings */
     gchar          *terminal_app;  /* terminal emulator command */
     /* cursor style */
@@ -198,6 +205,8 @@ void fo_move(FM *fm);
 void fo_delete(FM *fm);
 void fo_mkdir(FM *fm);
 void fo_rename(FM *fm);
+void fo_extract(FM *fm);
+void fo_pack(FM *fm);
 
 /* ── search ───────────────────────────────────────────────────────── */
 void search_run(FM *fm);
@@ -241,5 +250,7 @@ static inline Panel *other_panel(FM *fm)  { return &fm->panels[fm->active ^ 1]; 
 gchar *fmt_size(goffset sz);
 gchar *fmt_date(gint64 t);
 void   fm_status(FM *fm, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
+const char *icon_for_entry(const char *name, gboolean is_dir,
+                           gboolean is_link, gboolean is_exec);
 
 #endif /* FM_H */
