@@ -11,14 +11,15 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Copy, move, delete** — F5/F6/F8 with progress dialog (animated phases, byte-level tracking, speed display, cancel button); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
 - **Archive support** — extract and create archives (tar.gz, tar.bz2, tar.xz, tar.zst, zip, 7z, rar)
 - **File filter** — Ctrl+S, instant substring filter on active panel
-- **File search** — F2, recursive glob search with no result limit
+- **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
+- **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel
 - **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS)
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — named connections (name/host/user/port) in settings.ini, selectable via dropdown
-- **Hamburger menu** — Extract, Pack, Filter, SSH accessible from header bar
+- **Hamburger menu** — Search, Mask, Filter, Extract, Pack, SSH accessible from header bar
 - **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
 
 ## Keyboard shortcuts

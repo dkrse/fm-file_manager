@@ -880,7 +880,7 @@ void editor_show(FM *fm)
         }
         ssh_conn = p->ssh_conn;
     } else {
-        filepath = g_build_filename(p->cwd, name, NULL);
+        filepath = panel_cursor_fullpath(p);
         g_free(name);
 
         struct stat st;

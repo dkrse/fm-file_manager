@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.9.0] — 2026-03-27
+
+### Advanced search, file mask, cursor focus fixes, memory optimization
+
+**Advanced file search (F2):**
+- Search dialog with fields: file name (glob), content (text in files), search directory, size min/max (B/KB/MB/GB)
+- Content search: case-insensitive text grep in files, binary files auto-skipped
+- Size filter: min/max with unit selector dropdown
+- `*.*` treated as `*` (DOS/Commander compatibility)
+- Results displayed in active panel (MC style): directory headers (bold path) + files grouped under each directory
+- Enter on result navigates to file's directory and positions cursor on it
+- Backspace returns to previous directory
+- Exit search button (X icon) in path bar
+- Search parameters remembered between calls
+- F3 (viewer) and F4 (editor) work directly on search results via `panel_cursor_fullpath()`
+
+**Memory optimization for large searches:**
+- Two-phase search: lightweight `SearchResult` structs collected first, `FileItem` GObjects created only in final grouped list — halves peak memory
+- String interning (`StringPool`) for directory paths — millions of files sharing same directory use one allocation
+- Store replacement instead of `g_list_store_remove_all()` — avoids expensive signal propagation through model chain on large lists
+- Sorter disabled during search mode, restored only after store is replaced with small directory listing — prevents crash from sorting millions of items
+- Pre-allocated arrays with size hints
+- UI update throttled to every 4096 results
+
+**File mask (hamburger menu → File mask):**
+- Glob pattern display filter (e.g. `*.c`, `*.txt`, `log*`)
+- Files only — directories always visible
+- Case sensitive (shell patterns)
+- `*` or `*.*` or empty clears mask
+- Works alongside Ctrl+S substring filter (both conditions must match)
+- Current mask pre-filled on reopening
+
+**Cursor focus fixes:**
+- Cursor restored when window regains focus (Alt-Tab, taskbar click) via `GtkEventControllerFocus`
+- Cursor restored after hamburger menu closes via `notify::active` signal
+- Focus returned to column view after search completes, mask applies, search exit button click
+
+**Hamburger menu additions:**
+- "Search files… F2" — opens search dialog
+- "File mask…" — opens mask dialog
+
+---
+
 ## [2.8.0] — 2026-03-27
 
 ### Archive support, file filter, hamburger menu, content-type icons, configurable icon size

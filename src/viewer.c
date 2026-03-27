@@ -286,9 +286,9 @@ void viewer_show(FM *fm)
         return;
 #endif
     } else {
-        gchar *fullpath = g_build_filename(p->cwd, name, NULL);
+        gchar *fullpath = panel_cursor_fullpath(p);
         struct stat st;
-        if (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (!fullpath || (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode))) {
             fm_status(fm, "Viewer: '%s' is a directory", name);
             g_free(name);
             g_free(fullpath);

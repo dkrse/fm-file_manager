@@ -12,7 +12,7 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), file filter (Ctrl+S), hamburger menu, path entry navigation (`do_path_activate`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
 | `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
-| `src/search.c` | Recursive glob search dialog, `SearchItem` GObject |
+| `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, `apply_*_css`; SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
 | `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators |
@@ -60,6 +60,9 @@ Each `Panel` has:
 - `cursor_pos` — manual cursor position tracking
 - `inhibit_sel` — flag preventing `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
 - `filter_bar`, `filter_entry`, `filter_text` — Ctrl+S filter UI and state
+- `mask_pattern` — glob mask filter (files only, case sensitive)
+- `search_mode`, `search_prev_cwd`, `search_btn` — search results mode state
+- `default_sorter` — saved sorter for restoring after search mode
 
 **Sort:** Always `..` first, then directories, then files (enforced via `GtkMultiSorter`: a standalone `dirs_first_func` sorter as primary, column view sorter as secondary — direction toggle never affects directory-first ordering). Within each group by active column.
 
@@ -107,15 +110,40 @@ gtk_window_destroy(GTK_WINDOW(dlg));
   - Main operation loop — skips remaining files
   - Size calculation phase — skips to end
 
-## File filter (Ctrl+S)
+## File filter (Ctrl+S) and mask
 
 Each panel has a hidden filter bar (below file list). Ctrl+S shows it, typing filters immediately:
-- `GtkCustomFilter` with `filter_match_func` — case-insensitive substring match on `FileItem.name`
+- `GtkCustomFilter` with `filter_match_func` — evaluates both mask and substring filter
 - `..` always passes filter
 - `GtkFilterListModel` sits between `GtkSortListModel` and `GtkMultiSelection` in the model chain
 - `Panel.filter_text` stores lowercase search string; NULL when filter is inactive
+- `Panel.mask_pattern` stores glob pattern; NULL when mask is off. Applies to files only (dirs always visible), case sensitive (`fnmatch` without `FNM_CASEFOLD`)
+- Both conditions must match: mask first (glob on filename, files only), then substring filter
 - Enter/Escape clears filter text, hides bar, calls `gtk_filter_changed` to restore full list
 - Cursor resets to 0 on each filter change
+
+## File search (F2)
+
+Advanced search with results displayed in active panel (MC style):
+
+**Input dialog:** file name (glob), content (text grep), search directory, size min/max with unit dropdown (B/KB/MB/GB). Parameters saved between calls.
+
+**Search engine (`search.c`):**
+- Two-phase design for memory efficiency:
+  1. Collect lightweight `SearchResult` structs (dir pointer + name + stat data, ~40 bytes each)
+  2. Sort by directory, build grouped `FileItem` GObject list with directory headers
+- `StringPool` — hash-table-based string interning for directory paths. Millions of files sharing same directory use one allocation
+- Content search: `file_contains()` reads files line-by-line, binary detection via null-byte probe on first 512 bytes
+- Files only in results (directories appear as group headers)
+- `*.*` treated as `*` (DOS/Commander compatibility)
+
+**Panel integration:**
+- Sorter disabled (`gtk_sort_list_model_set_sorter(NULL)`) to preserve grouped order
+- Store replaced (not cleared) via `gtk_sort_list_model_set_model()` — avoids O(n) signal propagation
+- `search_mode` flag changes behavior: Enter navigates to result's directory, Backspace returns, Date column shows dir_path
+- `panel_cursor_fullpath()` builds correct path for F3/F4 in search mode
+- Exit search button (X icon) in path bar
+- On exit: store replaced first (small directory), then sorter restored — prevents sorting millions of items
 
 ## Archive support
 
@@ -131,7 +159,7 @@ Each panel has a hidden filter bar (below file list). Ctrl+S shows it, typing fi
 
 ## Hamburger menu
 
-`GSimpleActionGroup` ("fm") with `GMenu` model, attached to `GtkMenuButton` in header bar. Actions: `fm.extract`, `fm.pack`, `fm.filter`, `fm.ssh`.
+`GSimpleActionGroup` ("fm") with `GMenu` model, attached to `GtkMenuButton` in header bar. Actions: `fm.extract`, `fm.pack`, `fm.search`, `fm.mask`, `fm.filter`, `fm.ssh`. Focus restored to active panel on menu close via `notify::active` signal.
 
 ## Content-type icons
 
@@ -173,6 +201,9 @@ Without GtkSourceView (fallback):
 - **Mouse click:** `inhibit_sel` is FALSE on `on_focus_enter` → restore is skipped → `on_selection_changed` sets cursor directly to clicked position (no jump)
 - **After closing viewer/editor:** `inhibit_sel = TRUE` + `gtk_widget_grab_focus(panel->column_view)` → `on_focus_enter` restores cursor
 - **After dialogs (SSH connect, mkdir, rename, delete, copy, move):** same `inhibit_sel + grab_focus` pattern restores cursor
+- **Window regains focus (Alt-Tab, taskbar):** `GtkEventControllerFocus` on window fires `on_window_focus_in` → `restore_panel_cursor()`
+- **Hamburger menu closes:** `notify::active` on `GtkMenuButton` fires `on_hamburger_toggled` → `restore_panel_cursor()`
+- **After search/mask:** explicit `gtk_widget_grab_focus(p->column_view)` at end of operation
 
 ## SSH — async connect
 
@@ -244,6 +275,8 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - `lstat()` everywhere (not `stat()`) — correct symlink detection
 - Cross-device move: `rename()` → `EXDEV` → fallback copy+delete
 - `g_list_store_splice()` for batch insert (performance with 4000+ files)
+- Store replacement via `gtk_sort_list_model_set_model()` instead of `g_list_store_remove_all()` — critical for large lists (search results with millions of items)
+- `FileItem.dir_path` — used in search mode to store the directory containing the file; NULL for normal directory listings and directory header rows
 - `inhibit_sel` must be set BEFORE each `gtk_column_view_scroll_to(..., GTK_LIST_SCROLL_SELECT, ...)`
 - `ssh_write_file` writes in a loop (`libssh2_sftp_write` may return partial write)
 - `EditorCtx.filepath` is NULL for SFTP editing; `EditorCtx.remote_path` is NULL for local — always use `title = remote_path ?: filepath`

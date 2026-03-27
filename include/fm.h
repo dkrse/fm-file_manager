@@ -29,6 +29,7 @@ struct _FileItem {
     gint64    size_raw;    /* for sorting                     */
     gint64    date_raw;    /* for sorting                     */
     gboolean  marked;     /* user-toggled mark for ops       */
+    gchar    *dir_path;   /* search results: directory containing this file (NULL otherwise) */
 };
 
 FileItem *file_item_new(const char *icon_name, const char *name,
@@ -82,6 +83,7 @@ typedef struct {
     GtkWidget          *column_view;    /* GtkColumnView                      */
     GListStore         *store;          /* GListStore<FileItem>               */
     GtkSortListModel   *sort_model;     /* wraps store with sorters           */
+    GtkSorter          *default_sorter; /* saved for restoring after search    */
     GtkMultiSelection  *selection;      /* selection model for column view    */
     GtkWidget          *status_label;   /* selection / item count             */
     GtkWidget          *disconnect_btn; /* shown when ssh_conn active         */
@@ -99,6 +101,11 @@ typedef struct {
     GtkFilterListModel *filter_model;  /* sits between sort_model and selection */
     GtkCustomFilter    *custom_filter;
     gchar              *filter_text;   /* current filter string (lowercase)    */
+    gchar              *mask_pattern;  /* glob mask (e.g. "*.c"), NULL = off   */
+    /* search results mode */
+    gboolean            search_mode;   /* TRUE when panel shows search results */
+    char                search_prev_cwd[4096]; /* cwd to restore on leaving search */
+    GtkWidget          *search_btn;    /* "exit search" button – hidden by default */
 } Panel;
 
 struct _FM {
@@ -196,6 +203,7 @@ void   panel_load_remote(Panel *p, const char *path);
 void   panel_reload(Panel *p);
 void   panel_go_up(Panel *p);
 gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
+gchar *panel_cursor_fullpath(Panel *p);     /* full path (search-aware), caller must g_free() */
 GList *panel_selection(Panel *p);            /* g_list_free_full(l, g_free) */
 void   panel_update_status(Panel *p);
 

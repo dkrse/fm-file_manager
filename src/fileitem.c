@@ -9,6 +9,7 @@ static void file_item_finalize(GObject *obj)
     g_free(self->name);
     g_free(self->size);
     g_free(self->date);
+    g_free(self->dir_path);
     G_OBJECT_CLASS(file_item_parent_class)->finalize(obj);
 }
 
