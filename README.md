@@ -10,7 +10,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **File marking** — Insert/Space marks files (colored), `+` marks all; marks used for copy/move/delete
 - **Copy, move, delete** — F5/F6/F8 with progress dialog (animated phases, byte-level tracking, speed display, cancel button); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
 - **Archive support** — extract and create archives (tar.gz, tar.bz2, tar.xz, tar.zst, zip, 7z, rar)
-- **File filter** — Ctrl+S, instant substring filter on active panel
+- **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel
 - **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
@@ -19,7 +19,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — named connections (name/host/user/port) in settings.ini, selectable via dropdown
-- **Hamburger menu** — Search, Mask, Filter, Extract, Pack, SSH accessible from header bar
+- **Per-panel hamburger menu** — SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
 
 ## Keyboard shortcuts
@@ -40,9 +40,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F6 | Move |
 | F7 | New directory |
 | F8 | Delete |
-| F9 | Rename |
 | F10 | Quit |
-| Ctrl+S | Filter files in active panel |
+| Ctrl+S | Incremental search (MC-style jump to file) |
 | Ctrl+H | Hidden files |
 | Ctrl+R | Refresh both panels |
 | Ctrl+= | Synchronize panels |
@@ -120,7 +119,7 @@ Makefile            — build system
 
 Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear icon):
 
-**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, directory color and bold, mark color, icon size (8–64 px)
+**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, row hover highlight, directory color and bold, mark color, icon size (8–64 px)
 
 **Cursor** — style (filled color or outline only), cursor color
 
@@ -134,7 +133,7 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 Stored in `~/.config/fm/settings.ini`, section `[ssh]`, key `connections`. Format: `name|user|host|port` separated by `;`.
 
-The dialog (SSH icon or hamburger menu) allows:
+The dialog (panel hamburger menu → SSH/SFTP) allows:
 - **Select** a saved connection from the dropdown → fills the form
 - **New** — clears the form for entering a new connection
 - **Save** — saves/updates the connection (password is not saved)

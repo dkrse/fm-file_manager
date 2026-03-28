@@ -9,7 +9,7 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | File | Responsibility |
 |------|---------------|
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
-| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), file filter (Ctrl+S), hamburger menu, path entry navigation (`do_path_activate`) |
+| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), incremental search (Ctrl+S), per-panel hamburger menus, path entry navigation (`do_path_activate`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
 | `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display |
@@ -54,12 +54,12 @@ Each `Panel` has:
 - `path_entry` — editable path; Enter navigates, Escape restores; supports `~` and relative paths
 - `GListStore<FileItem>` — raw data
 - `GtkSortListModel` — sorts store (synchronous, `incremental=FALSE`)
-- `GtkFilterListModel` — wraps sort model; filters by `filter_text` (Ctrl+S)
+- `GtkFilterListModel` — wraps sort model; filters by mask pattern
 - `GtkMultiSelection` — selection over filter model
 - `GtkColumnView` — 3 columns (Name, Size, Date) via `GtkSignalListItemFactory`
 - `cursor_pos` — manual cursor position tracking
 - `inhibit_sel` — flag preventing `on_selection_changed` from overwriting `cursor_pos` during programmatic selection
-- `filter_bar`, `filter_entry`, `filter_text` — Ctrl+S filter UI and state
+- `filter_bar`, `filter_entry` — Ctrl+S incremental search UI (MC-style jump to file, no filtering)
 - `mask_pattern` — glob mask filter (files only, case sensitive)
 - `search_mode`, `search_prev_cwd`, `search_btn` — search results mode state
 - `default_sorter` — saved sorter for restoring after search mode
@@ -73,7 +73,7 @@ Each `Panel` has:
 1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global, Ctrl+S (filter), Alt+E (extract), Alt+P (pack) (skipped if `GtkEntry` has focus)
 2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+` (mark/unmark all)
 3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
-4. `on_filter_key` (filter entry) — Enter/Escape (close filter, restore full list)
+4. `on_filter_key` (CAPTURE phase, filter entry) — Escape (close search bar), Enter (close + activate item), arrows/PgUp/PgDn/Home/End (close, cursor stays)
 
 ## Dialog pattern
 
@@ -110,17 +110,21 @@ gtk_window_destroy(GTK_WINDOW(dlg));
   - Main operation loop — skips remaining files
   - Size calculation phase — skips to end
 
-## File filter (Ctrl+S) and mask
+## Incremental search (Ctrl+S) and file mask
 
-Each panel has a hidden filter bar (below file list). Ctrl+S shows it, typing filters immediately:
-- `GtkCustomFilter` with `filter_match_func` — evaluates both mask and substring filter
+**Ctrl+S — MC-style incremental search:**
+- Each panel has a hidden search bar (below file list). Ctrl+S shows it and grabs focus
+- Typing jumps cursor to the first matching file (case-insensitive substring match) — the file list is NOT filtered
+- Enter closes search bar and activates the item under cursor (`activate_item()`)
+- Arrow keys, PageUp/Down, Home/End close search bar (cursor stays on current item)
+- Escape closes search bar without action
+- Key controller uses `GTK_PHASE_CAPTURE` to intercept Enter/arrows before GtkEntry consumes them
+
+**File mask (panel menu → File mask):**
+- `GtkCustomFilter` with `filter_match_func` — evaluates mask pattern
 - `..` always passes filter
 - `GtkFilterListModel` sits between `GtkSortListModel` and `GtkMultiSelection` in the model chain
-- `Panel.filter_text` stores lowercase search string; NULL when filter is inactive
 - `Panel.mask_pattern` stores glob pattern; NULL when mask is off. Applies to files only (dirs always visible), case sensitive (`fnmatch` without `FNM_CASEFOLD`)
-- Both conditions must match: mask first (glob on filename, files only), then substring filter
-- Enter/Escape clears filter text, hides bar, calls `gtk_filter_changed` to restore full list
-- Cursor resets to 0 on each filter change
 
 ## File search (F2)
 
@@ -157,9 +161,9 @@ Advanced search with results displayed in active panel (MC style):
 
 **Pack:** Dialog with format dropdown (6 options), archive name entry, destination entry. Builds argv based on selected format: `tar czf/cjf/cJf/--zstd`, `zip -r`, `7z a`.
 
-## Hamburger menu
+## Per-panel hamburger menus
 
-`GSimpleActionGroup` ("fm") with `GMenu` model, attached to `GtkMenuButton` in header bar. Actions: `fm.extract`, `fm.pack`, `fm.search`, `fm.mask`, `fm.filter`, `fm.ssh`. Focus restored to active panel on menu close via `notify::active` signal.
+Each panel has its own `GtkMenuButton` (☰) in the path bar with a `GSimpleActionGroup` using prefix `p0`/`p1`. Menu items: SSH/SFTP, Create archive, Extract archive, File mask, Search files, Filter files. Each callback sets the panel as active before executing the action. Actions are inserted on the menu button widget itself via `gtk_widget_insert_action_group()`.
 
 ## Content-type icons
 
@@ -202,7 +206,6 @@ Without GtkSourceView (fallback):
 - **After closing viewer/editor:** `inhibit_sel = TRUE` + `gtk_widget_grab_focus(panel->column_view)` → `on_focus_enter` restores cursor
 - **After dialogs (SSH connect, mkdir, rename, delete, copy, move):** same `inhibit_sel + grab_focus` pattern restores cursor
 - **Window regains focus (Alt-Tab, taskbar):** `GtkEventControllerFocus` on window fires `on_window_focus_in` → `restore_panel_cursor()`
-- **Hamburger menu closes:** `notify::active` on `GtkMenuButton` fires `on_hamburger_toggled` → `restore_panel_cursor()`
 - **After search/mask:** explicit `gtk_widget_grab_focus(p->column_view)` at end of operation
 
 ## SSH — async connect
@@ -245,6 +248,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `gui_font_family`, `gui_font_size` | GUI font |
 | `col_name_width`, `col_size_width`, `col_date_width` | Column widths |
 | `show_hidden` | Hidden files |
+| `show_hover` | Row hover highlight (default true) |
 | `icon_size` | File icon pixel size (8–64, default 16) |
 | `terminal_app` | Terminal emulator |
 | `cursor_color`, `cursor_outline` | Cursor style |
@@ -290,3 +294,4 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - Archive commands run async via `g_spawn_async` + `waitpid(WNOHANG)` poll loop — cancel sends `SIGTERM`
 - Filter model uses `filter_model` (not `sort_model`) for all item access: `panel_cursor_name`, `panel_selection`, cursor navigation, search result lookup
 - `icon_for_entry()` returns static string constants — safe for `FileItem.icon_name` (not freed in finalize)
+- Ctrl+S search bar key controller uses `GTK_PHASE_CAPTURE` — required because GtkEntry otherwise consumes Enter/arrows before the handler sees them

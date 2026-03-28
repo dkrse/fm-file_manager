@@ -132,6 +132,7 @@ struct _FM {
     int             col_date_width;
     /* display options */
     gboolean        show_hidden;
+    gboolean        show_hover;     /* show row hover highlight */
     int             icon_size;          /* pixel size for file icons (16–48) */
     /* application settings */
     gchar          *terminal_app;  /* terminal emulator command */

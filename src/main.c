@@ -1156,35 +1156,34 @@ static gboolean filter_match_func(gpointer item, gpointer user_data)
             return FALSE;
     }
 
-    /* Substring filter (Ctrl+S) */
-    if (p->filter_text && p->filter_text[0]) {
-        gchar *lower = g_utf8_strdown(fi->name, -1);
-        gboolean match = (strstr(lower, p->filter_text) != NULL);
-        g_free(lower);
-        return match;
-    }
-
     return TRUE;
 }
 
 static void on_filter_changed(GtkEditable *editable, Panel *p)
 {
-    g_free(p->filter_text);
     const gchar *text = gtk_editable_get_text(editable);
-    p->filter_text = (text && text[0]) ? g_utf8_strdown(text, -1) : NULL;
+    if (!text || !text[0]) return;
 
-    gtk_filter_changed(GTK_FILTER(p->custom_filter), GTK_FILTER_CHANGE_DIFFERENT);
-
-    /* Reset cursor to top */
-    p->cursor_pos = 0;
+    /* MC-style incremental search: jump cursor to first matching item */
+    gchar *lower = g_utf8_strdown(text, -1);
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
-    if (n > 0) {
-        p->inhibit_sel = TRUE;
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
-                                  NULL, GTK_LIST_SCROLL_SELECT, NULL);
-        p->inhibit_sel = FALSE;
+    for (guint i = 0; i < n; i++) {
+        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+        if (!item) continue;
+        gchar *name_lower = g_utf8_strdown(item->name, -1);
+        gboolean match = (strstr(name_lower, lower) != NULL);
+        g_free(name_lower);
+        g_object_unref(item);
+        if (match) {
+            p->cursor_pos = i;
+            p->inhibit_sel = TRUE;
+            gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
+                                      NULL, GTK_LIST_SCROLL_SELECT, NULL);
+            p->inhibit_sel = FALSE;
+            break;
+        }
     }
-    panel_update_status(p);
+    g_free(lower);
 }
 
 static gboolean on_filter_key(GtkEventControllerKey *ctrl,
@@ -1192,16 +1191,28 @@ static gboolean on_filter_key(GtkEventControllerKey *ctrl,
                                GdkModifierType state, Panel *p)
 {
     (void)ctrl; (void)keycode; (void)state;
-    if (keyval == GDK_KEY_Escape || keyval == GDK_KEY_Return ||
-        keyval == GDK_KEY_KP_Enter) {
-        /* Close filter bar */
+    if (keyval == GDK_KEY_Escape) {
+        /* Close search bar, consume key */
         gtk_widget_set_visible(p->filter_bar, FALSE);
-        g_free(p->filter_text);
-        p->filter_text = NULL;
         gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
-        gtk_filter_changed(GTK_FILTER(p->custom_filter), GTK_FILTER_CHANGE_DIFFERENT);
         gtk_widget_grab_focus(p->column_view);
-        panel_update_status(p);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        /* Close search bar and activate the item under cursor */
+        gtk_widget_set_visible(p->filter_bar, FALSE);
+        gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
+        gtk_widget_grab_focus(p->column_view);
+        activate_item(p);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Up    || keyval == GDK_KEY_Down  ||
+        keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_Page_Down ||
+        keyval == GDK_KEY_Home  || keyval == GDK_KEY_End) {
+        /* Close search bar, cursor stays */
+        gtk_widget_set_visible(p->filter_bar, FALSE);
+        gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
+        gtk_widget_grab_focus(p->column_view);
         return TRUE;
     }
     return FALSE;
@@ -1213,7 +1224,22 @@ static void panel_show_filter(Panel *p)
     gtk_widget_grab_focus(p->filter_entry);
 }
 
-/* ─────────────────────────────────────────────────────────────────── *
+static void menu_mask(GSimpleAction *a, GVariant *v, gpointer d);
+/* Per-panel hamburger menu callbacks */
+static void pmenu_ssh(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); ssh_connect_dialog(p->fm); }
+static void pmenu_pack(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); fo_pack(p->fm); }
+static void pmenu_extract(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); fo_extract(p->fm); }
+static void pmenu_mask(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); menu_mask(a, v, p->fm); }
+static void pmenu_search(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); search_run(p->fm); }
+static void pmenu_filter(GSimpleAction *a, GVariant *v, gpointer d)
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); panel_show_filter(p); }
+
+/*─────────────────────────────────────────────────────────────────── *
  *  Panel: widget setup
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -1253,12 +1279,67 @@ void panel_setup(Panel *p, FM *fm, int idx)
     p->terminal_btn = gtk_button_new_from_icon_name("utilities-terminal-symbolic");
     gtk_widget_set_tooltip_text(p->terminal_btn, "Open terminal");
 
-    gtk_box_append(GTK_BOX(path_box), p->path_entry);
-    gtk_box_append(GTK_BOX(path_box), p->terminal_btn);
-    gtk_box_append(GTK_BOX(path_box), p->disconnect_btn);
-    gtk_box_append(GTK_BOX(path_box), p->search_btn);
-    gtk_box_append(GTK_BOX(path_box), up_btn);
-    gtk_box_append(GTK_BOX(path_box), home_btn);
+    /* ── Per-panel hamburger menu ── */
+    {
+        gchar *grp = g_strdup_printf("p%d", idx);
+
+        GSimpleActionGroup *ag = g_simple_action_group_new();
+        struct { const char *name; GCallback cb; } acts[] = {
+            { "ssh",     G_CALLBACK(pmenu_ssh)     },
+            { "pack",    G_CALLBACK(pmenu_pack)    },
+            { "extract", G_CALLBACK(pmenu_extract) },
+            { "mask",    G_CALLBACK(pmenu_mask)    },
+            { "search",  G_CALLBACK(pmenu_search)  },
+            { "filter",  G_CALLBACK(pmenu_filter)  },
+        };
+        for (gsize i = 0; i < G_N_ELEMENTS(acts); i++) {
+            GSimpleAction *sa = g_simple_action_new(acts[i].name, NULL);
+            g_signal_connect(sa, "activate", acts[i].cb, p);
+            g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(sa));
+        }
+
+        GMenu *pmenu = g_menu_new();
+        GMenu *s1 = g_menu_new();
+        gchar *a_ssh = g_strdup_printf("%s.ssh", grp);
+        g_menu_append(s1, "SSH / SFTP\u2026", a_ssh);
+        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s1));
+
+        GMenu *s2 = g_menu_new();
+        gchar *a_pack    = g_strdup_printf("%s.pack", grp);
+        gchar *a_extract = g_strdup_printf("%s.extract", grp);
+        g_menu_append(s2, "Create archive\u2026", a_pack);
+        g_menu_append(s2, "Extract archive\u2026", a_extract);
+        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s2));
+
+        GMenu *s3 = g_menu_new();
+        gchar *a_mask   = g_strdup_printf("%s.mask", grp);
+        gchar *a_search = g_strdup_printf("%s.search", grp);
+        gchar *a_filter = g_strdup_printf("%s.filter", grp);
+        g_menu_append(s3, "File mask\u2026", a_mask);
+        g_menu_append(s3, "Search files\u2026    F2", a_search);
+        g_menu_append(s3, "Filter files\u2026    Ctrl+S", a_filter);
+        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s3));
+
+        GtkWidget *hbtn = gtk_menu_button_new();
+        gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(hbtn), "open-menu-symbolic");
+        gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(hbtn), G_MENU_MODEL(pmenu));
+        gtk_widget_set_tooltip_text(hbtn, "Panel menu");
+        gtk_widget_set_focusable(hbtn, FALSE);
+
+        /* Insert action group on the menu button itself */
+        gtk_widget_insert_action_group(hbtn, grp, G_ACTION_GROUP(ag));
+
+        gtk_box_append(GTK_BOX(path_box), p->path_entry);
+        gtk_box_append(GTK_BOX(path_box), hbtn);
+        gtk_box_append(GTK_BOX(path_box), p->terminal_btn);
+        gtk_box_append(GTK_BOX(path_box), p->disconnect_btn);
+        gtk_box_append(GTK_BOX(path_box), p->search_btn);
+        gtk_box_append(GTK_BOX(path_box), up_btn);
+        gtk_box_append(GTK_BOX(path_box), home_btn);
+
+        g_free(grp); g_free(a_ssh); g_free(a_pack); g_free(a_extract);
+        g_free(a_mask); g_free(a_search); g_free(a_filter);
+    }
 
     /* ── GListStore ── */
     p->store = g_list_store_new(FILE_ITEM_TYPE);
@@ -1369,6 +1450,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
 
     g_signal_connect(p->filter_entry, "changed", G_CALLBACK(on_filter_changed), p);
     GtkEventController *filt_key = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(filt_key, GTK_PHASE_CAPTURE);
     g_signal_connect(filt_key, "key-pressed", G_CALLBACK(on_filter_key), p);
     gtk_widget_add_controller(p->filter_entry, filt_key);
 
@@ -1417,13 +1499,9 @@ static void btn_copy(GtkButton *b, gpointer d)    { (void)b; fo_copy(d);   }
 static void btn_move(GtkButton *b, gpointer d)    { (void)b; fo_move(d);   }
 static void btn_mkdir(GtkButton *b, gpointer d)   { (void)b; fo_mkdir(d);  }
 static void btn_delete(GtkButton *b, gpointer d)  { (void)b; fo_delete(d); }
-static void btn_rename(GtkButton *b, gpointer d)  { (void)b; fo_rename(d); }
 static void btn_find(GtkButton *b, gpointer d)    { (void)b; search_run(d); }
 static void btn_view(GtkButton *b, gpointer d)    { (void)b; viewer_show(d); }
 static void btn_editor(GtkButton *b, gpointer d)  { (void)b; editor_show(d); }
-static void btn_extract(GtkButton *b, gpointer d) { (void)b; fo_extract(d); }
-static void btn_pack(GtkButton *b, gpointer d)    { (void)b; fo_pack(d);  }
-static void btn_ssh(GtkButton *b, gpointer d)     { (void)b; ssh_connect_dialog(d); }
 static void btn_quit(GtkButton *b, gpointer d)    { (void)b; g_application_quit(G_APPLICATION(((FM*)d)->app)); }
 
 static GtkWidget *create_toolbar(FM *fm)
@@ -1433,17 +1511,13 @@ static GtkWidget *create_toolbar(FM *fm)
         const char *tooltip;
         void (*cb)(GtkButton *, gpointer);
     } btns[] = {
-        { "F5 Copy",    "Copy to other panel",      btn_copy    },
-        { "F6 Move",    "Move to other panel",       btn_move    },
-        { "F7 MkDir",   "Create new directory",      btn_mkdir   },
-        { "F8 Delete",  "Delete selected files",     btn_delete  },
-        { "F9 Rename",  "Rename current file",       btn_rename  },
         { "F2 Search",  "Search files",              btn_find    },
         { "F3 View",    "View file contents",        btn_view    },
         { "F4 Editor",  "Open file in editor",       btn_editor  },
-        { "Extract",    "Extract archive (Alt+E)",   btn_extract },
-        { "Pack",       "Create archive (Alt+P)",    btn_pack    },
-        { "SSH",        "Connect via SSH/SFTP",      btn_ssh     },
+        { "F5 Copy",    "Copy to other panel",       btn_copy    },
+        { "F6 Move",    "Move to other panel",       btn_move    },
+        { "F7 MkDir",   "Create new directory",      btn_mkdir   },
+        { "F8 Delete",  "Delete selected files",     btn_delete  },
         { "F10 Quit",   "Quit application",          btn_quit    },
     };
 
@@ -1564,16 +1638,7 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
  *  Application activate
  * ─────────────────────────────────────────────────────────────────── */
 
-/* ── Hamburger menu action callbacks ──────────────────────────────── */
-
-static void menu_extract(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; fo_extract(d); }
-static void menu_pack(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; fo_pack(d); }
-static void menu_filter(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; panel_show_filter(active_panel(d)); }
-static void menu_search(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; search_run(d); }
+/* ── Menu action callbacks ────────────────────────────────────────── */
 
 static void menu_mask(GSimpleAction *a, GVariant *v, gpointer d)
 {
@@ -1650,9 +1715,6 @@ static void menu_mask(GSimpleAction *a, GVariant *v, gpointer d)
     panel_update_status(p);
     gtk_widget_grab_focus(p->column_view);
 }
-static void menu_ssh(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; ssh_connect_dialog(d); }
-
 static void restore_panel_cursor(FM *fm)
 {
     Panel *p = active_panel(fm);
@@ -1663,13 +1725,6 @@ static void restore_panel_cursor(FM *fm)
                                   p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
         p->inhibit_sel = FALSE;
     }
-}
-
-static void on_hamburger_toggled(GtkMenuButton *btn, GParamSpec *pspec, FM *fm)
-{
-    (void)pspec;
-    if (gtk_menu_button_get_active(btn)) return;
-    restore_panel_cursor(fm);
 }
 
 static void on_window_focus_in(GtkEventControllerFocus *ctrl, FM *fm)
@@ -1735,60 +1790,7 @@ static void on_activate(GtkApplication *app, gpointer data)
         G_CALLBACK(settings_dialog), fm);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), settings_btn);
 
-    /* ── Hamburger menu ── */
-    {
-        GSimpleActionGroup *win_actions = g_simple_action_group_new();
 
-        GSimpleAction *a_extract = g_simple_action_new("extract", NULL);
-        g_signal_connect(a_extract, "activate", G_CALLBACK(menu_extract), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_extract));
-
-        GSimpleAction *a_pack = g_simple_action_new("pack", NULL);
-        g_signal_connect(a_pack, "activate", G_CALLBACK(menu_pack), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_pack));
-
-        GSimpleAction *a_search = g_simple_action_new("search", NULL);
-        g_signal_connect(a_search, "activate", G_CALLBACK(menu_search), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_search));
-
-        GSimpleAction *a_mask = g_simple_action_new("mask", NULL);
-        g_signal_connect(a_mask, "activate", G_CALLBACK(menu_mask), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_mask));
-
-        GSimpleAction *a_filter = g_simple_action_new("filter", NULL);
-        g_signal_connect(a_filter, "activate", G_CALLBACK(menu_filter), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_filter));
-
-        GSimpleAction *a_ssh = g_simple_action_new("ssh", NULL);
-        g_signal_connect(a_ssh, "activate", G_CALLBACK(menu_ssh), fm);
-        g_action_map_add_action(G_ACTION_MAP(win_actions), G_ACTION(a_ssh));
-
-        gtk_widget_insert_action_group(fm->window, "fm", G_ACTION_GROUP(win_actions));
-
-        GMenu *menu = g_menu_new();
-
-        GMenu *archive_section = g_menu_new();
-        g_menu_append(archive_section, "Extract archive…    Alt+E", "fm.extract");
-        g_menu_append(archive_section, "Create archive…     Alt+P", "fm.pack");
-        g_menu_append_section(menu, NULL, G_MENU_MODEL(archive_section));
-
-        GMenu *tools_section = g_menu_new();
-        g_menu_append(tools_section, "Search files…        F2", "fm.search");
-        g_menu_append(tools_section, "File mask…", "fm.mask");
-        g_menu_append(tools_section, "Filter files…        Ctrl+S", "fm.filter");
-        g_menu_append(tools_section, "SSH / SFTP…", "fm.ssh");
-        g_menu_append_section(menu, NULL, G_MENU_MODEL(tools_section));
-
-        GtkWidget *hamburger = gtk_menu_button_new();
-        gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(hamburger), "open-menu-symbolic");
-        gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(hamburger), G_MENU_MODEL(menu));
-        gtk_widget_set_tooltip_text(hamburger, "Menu");
-        gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), hamburger);
-
-        /* Restore focus to active panel after menu closes */
-        g_signal_connect(hamburger, "notify::active",
-            G_CALLBACK(on_hamburger_toggled), fm);
-    }
 
     gtk_window_set_titlebar(GTK_WINDOW(fm->window), hbar);
 

@@ -21,6 +21,7 @@
 #define KEY_COL_DATE_W  "col_date_width"
 #define KEY_BOOKMARKS      "bookmarks"
 #define KEY_SHOW_HIDDEN    "show_hidden"
+#define KEY_SHOW_HOVER     "show_hover"
 #define KEY_TERMINAL       "terminal_app"
 #define KEY_CURSOR_COLOR    "cursor_color"
 #define KEY_CURSOR_OUTLINE  "cursor_outline"
@@ -180,8 +181,14 @@ static void apply_gui_css(FM *fm)
         "  outline: none;"
         "  outline-width: 0;"
         "}"
+        "%s"
         "%s",
-        gui_fam, gui_sz, cursor_css);
+        gui_fam, gui_sz, cursor_css,
+        fm->show_hover ? "" :
+            "columnview listview row:hover:not(:selected) {"
+            "  background-color: transparent;"
+            "  background-image: none;"
+            "}");
     g_free(cursor_css);
     gtk_css_provider_load_from_string(fm->css_provider, css);
     g_free(css);
@@ -247,6 +254,10 @@ void settings_load(FM *fm)
     GError *sherr = NULL;
     fm->show_hidden = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SHOW_HIDDEN, &sherr);
     if (sherr) { g_clear_error(&sherr); fm->show_hidden = FALSE; }
+
+    GError *hoverr = NULL;
+    fm->show_hover = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SHOW_HOVER, &hoverr);
+    if (hoverr) { g_clear_error(&hoverr); fm->show_hover = TRUE; }
 
     g_free(fm->terminal_app);
     fm->terminal_app = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_TERMINAL, NULL);
@@ -377,6 +388,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_COL_DATE_W,
                            fm->col_date_width > 0 ? fm->col_date_width : DEFAULT_COL_DATE_W);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SHOW_HIDDEN, fm->show_hidden);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SHOW_HOVER, fm->show_hover);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_TERMINAL,
                           fm->terminal_app ? fm->terminal_app : DEFAULT_TERMINAL);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_CURSOR_COLOR,
@@ -651,6 +663,10 @@ void settings_dialog(FM *fm)
     GtkWidget *chk_hidden = gtk_check_button_new_with_label("Show hidden files");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hidden), fm->show_hidden);
     gtk_grid_attach(GTK_GRID(g1), chk_hidden, 0, row++, 2, 1);
+
+    GtkWidget *chk_hover = gtk_check_button_new_with_label("Show row hover highlight");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hover), fm->show_hover);
+    gtk_grid_attach(GTK_GRID(g1), chk_hover, 0, row++, 2, 1);
 
     /* ── Directory appearance ── */
     GtkWidget *hdr_dir = gtk_label_new(NULL);
@@ -980,6 +996,7 @@ void settings_dialog(FM *fm)
 
         /* show hidden */
         fm->show_hidden = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_hidden));
+        fm->show_hover = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_hover));
 
         /* directory appearance */
         {

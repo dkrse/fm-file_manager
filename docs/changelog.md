@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.10.0] — 2026-03-28
+
+### MC-style incremental search, per-panel hamburger menus, toolbar reorder, hover setting
+
+**Ctrl+S — MC-style incremental search:**
+- Ctrl+S no longer filters the file list — instead, typing jumps the cursor to the first matching file (case-insensitive substring match), like Midnight Commander
+- Full file list remains visible at all times
+- Enter closes search bar and activates the item (opens file/directory)
+- Arrow keys, PageUp/Down, Home/End close search bar (cursor stays on current item)
+- Escape closes search bar without action
+- Key controller uses `GTK_PHASE_CAPTURE` to intercept Enter before GtkEntry consumes it
+
+**Per-panel hamburger menus:**
+- Each panel now has its own hamburger menu button (☰) in the path bar
+- Menu items: SSH/SFTP, Create archive, Extract archive, File mask, Search files, Filter files
+- Clicking a menu item activates the corresponding panel before executing the action
+- Actions use `GSimpleActionGroup` per panel with unique prefixes (`p0.*`, `p1.*`)
+- Old global hamburger menu in header bar removed
+
+**Bottom toolbar reorder:**
+- Buttons reordered to: F2 Search, F3 View, F4 Editor, F5 Copy, F6 Move, F7 MkDir, F8 Delete, F10 Quit
+- Removed from toolbar: F9 Rename, Extract, Pack, SSH (available in per-panel menus)
+
+**Row hover highlight setting:**
+- New setting in Settings → Display: "Show row hover highlight"
+- When disabled, the subtle row highlight on mouse hover is hidden via CSS (`row:hover:not(:selected) { background-color: transparent }`)
+- Default: enabled (hover visible)
+- Stored in `settings.ini` as `show_hover`
+
+---
+
 ## [2.9.0] — 2026-03-27
 
 ### Advanced search, file mask, cursor focus fixes, memory optimization
