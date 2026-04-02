@@ -255,9 +255,12 @@ settings.ini [ssh]
 
 ## Security
 
-- **Path traversal guard:** `name_is_safe()` in fileops.c rejects filenames containing `/`, `..`, or empty strings — applied to all file operations (copy, move, delete, rename, mkdir)
-- **Command injection prevention:** Terminal launch uses `g_spawn_async()` with argv array (no shell parsing); SSH remote paths quoted via `g_shell_quote()`
-- **Temp file safety:** Remote file preview creates unique temp directory via `g_dir_make_tmp()` to prevent symlink attacks
+- **Path traversal guard:** `name_is_safe()` in fileops.c rejects exact `..`, `.`, `/` in filenames, and empty strings — applied to all file operations (copy, move, delete, rename, mkdir)
+- **Command injection prevention:** Terminal launch uses `g_spawn_async()` with argv array (no shell parsing); SSH remote paths, user, and host quoted via `g_shell_quote()`
+- **Archive flag injection prevention:** `--` separator before archive path in all extract/pack commands (tar, unzip, 7z, unrar) — prevents malicious filenames from being interpreted as flags
+- **Symlink safety:** `copy_file()` opens source with `O_NOFOLLOW` — refuses to follow symlinks during copy
+- **Credential hygiene:** SSH password cleared from memory via `explicit_bzero()` before `g_free()` after authentication
+- **Temp file safety:** Remote file preview creates unique temp directory via `g_dir_make_tmp()` to prevent symlink attacks; R2R temp cleanup uses recursive `delete_r()`
 
 ## Settings
 
@@ -317,6 +320,8 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - Cancel during delete stops immediately — already-deleted files remain deleted
 - Archive commands run async via `g_spawn_async` + `waitpid(WNOHANG)` poll loop — cancel sends `SIGTERM`
 - Filter model uses `filter_model` (not `sort_model`) for all item access: `panel_cursor_name`, `panel_selection`, cursor navigation, search result lookup
+- `FM.vis_mark_color` — cached theme-adjusted mark color, updated at settings load/save; used directly in bind callbacks (zero allocation per row)
+- `fmt_date()` uses `localtime_r()` (thread-safe POSIX variant, not `localtime()`)
 - `icon_for_entry()` returns static string constants — safe for `FileItem.icon_name` (not freed in finalize)
 - `FileItem.fg_color` is now `g_strdup`'d and freed in finalize — required because `fm_visible_color()` returns allocated strings for theme-adjusted colors
 - `fm_visible_color(fm, hex)` inverts colors that are not visible on the current theme background (dark-on-dark or light-on-light); caller must `g_free()` the result

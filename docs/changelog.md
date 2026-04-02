@@ -2,7 +2,31 @@
 
 ## [2.12.0] — 2026-04-02
 
-### Dark / Light theme switching
+### Dark / Light theme switching, security hardening, memory/performance fixes
+
+**Security hardening:**
+- **SSH password cleared from memory** — `explicit_bzero()` before `g_free()` in `ssh_connect_args_free`; password no longer lingers in process memory after authentication
+- **Archive flag injection prevention** — `--` separator added before archive path in all extract and pack commands (tar, unzip, 7z, unrar); prevents filenames like `--checkpoint-action=exec=cmd.tar.gz` from being interpreted as flags
+- **SSH terminal user/host quoting** — `g_shell_quote()` applied to user and host in SSH terminal command, not just remote path
+- **Copy follows no symlinks** — `O_NOFOLLOW` on source `open()` in `copy_file`; prevents symlink-following attacks during copy operations
+- **`name_is_safe()` fixed** — no longer rejects legitimate filenames containing `..` substring (e.g. `test..data`); only rejects exact `..` and `/`
+- **`fstat()` error checked** — `copy_file` now checks `fstat()` return value before using file mode
+
+**Memory leak fixes:**
+- `GSimpleActionGroup` in per-panel hamburger menu now `g_object_unref`'d after use
+- 4× `GMenu` objects (`pmenu`, `s1`, `s2`, `s3`) now `g_object_unref`'d after `set_menu_model`
+- 3× `GtkColumnViewColumn` objects now `g_object_unref`'d after `append_column`
+- R2R temp directory cleanup uses `delete_r()` instead of `rmdir()` — recursively removes contents even if `delete_r` on inner path fails
+
+**Performance fixes:**
+- **Bind callback zero-alloc** — mark color cached in `FM.vis_mark_color` (computed once at settings load/save); `name_bind`, `size_bind`, `date_bind` no longer allocate per row
+- **`localtime_r()`** — thread-safe replacement for `localtime()` in `fmt_date()`
+
+**Bug fix:**
+- `highlight.c` — NULL check before `g_match_info_matches()` prevents potential crash if regex match fails
+- tar pack argv array size fixed (`n_targets + 8` instead of `+6`) — `--zstd` path could overflow
+
+---
 
 **Runtime theme switching (Settings → System → Theme):**
 - Dark and Light theme selectable via dropdown in Settings → System tab

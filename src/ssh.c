@@ -477,7 +477,11 @@ static void ssh_connect_args_free(gpointer p)
     SshConnectArgs *a = p;
     g_free(a->host);
     g_free(a->user);
-    g_free(a->password);
+    /* Securely clear password from memory before freeing */
+    if (a->password) {
+        explicit_bzero(a->password, strlen(a->password));
+        g_free(a->password);
+    }
     g_free(a->key_path);
     g_free(a);
 }

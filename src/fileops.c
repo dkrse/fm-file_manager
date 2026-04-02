@@ -17,9 +17,9 @@
 static gboolean name_is_safe(const char *name)
 {
     if (!name || !name[0]) return FALSE;
+    if (strcmp(name, ".") == 0) return FALSE;
     if (strcmp(name, "..") == 0) return FALSE;
     if (strchr(name, '/') != NULL) return FALSE;
-    if (strstr(name, "..") != NULL) return FALSE;
     return TRUE;
 }
 
@@ -263,11 +263,11 @@ static gint64 calc_size_r(const char *path, ProgressDlg *pd)
 
 static int copy_file(const char *src, const char *dst, CopyProgress *cp)
 {
-    int fin = open(src, O_RDONLY);
+    int fin = open(src, O_RDONLY | O_NOFOLLOW);
     if (fin < 0) return -1;
 
     struct stat st;
-    fstat(fin, &st);
+    if (fstat(fin, &st) != 0) { close(fin); return -1; }
 
     int fout = open(dst, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
     if (fout < 0) { close(fin); return -1; }
@@ -807,9 +807,9 @@ void fo_copy(FM *fm)
                 else
                     r = sftp_upload(dst->ssh_conn, lp_tmp, rp_dst, &cp);
             }
-            /* clean up temp */
+            /* clean up temp – delete contents then directory */
             delete_r(lp_tmp, NULL, NULL);
-            rmdir(tmpdir);
+            delete_r(tmpdir, NULL, NULL);
             g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
         } else if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
@@ -978,7 +978,7 @@ void fo_move(FM *fm)
             if (r == 0)
                 sftp_delete_r(src->ssh_conn, rp_src, NULL, NULL);
             delete_r(lp_tmp, NULL, NULL);
-            rmdir(tmpdir);
+            delete_r(tmpdir, NULL, NULL);
             g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
         } else if (src->ssh_conn) {
             gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
@@ -1538,26 +1538,29 @@ void fo_extract(FM *fm)
     case ARC_TAR:
         argv[a++] = "tar";
         argv[a++] = "xf";
-        argv[a++] = archive;
         argv[a++] = "-C";
         argv[a++] = dest;
+        argv[a++] = "--";
+        argv[a++] = archive;
         argv[a]   = NULL;
         ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
         break;
     case ARC_ZIP:
         argv[a++] = "unzip";
         argv[a++] = "-o";
-        argv[a++] = archive;
         argv[a++] = "-d";
         argv[a++] = dest;
+        argv[a++] = "--";
+        argv[a++] = archive;
         argv[a]   = NULL;
         ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
         break;
     case ARC_7Z:
         argv[a++] = "7z";
         argv[a++] = "x";
-        argv[a++] = archive;
         argv[a++] = "-y";
+        argv[a++] = "--";
+        argv[a++] = archive;
         {
             gchar *outdir = g_strdup_printf("-o%s", dest);
             argv[a++] = outdir;
@@ -1570,6 +1573,7 @@ void fo_extract(FM *fm)
         argv[a++] = "unrar";
         argv[a++] = "x";
         argv[a++] = "-y";
+        argv[a++] = "--";
         argv[a++] = archive;
         argv[a++] = dest;
         argv[a]   = NULL;
@@ -1761,9 +1765,9 @@ void fo_pack(FM *fm)
             NULL,    /* 3: tar.zst (needs --zstd) */
         };
 
-        /* argv: tar + flag + archive + -C + srcdir + files... + NULL */
+        /* argv: tar + flag(s) + archive + -C + srcdir + -- + files... + NULL */
         int n_targets = g_list_length(targets);
-        const gchar **argv = g_new0(const gchar *, n_targets + 6);
+        const gchar **argv = g_new0(const gchar *, n_targets + 8);
         int a = 0;
         argv[a++] = "tar";
         if (fmt_sel == 3) {
@@ -1775,6 +1779,7 @@ void fo_pack(FM *fm)
         argv[a++] = arc_path;
         argv[a++] = "-C";
         argv[a++] = p->cwd;
+        argv[a++] = "--";
         for (GList *l = targets; l; l = l->next)
             argv[a++] = (const char *)l->data;
         argv[a] = NULL;

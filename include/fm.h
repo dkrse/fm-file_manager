@@ -169,6 +169,8 @@ struct _FM {
     gboolean        auto_refresh;             /* watch directories for changes  */
     /* theme: 0 = dark, 1 = light */
     int             theme;
+    /* cached theme-adjusted mark color (avoids alloc in bind callbacks) */
+    gchar          *vis_mark_color;
 };
 
 /* ── Dialog helper (replaces gtk_dialog_run with GMainLoop) ───────── */

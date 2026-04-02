@@ -466,6 +466,12 @@ void settings_load(FM *fm)
     g_key_file_free(kf);
 
     apply_theme(fm);
+
+    /* Cache theme-adjusted mark color for bind callbacks */
+    g_free(fm->vis_mark_color);
+    fm->vis_mark_color = fm_visible_color(fm,
+        fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
+
     apply_font_css(fm);
     apply_gui_css(fm);
     apply_editor_css(fm);
@@ -1265,6 +1271,11 @@ void settings_dialog(FM *fm)
 
         apply_gui_css(fm);
         apply_editor_css(fm);
+
+        /* Update cached theme-adjusted mark color */
+        g_free(fm->vis_mark_color);
+        fm->vis_mark_color = fm_visible_color(fm,
+            fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
 
         settings_save(fm);
         panel_reload(&fm->panels[0]);

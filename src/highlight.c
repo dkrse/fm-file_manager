@@ -225,7 +225,7 @@ void highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled)
 
     GMatchInfo *mi = NULL;
     g_regex_match_full(re, text, (gssize)tlen, 0, 0, &mi, NULL);
-    while (g_match_info_matches(mi)) {
+    while (mi && g_match_info_matches(mi)) {
         for (int g = 1; g <= 5; g++) {
             gint bs = -1, be = -1;
             if (g_match_info_fetch_pos(mi, g, &bs, &be) && bs >= 0 && be > bs) {

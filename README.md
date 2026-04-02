@@ -146,6 +146,15 @@ The dialog (panel hamburger menu → SSH/SFTP) allows:
 - **Key** — path to private key (optional, defaults to `~/.ssh/id_rsa`), with file browser
 - **Connect** — connects with the current details and password (async, non-blocking UI)
 
+## Security
+
+- Path traversal guard on all file operations (copy, move, delete, rename, mkdir)
+- Archive extract/pack: `--` separator prevents flag injection from malicious filenames
+- SSH terminal: user, host, and remote path quoted via `g_shell_quote()`
+- SSH password cleared from memory (`explicit_bzero`) after authentication
+- Copy operations refuse to follow symlinks (`O_NOFOLLOW`)
+- Remote file preview uses unique temp directories (`g_dir_make_tmp`)
+
 ## License
 
 MIT

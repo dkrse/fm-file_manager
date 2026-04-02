@@ -27,9 +27,10 @@ gchar *fmt_size(goffset sz)
 gchar *fmt_date(gint64 t)
 {
     time_t tt = (time_t)t;
-    struct tm *tm = localtime(&tt);
+    struct tm tm_buf;
     char buf[32] = "";
-    if (tm) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", tm);
+    if (localtime_r(&tt, &tm_buf))
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
     return g_strdup(buf);
 }
 
@@ -847,8 +848,7 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     gtk_image_set_pixel_size(GTK_IMAGE(image),
         p->fm->icon_size > 0 ? p->fm->icon_size : 16);
 
-    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
-    const gchar *fg = item->marked ? vis_mark : item->fg_color;
+    const gchar *fg = item->marked ? p->fm->vis_mark_color : item->fg_color;
     gint wt = item->marked ? PANGO_WEIGHT_BOLD : item->weight;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
@@ -859,7 +859,6 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), item->name);
     }
-    g_free(vis_mark);
 }
 
 /* Size column */
@@ -879,8 +878,7 @@ static void size_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     GtkWidget *label = gtk_list_item_get_child(li);
     FileItem  *item  = gtk_list_item_get_item(li);
 
-    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
-    const gchar *fg = item->marked ? vis_mark : item->fg_color;
+    const gchar *fg = item->marked ? p->fm->vis_mark_color : item->fg_color;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
             "<span foreground='%s'>%s</span>", fg, item->size);
@@ -889,7 +887,6 @@ static void size_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), item->size);
     }
-    g_free(vis_mark);
 }
 
 /* Date column */
@@ -912,8 +909,7 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     /* In search mode, show directory path instead of date */
     const gchar *text = (p->search_mode && item->dir_path) ? item->dir_path : item->date;
 
-    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
-    const gchar *fg = item->marked ? vis_mark : item->fg_color;
+    const gchar *fg = item->marked ? p->fm->vis_mark_color : item->fg_color;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
             "<span foreground='%s'>%s</span>", fg, text);
@@ -922,7 +918,6 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), text);
     }
-    g_free(vis_mark);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -1383,13 +1378,15 @@ static void on_terminal_clicked(GtkButton *btn, Panel *p)
 
         /* Shell-quote remote path to prevent command injection */
         gchar *quoted_path = g_shell_quote(rpath);
+        gchar *quoted_user = g_shell_quote(p->ssh_conn->user);
+        gchar *quoted_host = g_shell_quote(p->ssh_conn->host);
         gchar *sh_cmd = (p->ssh_conn->port != 22)
             ? g_strdup_printf("ssh -t -p %d %s@%s 'cd %s && exec $SHELL -l'",
                               p->ssh_conn->port,
-                              p->ssh_conn->user, p->ssh_conn->host, quoted_path)
+                              quoted_user, quoted_host, quoted_path)
             : g_strdup_printf("ssh -t %s@%s 'cd %s && exec $SHELL -l'",
-                              p->ssh_conn->user, p->ssh_conn->host, quoted_path);
-        g_free(quoted_path);
+                              quoted_user, quoted_host, quoted_path);
+        g_free(quoted_path); g_free(quoted_user); g_free(quoted_host);
 
         /* Use argv array — no shell parsing, no injection */
         const gchar *argv[7];
@@ -1651,6 +1648,9 @@ void panel_setup(Panel *p, FM *fm, int idx)
         gtk_box_append(GTK_BOX(path_box), up_btn);
         gtk_box_append(GTK_BOX(path_box), home_btn);
 
+        g_object_unref(ag);
+        g_object_unref(s1); g_object_unref(s2); g_object_unref(s3);
+        g_object_unref(pmenu);
         g_free(grp); g_free(a_ssh); g_free(a_pack); g_free(a_extract);
         g_free(a_mask); g_free(a_search); g_free(a_filter);
     }
@@ -1677,6 +1677,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_column_view_column_set_sorter(col_name, ns);
     g_object_unref(ns);
     gtk_column_view_append_column(GTK_COLUMN_VIEW(p->column_view), col_name);
+    g_object_unref(col_name);
 
     /* Size column */
     GtkListItemFactory *size_factory = gtk_signal_list_item_factory_new();
@@ -1690,6 +1691,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_column_view_column_set_sorter(col_size, ss);
     g_object_unref(ss);
     gtk_column_view_append_column(GTK_COLUMN_VIEW(p->column_view), col_size);
+    g_object_unref(col_size);
 
     /* Date column */
     GtkListItemFactory *date_factory = gtk_signal_list_item_factory_new();
@@ -1703,6 +1705,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_column_view_column_set_sorter(col_date, ds);
     g_object_unref(ds);
     gtk_column_view_append_column(GTK_COLUMN_VIEW(p->column_view), col_date);
+    g_object_unref(col_date);
 
     /* Sort model: dirs-first (always) + column sort (respects asc/desc) */
     GtkSorter *cv_sorter = gtk_column_view_get_sorter(
