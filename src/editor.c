@@ -1005,11 +1005,12 @@ void editor_show(FM *fm)
 
 #ifdef HAVE_GTKSOURCEVIEW
     GtkSourceBuffer *_sbuf = gtk_source_buffer_new(NULL);
-    if (fm->editor_style_scheme && fm->editor_style_scheme[0]) {
+    {
+        const char *sid = fm_scheme_for_theme(fm);
         GtkSourceStyleSchemeManager *_sm =
             gtk_source_style_scheme_manager_get_default();
         GtkSourceStyleScheme *_sc =
-            gtk_source_style_scheme_manager_get_scheme(_sm, fm->editor_style_scheme);
+            gtk_source_style_scheme_manager_get_scheme(_sm, sid);
         if (_sc) gtk_source_buffer_set_style_scheme(_sbuf, _sc);
     }
     ctx->buffer    = GTK_TEXT_BUFFER(_sbuf);

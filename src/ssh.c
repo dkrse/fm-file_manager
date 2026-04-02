@@ -248,17 +248,19 @@ void panel_load_remote(Panel *p, const char *path)
         gint64 mtime    = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)
                           ? (gint64)attrs.mtime : 0;
 
+        gchar *vdc = fm_visible_color(p->fm, p->fm->dir_color);
         const gchar *fg = NULL;
         gint         wt = PANGO_WEIGHT_NORMAL;
-        if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-        else if (is_link) { fg = "#7B1FA2"; }
-        else if (is_exec) { fg = "#2E7D32"; }
+        if      (is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+        else if (is_link) { fg = fm_link_color(p->fm); }
+        else if (is_exec) { fg = fm_exec_color(p->fm); }
 
         /* file_item_new_take takes ownership of size/date strings */
         FileItem *fi = file_item_new_take(icon, name_buf,
                                is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
                                fmt_date(mtime),
                                is_dir, fg, wt, size_raw, mtime);
+        g_free(vdc);
         if (p->marks && g_hash_table_contains(p->marks, name_buf))
             fi->marked = TRUE;
         g_ptr_array_add(items, fi);

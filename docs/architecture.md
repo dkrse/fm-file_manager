@@ -2,7 +2,7 @@
 
 ## Overview
 
-Single-window GTK4 application — a Total Commander clone. A single global `FM` struct (stack-allocated in `main.c` as `g_fm`) holds the entire application state and is passed everywhere as a pointer.
+Single-window GTK4 application (with optional libadwaita for runtime theme switching) — a Total Commander clone. A single global `FM` struct (stack-allocated in `main.c` as `g_fm`) holds the entire application state and is passed everywhere as a pointer.
 
 ## Files
 
@@ -14,7 +14,7 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
-| `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, `apply_*_css`; SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
+| `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, theme (dark/light), `apply_*_css`, `apply_theme`; theme-aware color helpers (`fm_visible_color`, `fm_link_color`, `fm_exec_color`, `fm_scheme_for_theme`); SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
 | `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators |
 | `src/editor.c` | Text editor (F4) with menu bar, find/replace (Ctrl+F/H), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
 | `src/highlight.c` | Syntax highlighting: GtkSourceView wrapper or custom regex highlighter |
@@ -284,6 +284,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `viewer_syntax_highlight` | Viewer syntax highlighting |
 | `viewer_line_numbers` | Viewer line numbers |
 | `editor_style_scheme` | Color scheme (GtkSourceView) |
+| `theme` | Theme: 0=dark, 1=light (default 1) |
 
 ## Dependencies
 
@@ -291,6 +292,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 |---------|----------|----------|
 | GTK4 >= 4.12 | yes | entire UI |
 | GLib 2.x | yes | data structures, GRegex |
+| libadwaita-1 | optional | runtime dark/light theme switching (`#ifdef HAVE_LIBADWAITA`); uses `AdwApplication` + `AdwStyleManager` |
 | libssh2 | optional | SFTP panel (`#ifdef HAVE_LIBSSH2`) |
 | gtksourceview-5 | optional | full syntax highlighting (`#ifdef HAVE_GTKSOURCEVIEW`) |
 
@@ -316,6 +318,10 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - Archive commands run async via `g_spawn_async` + `waitpid(WNOHANG)` poll loop — cancel sends `SIGTERM`
 - Filter model uses `filter_model` (not `sort_model`) for all item access: `panel_cursor_name`, `panel_selection`, cursor navigation, search result lookup
 - `icon_for_entry()` returns static string constants — safe for `FileItem.icon_name` (not freed in finalize)
+- `FileItem.fg_color` is now `g_strdup`'d and freed in finalize — required because `fm_visible_color()` returns allocated strings for theme-adjusted colors
+- `fm_visible_color(fm, hex)` inverts colors that are not visible on the current theme background (dark-on-dark or light-on-light); caller must `g_free()` the result
+- `fm_scheme_for_theme(fm)` auto-selects GtkSourceView dark scheme: tries `<base>-dark`, then `Adwaita-dark`, `oblivion`, `cobalt`; returns static string (do not free)
+- `apply_theme()` uses `AdwStyleManager` when available (reliable runtime switching); falls back to `gtk-application-prefer-dark-theme` (startup only, dark→light unreliable without libadwaita)
 - Ctrl+S search bar key controller uses `GTK_PHASE_CAPTURE` — required because GtkEntry otherwise consumes Enter/arrows before the handler sees them
 - `sync_cursor_from_selection()` — called before all keyboard actions in `on_tree_key_press` to sync `cursor_pos` from actual GTK selection; fixes mouse click + keyboard desync on SFTP panels where `on_selection_changed` may not reliably fire after `panel_load_remote`
 - SSH authentication tries password first, then public key (`key_path` from bookmark or default `~/.ssh/id_rsa`)

@@ -8,16 +8,24 @@ BUILDDIR:= build
 
 CFLAGS  += -I$(INCDIR)
 
-# ── find GTK4 ────────────────────────────────────────────────────────
-_GTK_CFLAGS := $(shell pkg-config --cflags gtk4 2>/dev/null)
-_GTK_LIBS   := $(shell pkg-config --libs   gtk4 2>/dev/null)
+# ── find libadwaita (includes GTK4) ──────────────────────────────────
+_ADW_CFLAGS := $(shell pkg-config --cflags libadwaita-1 2>/dev/null)
+_ADW_LIBS   := $(shell pkg-config --libs   libadwaita-1 2>/dev/null)
 
-ifeq ($(strip $(_GTK_LIBS)),)
-  $(error GTK4 not found. Install: sudo dnf install gtk4-devel)
+ifneq ($(strip $(_ADW_LIBS)),)
+  CFLAGS += $(_ADW_CFLAGS) -DHAVE_LIBADWAITA
+  LIBS    = $(_ADW_LIBS)
+  $(info libadwaita-1 found – runtime theme switching enabled)
+else
+  _GTK_CFLAGS := $(shell pkg-config --cflags gtk4 2>/dev/null)
+  _GTK_LIBS   := $(shell pkg-config --libs   gtk4 2>/dev/null)
+  ifeq ($(strip $(_GTK_LIBS)),)
+    $(error Neither libadwaita-1 nor gtk4 found. Install: sudo dnf install libadwaita-devel)
+  endif
+  CFLAGS += $(_GTK_CFLAGS)
+  LIBS    = $(_GTK_LIBS)
+  $(info libadwaita not found, using plain GTK4 – theme switching limited)
 endif
-
-CFLAGS += $(_GTK_CFLAGS)
-LIBS    = $(_GTK_LIBS)
 
 # ── find libssh2 (optional – enables full SFTP panel) ────────────────
 #  Install: sudo dnf install libssh2-devel

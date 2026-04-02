@@ -401,11 +401,12 @@ void viewer_show(FM *fm)
 
 #ifdef HAVE_GTKSOURCEVIEW
     GtkSourceBuffer *_vsbuf = gtk_source_buffer_new(NULL);
-    if (fm->editor_style_scheme && fm->editor_style_scheme[0]) {
+    {
+        const char *sid = fm_scheme_for_theme(fm);
         GtkSourceStyleSchemeManager *_sm =
             gtk_source_style_scheme_manager_get_default();
         GtkSourceStyleScheme *_sc =
-            gtk_source_style_scheme_manager_get_scheme(_sm, fm->editor_style_scheme);
+            gtk_source_style_scheme_manager_get_scheme(_sm, sid);
         if (_sc) gtk_source_buffer_set_style_scheme(_vsbuf, _sc);
     }
     ctx.buffer = GTK_TEXT_BUFFER(_vsbuf);
@@ -436,8 +437,8 @@ void viewer_show(FM *fm)
 
     /* Create match tag for search highlighting */
     ctx.match_tag = gtk_text_buffer_create_tag(ctx.buffer, "search-match",
-                        "background", "#FFFF00",
-                        "foreground", "#000000",
+                        "background", fm->theme == 0 ? "#665500" : "#FFFF00",
+                        "foreground", fm->theme == 0 ? "#FFFF00" : "#000000",
                         NULL);
 
     GtkWidget *scroll = gtk_scrolled_window_new();

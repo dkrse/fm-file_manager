@@ -5,7 +5,7 @@ G_DEFINE_TYPE(FileItem, file_item, G_TYPE_OBJECT)
 static void file_item_finalize(GObject *obj)
 {
     FileItem *self = FILE_ITEM(obj);
-    /* icon_name and fg_color are static constants - don't free */
+    g_free(self->fg_color);
     g_free(self->name);
     g_free(self->size);
     g_free(self->date);
@@ -38,7 +38,7 @@ FileItem *file_item_new_take(const char *icon_name, const char *name,
     item->size      = size;   /* takes ownership */
     item->date      = date;   /* takes ownership */
     item->is_dir    = is_dir;
-    item->fg_color  = (gchar *)fg_color;
+    item->fg_color  = g_strdup(fg_color);
     item->weight    = weight;
     item->size_raw  = size_raw;
     item->date_raw  = date_raw;

@@ -46,6 +46,8 @@
 #define KEY_ICON_SIZE            "icon_size"
 #define DEFAULT_ICON_SIZE        16
 #define KEY_AUTO_REFRESH         "auto_refresh"
+#define KEY_THEME                "theme"
+#define DEFAULT_THEME            1   /* 0=dark, 1=light */
 
 #define DEFAULT_TERMINAL       "gnome-terminal"
 #define DEFAULT_CURSOR_COLOR   "#1A73E8"
@@ -72,6 +74,84 @@ static gboolean color_is_light(const char *hex)
     int r = 0, g = 0, b = 0;
     sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b);
     return (0.299 * r + 0.587 * g + 0.114 * b) > 128.0;
+}
+
+/* Apply dark/light theme via AdwStyleManager (reliable runtime switching)
+ * or fall back to gtk-application-prefer-dark-theme (startup only). */
+static void apply_theme(FM *fm)
+{
+#ifdef HAVE_LIBADWAITA
+    AdwStyleManager *sm = adw_style_manager_get_default();
+    adw_style_manager_set_color_scheme(sm,
+        fm->theme == 0 ? ADW_COLOR_SCHEME_FORCE_DARK
+                       : ADW_COLOR_SCHEME_FORCE_LIGHT);
+#else
+    g_object_set(gtk_settings_get_default(),
+                 "gtk-application-prefer-dark-theme", fm->theme == 0, NULL);
+#endif
+}
+
+/* Theme-aware symlink / executable colors (Material Design pairs) */
+const char *fm_link_color(FM *fm)
+{
+    return fm->theme == 0 ? "#CE93D8" : "#7B1FA2";
+}
+
+const char *fm_exec_color(FM *fm)
+{
+    return fm->theme == 0 ? "#81C784" : "#2E7D32";
+}
+
+/* Invert a hex color: useful for making dark colors visible on dark bg */
+static gchar *invert_color(const char *hex)
+{
+    if (!hex || hex[0] != '#' || strlen(hex) < 7) return g_strdup(hex ? hex : "");
+    int r = 0, g = 0, b = 0;
+    sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b);
+    return g_strdup_printf("#%02x%02x%02x", 255 - r, 255 - g, 255 - b);
+}
+
+/* Ensure a color is visible on the current theme background.
+ * For dark theme, dark colors get inverted. For light theme, light colors do.
+ * Caller must g_free() the result. */
+gchar *fm_visible_color(FM *fm, const char *hex)
+{
+    if (!hex || hex[0] != '#' || strlen(hex) < 7) return g_strdup(hex ? hex : "");
+    gboolean light = color_is_light(hex);
+    if (fm->theme == 0 && !light) return invert_color(hex); /* dark-on-dark → invert */
+    if (fm->theme == 1 && light)  return invert_color(hex); /* light-on-light → invert */
+    return g_strdup(hex);
+}
+
+/* Auto-select GtkSourceView scheme matching current theme.
+ * For dark theme: try "<scheme>-dark", then "Adwaita-dark", "oblivion".
+ * Returns a static/interned string – caller must NOT free. */
+const char *fm_scheme_for_theme(FM *fm)
+{
+#ifdef HAVE_GTKSOURCEVIEW
+    const char *base = fm->editor_style_scheme ? fm->editor_style_scheme
+                                               : DEFAULT_STYLE_SCHEME;
+    if (fm->theme == 0) {
+        /* Try <base>-dark first */
+        GtkSourceStyleSchemeManager *sm =
+            gtk_source_style_scheme_manager_get_default();
+        gchar *try_dark = g_strdup_printf("%s-dark", base);
+        GtkSourceStyleScheme *sc =
+            gtk_source_style_scheme_manager_get_scheme(sm, try_dark);
+        g_free(try_dark);
+        if (sc) return gtk_source_style_scheme_get_id(sc);
+        /* Known dark schemes */
+        const char *darks[] = { "Adwaita-dark", "oblivion", "cobalt", NULL };
+        for (int i = 0; darks[i]; i++) {
+            sc = gtk_source_style_scheme_manager_get_scheme(sm, darks[i]);
+            if (sc) return gtk_source_style_scheme_get_id(sc);
+        }
+    }
+    return base;
+#else
+    (void)fm;
+    return DEFAULT_STYLE_SCHEME;
+#endif
 }
 
 static gchar *settings_path(void)
@@ -155,23 +235,39 @@ static void apply_gui_css(FM *fm)
             "}", cur_col, txt);
     }
 
+    /* Theme-dependent colors */
+    const char *active_bg, *active_fg, *inactive_bg, *inactive_fg, *sep_color;
+    if (fm->theme == 0) { /* dark */
+        active_bg   = "#1A3A5C";
+        active_fg   = "#90CAF9";
+        inactive_bg = "#2A2A2A";
+        inactive_fg = "#999";
+        sep_color   = "#1565C0";
+    } else { /* light */
+        active_bg   = "#E3F2FD";
+        active_fg   = "#0D47A1";
+        inactive_bg = "#F5F5F5";
+        inactive_fg = "#555";
+        sep_color   = "#90CAF9";
+    }
+
     gchar *css = g_strdup_printf(
         "* { font-family: %s; font-size: %dpx; }"
         "entry.active-panel {"
-        "  background-color: #E3F2FD;"
-        "  color: #0D47A1;"
+        "  background-color: %s;"
+        "  color: %s;"
         "  font-weight: bold;"
         "}"
         "entry.inactive-panel {"
-        "  background-color: #F5F5F5;"
-        "  color: #555;"
+        "  background-color: %s;"
+        "  color: %s;"
         "}"
         "button.fm-fkey {"
         "  padding: 2px 4px;"
         "  min-height: 0;"
         "}"
         "paned > separator {"
-        "  background-color: #90CAF9;"
+        "  background-color: %s;"
         "  min-width: 3px;"
         "  min-height: 3px;"
         "}"
@@ -184,7 +280,9 @@ static void apply_gui_css(FM *fm)
         "}"
         "%s"
         "%s",
-        gui_fam, gui_sz, cursor_css,
+        gui_fam, gui_sz,
+        active_bg, active_fg, inactive_bg, inactive_fg, sep_color,
+        cursor_css,
         fm->show_hover ? "" :
             "columnview listview row:hover:not(:selected) {"
             "  background-color: transparent;"
@@ -360,8 +458,14 @@ void settings_load(FM *fm)
     fm->auto_refresh = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, &arerr);
     if (arerr) { g_clear_error(&arerr); fm->auto_refresh = FALSE; }
 
+    GError *therr = NULL;
+    fm->theme = g_key_file_get_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, &therr);
+    if (therr) { g_clear_error(&therr); fm->theme = DEFAULT_THEME; }
+    if (fm->theme < 0 || fm->theme > 1) fm->theme = DEFAULT_THEME;
+
     g_key_file_free(kf);
 
+    apply_theme(fm);
     apply_font_css(fm);
     apply_gui_css(fm);
     apply_editor_css(fm);
@@ -427,6 +531,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_ICON_SIZE,
                            fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, fm->auto_refresh);
+    g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, fm->theme);
 
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {
@@ -935,9 +1040,26 @@ void settings_dialog(FM *fm)
     MAKE_TAB_GRID(g4)
     row = 0;
 
+    GtkWidget *hdr_theme = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr_theme), "<b>Theme</b>");
+    gtk_widget_set_halign(hdr_theme, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(g4), hdr_theme, 0, row++, 2, 1);
+
+    GtkWidget *lbl_theme = gtk_label_new("Appearance:");
+    gtk_widget_set_halign(lbl_theme, GTK_ALIGN_END);
+    const char *themes[] = { "Dark", "Light", NULL };
+    GtkStringList *theme_list = gtk_string_list_new(themes);
+    GtkWidget *combo_theme = gtk_drop_down_new(G_LIST_MODEL(theme_list), NULL);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(combo_theme),
+        (fm->theme >= 0 && fm->theme <= 1) ? (guint)fm->theme : DEFAULT_THEME);
+    gtk_widget_set_hexpand(combo_theme, TRUE);
+    gtk_grid_attach(GTK_GRID(g4), lbl_theme,   0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g4), combo_theme, 1, row++, 1, 1);
+
     GtkWidget *hdr5 = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hdr5), "<b>Applications</b>");
     gtk_widget_set_halign(hdr5, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(hdr5, 10);
     gtk_grid_attach(GTK_GRID(g4), hdr5, 0, row++, 2, 1);
 
     GtkWidget *lbl_term = gtk_label_new("Terminal:");
@@ -976,6 +1098,13 @@ void settings_dialog(FM *fm)
     gtk_window_present(GTK_WINDOW(dlg));
 
     if (dlg_ctx_run(&ctx) == 1) {
+        /* theme – must be first: recreates CSS providers */
+        int new_theme = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(combo_theme));
+        if (new_theme != fm->theme) {
+            fm->theme = new_theme;
+            apply_theme(fm);   /* destroys + recreates all CSS providers */
+        }
+
         /* panel font */
         PangoFontDescription *pfd_result =
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(panel_font_btn));

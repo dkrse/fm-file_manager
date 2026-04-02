@@ -2,6 +2,9 @@
 #define FM_H
 
 #include <gtk/gtk.h>
+#ifdef HAVE_LIBADWAITA
+#  include <adwaita.h>
+#endif
 #include <sys/stat.h>
 #include <dirent.h>
 #ifdef HAVE_LIBSSH2
@@ -164,6 +167,8 @@ struct _FM {
     gchar          *mark_color;               /* hex color for marked items     */
     /* auto-refresh */
     gboolean        auto_refresh;             /* watch directories for changes  */
+    /* theme: 0 = dark, 1 = light */
+    int             theme;
 };
 
 /* ── Dialog helper (replaces gtk_dialog_run with GMainLoop) ───────── */
@@ -243,6 +248,10 @@ void   settings_dialog(FM *fm);
 void   settings_apply_columns(FM *fm);
 void   apply_editor_css(FM *fm);
 void   apply_viewer_css(FM *fm);
+const char *fm_link_color(FM *fm);
+const char *fm_exec_color(FM *fm);
+const char *fm_scheme_for_theme(FM *fm);
+gchar      *fm_visible_color(FM *fm, const char *hex);  /* caller frees */
 void   highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled);
 #ifdef HAVE_GTKSOURCEVIEW
 #include <gtksourceview/gtksource.h>

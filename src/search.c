@@ -203,11 +203,13 @@ static GPtrArray *build_grouped_list(GPtrArray *results, FM *fm)
         /* Directory header when dir changes (pointer comparison first) */
         if (r->dir != prev_dir && (!prev_dir || strcmp(r->dir, prev_dir) != 0)) {
             prev_dir = r->dir;
+            gchar *vdc = fm_visible_color(fm, fm->dir_color);
             FileItem *hdr = file_item_new("folder-symbolic", r->dir,
                                           "", "", TRUE,
-                                          fm->dir_color,
+                                          vdc,
                                           PANGO_WEIGHT_BOLD,
                                           (gint64)-1, (gint64)0);
+            g_free(vdc);
             g_ptr_array_add(out, hdr);
         }
 
@@ -217,8 +219,8 @@ static GPtrArray *build_grouped_list(GPtrArray *results, FM *fm)
 
         const gchar *fg = NULL;
         gint wt = PANGO_WEIGHT_NORMAL;
-        if (is_link)      fg = "#7B1FA2";
-        else if (is_exec) fg = "#2E7D32";
+        if (is_link)      fg = fm_link_color(fm);
+        else if (is_exec) fg = fm_exec_color(fm);
 
         FileItem *fi = file_item_new_take(icon, r->name,
                           fmt_size(r->size), fmt_date(r->mtime),

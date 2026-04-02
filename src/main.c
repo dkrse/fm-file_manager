@@ -323,11 +323,12 @@ void panel_load(Panel *p, const char *path)
      * This emits a single items-changed on the store so GtkSortListModel
      * sorts only once (O(n log n)) instead of once per append (O(n² log n)). */
     GPtrArray *items = g_ptr_array_new_with_free_func(g_object_unref);
+    gchar *vis_dir_color = fm_visible_color(p->fm, p->fm->dir_color);
 
     /* ".." entry always first */
     g_ptr_array_add(items,
         file_item_new("go-up-symbolic", "..", "", "",
-                      TRUE, p->fm->dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
+                      TRUE, vis_dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
                       (gint64)-2, (gint64)0));
 
     if (dir) {
@@ -354,9 +355,9 @@ void panel_load(Panel *p, const char *path)
 
             const gchar *fg = NULL;
             gint         wt = PANGO_WEIGHT_NORMAL;
-            if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-            else if (is_link) { fg = "#7B1FA2"; }
-            else if (is_exec) { fg = "#2E7D32"; }
+            if      (is_dir)  { fg = vis_dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+            else if (is_link) { fg = fm_link_color(p->fm); }
+            else if (is_exec) { fg = fm_exec_color(p->fm); }
 
             /* file_item_new_take takes ownership of size/date strings */
             FileItem *fi = file_item_new_take(icon, de->d_name,
@@ -370,6 +371,7 @@ void panel_load(Panel *p, const char *path)
         }
         closedir(dir);
     }
+    g_free(vis_dir_color);
 
     /* Replace store: avoids expensive remove_all signal on large lists.
      * Create fresh store, splice items in, then swap into sort model. */
@@ -567,16 +569,18 @@ static void on_dir_changed(GFileMonitor *monitor, GFile *file,
             gboolean is_link = S_ISLNK(fst.st_mode);
             gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
             const char *icon = icon_for_entry(basename, is_dir, is_link, is_exec);
+            gchar *vdc = fm_visible_color(p->fm, p->fm->dir_color);
             const gchar *fg = NULL;
             gint wt = PANGO_WEIGHT_NORMAL;
-            if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-            else if (is_link) { fg = "#7B1FA2"; }
-            else if (is_exec) { fg = "#2E7D32"; }
+            if      (is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+            else if (is_link) { fg = fm_link_color(p->fm); }
+            else if (is_exec) { fg = fm_exec_color(p->fm); }
             FileItem *fi = file_item_new_take(icon, basename,
                               is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
                               fmt_date(fst.st_mtime),
                               is_dir, fg, wt,
                               (gint64)fst.st_size, (gint64)fst.st_mtime);
+            g_free(vdc);
             p->inhibit_sel = TRUE;
             g_list_store_append(p->store, fi);
             g_object_unref(fi);
@@ -599,16 +603,18 @@ static void on_dir_changed(GFileMonitor *monitor, GFile *file,
                     gboolean is_link = S_ISLNK(fst.st_mode);
                     gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
                     const char *icon = icon_for_entry(basename, is_dir, is_link, is_exec);
+                    gchar *vdc2 = fm_visible_color(p->fm, p->fm->dir_color);
                     const gchar *fg = NULL;
                     gint wt = PANGO_WEIGHT_NORMAL;
-                    if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-                    else if (is_link) { fg = "#7B1FA2"; }
-                    else if (is_exec) { fg = "#2E7D32"; }
+                    if      (is_dir)  { fg = vdc2; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+                    else if (is_link) { fg = fm_link_color(p->fm); }
+                    else if (is_exec) { fg = fm_exec_color(p->fm); }
                     FileItem *nfi = file_item_new_take(icon, basename,
                                       is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
                                       fmt_date(fst.st_mtime),
                                       is_dir, fg, wt,
                                       (gint64)fst.st_size, (gint64)fst.st_mtime);
+                    g_free(vdc2);
                     if (fi->marked) nfi->marked = TRUE;
                     p->inhibit_sel = TRUE;
                     g_list_store_remove(p->store, i);
@@ -701,15 +707,17 @@ static gboolean sftp_poll_tick(gpointer data)
         const char *icon = icon_for_entry(rname, is_dir, is_link, is_exec);
         gint64 size_raw = (a->flags & LIBSSH2_SFTP_ATTR_SIZE) ? (gint64)a->filesize : 0;
         gint64 mtime    = (a->flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (gint64)a->mtime : 0;
+        gchar *vdc3 = fm_visible_color(p->fm, p->fm->dir_color);
         const gchar *fg = NULL;
         gint wt = PANGO_WEIGHT_NORMAL;
-        if      (is_dir)  { fg = p->fm->dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-        else if (is_link) { fg = "#7B1FA2"; }
-        else if (is_exec) { fg = "#2E7D32"; }
+        if      (is_dir)  { fg = vdc3; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+        else if (is_link) { fg = fm_link_color(p->fm); }
+        else if (is_exec) { fg = fm_exec_color(p->fm); }
         FileItem *fi = file_item_new_take(icon, rname,
                           is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
                           fmt_date(mtime),
                           is_dir, fg, wt, size_raw, mtime);
+        g_free(vdc3);
         p->inhibit_sel = TRUE;
         g_list_store_append(p->store, fi);
         g_object_unref(fi);
@@ -839,7 +847,8 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     gtk_image_set_pixel_size(GTK_IMAGE(image),
         p->fm->icon_size > 0 ? p->fm->icon_size : 16);
 
-    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
+    const gchar *fg = item->marked ? vis_mark : item->fg_color;
     gint wt = item->marked ? PANGO_WEIGHT_BOLD : item->weight;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
@@ -850,6 +859,7 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), item->name);
     }
+    g_free(vis_mark);
 }
 
 /* Size column */
@@ -869,7 +879,8 @@ static void size_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     GtkWidget *label = gtk_list_item_get_child(li);
     FileItem  *item  = gtk_list_item_get_item(li);
 
-    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
+    const gchar *fg = item->marked ? vis_mark : item->fg_color;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
             "<span foreground='%s'>%s</span>", fg, item->size);
@@ -878,6 +889,7 @@ static void size_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), item->size);
     }
+    g_free(vis_mark);
 }
 
 /* Date column */
@@ -900,7 +912,8 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     /* In search mode, show directory path instead of date */
     const gchar *text = (p->search_mode && item->dir_path) ? item->dir_path : item->date;
 
-    const gchar *fg = item->marked ? (p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : item->fg_color;
+    gchar *vis_mark = item->marked ? fm_visible_color(p->fm, p->fm->mark_color ? p->fm->mark_color : "#D32F2F") : NULL;
+    const gchar *fg = item->marked ? vis_mark : item->fg_color;
     if (fg) {
         gchar *markup = g_markup_printf_escaped(
             "<span foreground='%s'>%s</span>", fg, text);
@@ -909,6 +922,7 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     } else {
         gtk_label_set_text(GTK_LABEL(label), text);
     }
+    g_free(vis_mark);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -2165,7 +2179,13 @@ int main(int argc, char *argv[])
     setlocale(LC_ALL, "");
     memset(&g_fm, 0, sizeof(g_fm));
 
+#ifdef HAVE_LIBADWAITA
+    adw_init();
+    GtkApplication *app = GTK_APPLICATION(
+        adw_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS));
+#else
     GtkApplication *app = gtk_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS);
+#endif
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), &g_fm);
 
     int status = g_application_run(G_APPLICATION(app), argc, argv);

@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.12.0] — 2026-04-02
+
+### Dark / Light theme switching
+
+**Runtime theme switching (Settings → System → Theme):**
+- Dark and Light theme selectable via dropdown in Settings → System tab
+- Uses `AdwStyleManager` (libadwaita) for reliable runtime dark↔light switching — all widgets fully repainted
+- Falls back to `gtk-application-prefer-dark-theme` if libadwaita is not available (startup-only)
+- Theme preference persisted in `settings.ini` as `theme` (0=dark, 1=light, default light)
+
+**Theme-aware colors:**
+- Directory color auto-inverted for visibility: dark colors inverted on dark background, light colors on light background (`fm_visible_color`)
+- Mark color similarly auto-adjusted at render time
+- Symlink color: `#7B1FA2` (light) / `#CE93D8` (dark) — Material Design purple pair
+- Executable color: `#2E7D32` (light) / `#81C784` (dark) — Material Design green pair
+- Panel path entry: active/inactive colors adapt to theme (blue tones for light, muted tones for dark)
+- Separator color adapts to theme
+
+**Editor / Viewer dark support:**
+- GtkSourceView style scheme auto-selects dark variant: tries `<scheme>-dark`, then `Adwaita-dark`, `oblivion`, `cobalt`
+- Viewer search highlight: yellow/black (light) → dark gold/yellow (dark)
+- Non-GtkSourceView text views inherit theme colors from GTK dark stylesheet
+
+**Build changes:**
+- New optional dependency: `libadwaita-1` (`sudo dnf install libadwaita-devel`)
+- Makefile auto-detects libadwaita; falls back to plain GTK4 if not found
+- `AdwApplication` used instead of `GtkApplication` when libadwaita is available
+- `FileItem.fg_color` now copied (`g_strdup`) and freed — was previously a borrowed pointer to static constants
+
+---
+
 ## [2.11.0] — 2026-04-02
 
 ### Auto-refresh, SSH private key, file list in dialogs, rename/cursor fixes

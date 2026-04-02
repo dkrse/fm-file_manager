@@ -21,6 +21,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
 - **Per-panel hamburger menu** — SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
+- **Dark / Light theme** — runtime switching via Settings → System (libadwaita); colors auto-adapt (directories, symlinks, marks, editor scheme)
 - **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
 
 ## Keyboard shortcuts
@@ -64,6 +65,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 - GTK4 (>= 4.12)
 - GLib 2.x
+- libadwaita-1 (optional — for runtime dark/light theme switching)
 - libssh2 (optional — for SFTP panel)
 - gtksourceview-5 (optional — for full syntax highlighting)
 
@@ -80,6 +82,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 ```bash
 sudo dnf install gtk4-devel
+sudo dnf install libadwaita-devel     # optional, for runtime dark/light theme
 sudo dnf install libssh2-devel        # optional, for SFTP
 sudo dnf install gtksourceview5-devel # optional, for syntax highlighting
 sudo dnf install p7zip unrar          # optional, for 7z/rar archives
@@ -105,7 +108,7 @@ src/fileitem.c      — FileItem GObject (model for file list)
 src/fileops.c       — file operations (copy, move, delete, mkdir, rename, extract, pack)
 src/search.c        — file search
 src/ssh.c           — SSH/SFTP connection and browsing
-src/settings.c      — settings (font, cursor, editor, viewer, terminal, icon size)
+src/settings.c      — settings (font, cursor, editor, viewer, terminal, icon size, theme)
 src/viewer.c        — file viewer (F3)
 src/editor.c        — text editor (F4)
 src/highlight.c     — syntax highlighting (GtkSourceView wrapper / custom regex)
@@ -129,7 +132,7 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 **Editor** — text font, editor GUI font, line number font size, line numbers, syntax highlighting, color scheme
 
-**System** — terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
+**System** — theme (dark / light), terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
 
 ## SSH connections
 
