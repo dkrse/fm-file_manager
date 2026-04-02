@@ -2,7 +2,30 @@
 
 ## [2.12.0] — 2026-04-02
 
-### Dark / Light theme switching, security hardening, memory/performance fixes
+### Dark / Light theme, image preview, search hardening, Display tab, security & memory fixes
+
+**Image preview in viewer (F3):**
+- F3 on image files (PNG, JPG, GIF, BMP, SVG, WebP, TIFF, ICO, XPM, PBM/PGM/PPM) opens a dedicated image viewer with `GtkPicture`
+- Image scales to fit window while preserving aspect ratio (`GTK_CONTENT_FIT_CONTAIN`)
+- Close with Escape, Q, or Close button
+- Configurable: Settings → Viewer → "Show image preview (F3 on images)" — enabled by default
+- When disabled, F3 shows raw binary/text as before
+- Local files only; SFTP files use text viewer
+
+**Settings — new Display tab:**
+- Display settings (hidden files, hover highlight, auto-refresh) moved from Panels tab to new Display tab
+- Directories (color, bold), Marked files (color), and Icons (size) also moved to Display tab
+- Panels tab now contains only: panel font, GUI font, column widths
+- Tab order: Panels → Display → Cursor → Viewer → Editor → System
+
+**Search hardening (F2):**
+- **Same-filesystem search (`-xdev`):** skips `/proc`, `/sys`, `/dev` and other mounted filesystems when searching from `/` — prevents traversal of pseudo-filesystems with millions of virtual entries
+- **Symlinks to directories not followed:** prevents infinite loops from circular symlinks (e.g. `/proc/self/root`)
+- **Visited-inode tracking:** `GHashTable<(dev,ino)>` detects bind mounts and hard-linked directories — prevents visiting same directory twice
+- **`fstatat` with `AT_SYMLINK_NOFOLLOW`:** replaces `lstat` + path concatenation for each entry — more efficient
+- **Cancel button:** shown during search, immediately stops recursive traversal
+- **Progress display:** "Scanning: N files, M found" updates every 8192 files visited (not just matched)
+- **F3/F4 in search results:** viewer/editor open the file directly from search list; search results preserved until explicitly exited
 
 **Security hardening:**
 - **SSH password cleared from memory** — `explicit_bzero()` before `g_free()` in `ssh_connect_args_free`; password no longer lingers in process memory after authentication

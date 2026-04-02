@@ -987,11 +987,13 @@ static void activate_item(Panel *p)
     }
 
     if (p->search_mode) {
-        /* In search mode: navigate to the result's directory.
-         * Items with dir_path==NULL are directory headers – skip them. */
+        /* In search mode:
+         * - On a file (has dir_path): open in viewer (F3-style) — keeps search list
+         * - On a directory header (dir_path==NULL): navigate to that directory */
         FileItem *si = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
                                              p->cursor_pos);
         if (si && si->dir_path) {
+            /* File result — navigate to its directory and position cursor */
             gchar *dir = g_strdup(si->dir_path);
             gchar *fname = g_strdup(si->name);
             g_object_unref(si);

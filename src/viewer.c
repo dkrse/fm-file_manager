@@ -255,6 +255,83 @@ static gboolean on_viewer_key_press(GtkEventControllerKey *ctrl,
     return FALSE;
 }
 
+/* Check if filename has an image extension */
+static gboolean is_image_file(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) return FALSE;
+    const char *exts[] = {
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp",
+        ".tiff", ".tif", ".ico", ".xpm", ".pbm", ".pgm", ".ppm",
+        NULL
+    };
+    for (int i = 0; exts[i]; i++)
+        if (g_ascii_strcasecmp(dot, exts[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+static gboolean on_image_viewer_key(GtkEventControllerKey *ctrl, guint kv,
+                                    guint kc, GdkModifierType mod, gpointer data)
+{
+    (void)ctrl; (void)kc; (void)mod;
+    if (kv == GDK_KEY_Escape || kv == GDK_KEY_q || kv == GDK_KEY_Q) {
+        g_main_loop_quit(data);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Image viewer — simple window with GtkPicture + close/key handling */
+static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
+{
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+
+    gchar *title = g_strdup_printf("View: %s", name);
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), title);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(fm->window));
+    gtk_window_set_default_size(GTK_WINDOW(win), 900, 700);
+    g_free(title);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GFile *file = g_file_new_for_path(fullpath);
+    GtkWidget *picture = gtk_picture_new_for_file(file);
+    g_object_unref(file);
+    gtk_picture_set_can_shrink(GTK_PICTURE(picture), TRUE);
+    gtk_picture_set_content_fit(GTK_PICTURE(picture), GTK_CONTENT_FIT_CONTAIN);
+    gtk_widget_set_vexpand(picture, TRUE);
+    gtk_widget_set_hexpand(picture, TRUE);
+    gtk_box_append(GTK_BOX(vbox), picture);
+
+    GtkWidget *close_btn = gtk_button_new_with_label("Close");
+    gtk_widget_set_halign(close_btn, GTK_ALIGN_END);
+    gtk_widget_set_margin_top(close_btn, 4);
+    gtk_widget_set_margin_end(close_btn, 4);
+    gtk_widget_set_margin_bottom(close_btn, 4);
+    gtk_box_append(GTK_BOX(vbox), close_btn);
+
+    gtk_window_set_child(GTK_WINDOW(win), vbox);
+
+    g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(g_main_loop_quit), loop);
+    g_signal_connect_swapped(win, "close-request", G_CALLBACK(g_main_loop_quit), loop);
+
+    /* Escape / Q closes */
+    GtkEventController *key_ctrl = gtk_event_controller_key_new();
+    g_signal_connect(key_ctrl, "key-pressed",
+        G_CALLBACK(on_image_viewer_key), loop);
+    gtk_widget_add_controller(win, key_ctrl);
+
+    gtk_window_present(GTK_WINDOW(win));
+    g_main_loop_run(loop);
+    g_main_loop_unref(loop);
+    gtk_window_destroy(GTK_WINDOW(win));
+
+    Panel *ap = active_panel(fm);
+    ap->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(ap->column_view);
+}
+
 void viewer_show(FM *fm)
 {
     Panel *p = active_panel(fm);
@@ -264,6 +341,21 @@ void viewer_show(FM *fm)
         g_free(name);
         fm_status(fm, "No file is selected");
         return;
+    }
+
+    /* Image preview — local files only, when enabled */
+    if (fm->viewer_image_preview && !p->ssh_conn && is_image_file(name)) {
+        gchar *fullpath = panel_cursor_fullpath(p);
+        if (fullpath) {
+            struct stat st;
+            if (lstat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
+                viewer_show_image(fm, name, fullpath);
+                g_free(fullpath);
+                g_free(name);
+                return;
+            }
+            g_free(fullpath);
+        }
     }
 
     gchar *content = NULL;

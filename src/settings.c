@@ -46,6 +46,7 @@
 #define KEY_ICON_SIZE            "icon_size"
 #define DEFAULT_ICON_SIZE        16
 #define KEY_AUTO_REFRESH         "auto_refresh"
+#define KEY_VIEWER_IMAGE_PREVIEW "viewer_image_preview"
 #define KEY_THEME                "theme"
 #define DEFAULT_THEME            1   /* 0=dark, 1=light */
 
@@ -458,6 +459,10 @@ void settings_load(FM *fm)
     fm->auto_refresh = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, &arerr);
     if (arerr) { g_clear_error(&arerr); fm->auto_refresh = FALSE; }
 
+    GError *vierr = NULL;
+    fm->viewer_image_preview = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_IMAGE_PREVIEW, &vierr);
+    if (vierr) { g_clear_error(&vierr); fm->viewer_image_preview = TRUE; }
+
     GError *therr = NULL;
     fm->theme = g_key_file_get_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, &therr);
     if (therr) { g_clear_error(&therr); fm->theme = DEFAULT_THEME; }
@@ -537,6 +542,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_ICON_SIZE,
                            fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, fm->auto_refresh);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_IMAGE_PREVIEW, fm->viewer_image_preview);
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, fm->theme);
 
     GError *err = NULL;
@@ -775,30 +781,38 @@ void settings_dialog(FM *fm)
     gtk_grid_attach(GTK_GRID(g1), lbl_cdate, 0, row, 1, 1);
     gtk_grid_attach(GTK_GRID(g1), spin_date, 1, row++, 1, 1);
 
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g1,
+                             gtk_label_new("Panels"));
+
+    /* ═══════════════════════════════════════════════════════
+     *  Tab – Display
+     * ═══════════════════════════════════════════════════════ */
+    MAKE_TAB_GRID(g_disp)
+    row = 0;
+
     GtkWidget *hdr4 = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hdr4), "<b>Display</b>");
     gtk_widget_set_halign(hdr4, GTK_ALIGN_START);
-    gtk_widget_set_margin_top(hdr4, 10);
-    gtk_grid_attach(GTK_GRID(g1), hdr4, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), hdr4, 0, row++, 2, 1);
 
     GtkWidget *chk_hidden = gtk_check_button_new_with_label("Show hidden files");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hidden), fm->show_hidden);
-    gtk_grid_attach(GTK_GRID(g1), chk_hidden, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), chk_hidden, 0, row++, 2, 1);
 
     GtkWidget *chk_hover = gtk_check_button_new_with_label("Show row hover highlight");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hover), fm->show_hover);
-    gtk_grid_attach(GTK_GRID(g1), chk_hover, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), chk_hover, 0, row++, 2, 1);
 
     GtkWidget *chk_auto_refresh = gtk_check_button_new_with_label("Auto-refresh panels (watch for file changes)");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_auto_refresh), fm->auto_refresh);
-    gtk_grid_attach(GTK_GRID(g1), chk_auto_refresh, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), chk_auto_refresh, 0, row++, 2, 1);
 
     /* ── Directory appearance ── */
     GtkWidget *hdr_dir = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hdr_dir), "<b>Directories</b>");
     gtk_widget_set_halign(hdr_dir, GTK_ALIGN_START);
     gtk_widget_set_margin_top(hdr_dir, 10);
-    gtk_grid_attach(GTK_GRID(g1), hdr_dir, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), hdr_dir, 0, row++, 2, 1);
 
     GtkWidget *lbl_dcolor = gtk_label_new("Color:");
     gtk_widget_set_halign(lbl_dcolor, GTK_ALIGN_END);
@@ -809,19 +823,19 @@ void settings_dialog(FM *fm)
     GtkWidget *dir_color_btn = gtk_color_dialog_button_new(dir_cdiag);
     gtk_color_dialog_button_set_rgba(GTK_COLOR_DIALOG_BUTTON(dir_color_btn), &dir_rgba);
     gtk_widget_set_hexpand(dir_color_btn, TRUE);
-    gtk_grid_attach(GTK_GRID(g1), lbl_dcolor,    0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(g1), dir_color_btn, 1, row++, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), lbl_dcolor,    0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), dir_color_btn, 1, row++, 1, 1);
 
     GtkWidget *chk_dir_bold = gtk_check_button_new_with_label("Bold font");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_dir_bold), fm->dir_bold);
-    gtk_grid_attach(GTK_GRID(g1), chk_dir_bold, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), chk_dir_bold, 0, row++, 2, 1);
 
     /* ── Mark color ── */
     GtkWidget *hdr_mark = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hdr_mark), "<b>Marked files (Insert/Space)</b>");
     gtk_widget_set_halign(hdr_mark, GTK_ALIGN_START);
     gtk_widget_set_margin_top(hdr_mark, 10);
-    gtk_grid_attach(GTK_GRID(g1), hdr_mark, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), hdr_mark, 0, row++, 2, 1);
 
     GtkWidget *lbl_mcolor = gtk_label_new("Color:");
     gtk_widget_set_halign(lbl_mcolor, GTK_ALIGN_END);
@@ -832,26 +846,26 @@ void settings_dialog(FM *fm)
     GtkWidget *mark_color_btn = gtk_color_dialog_button_new(mark_cdiag);
     gtk_color_dialog_button_set_rgba(GTK_COLOR_DIALOG_BUTTON(mark_color_btn), &mark_rgba);
     gtk_widget_set_hexpand(mark_color_btn, TRUE);
-    gtk_grid_attach(GTK_GRID(g1), lbl_mcolor,     0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(g1), mark_color_btn,  1, row++, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), lbl_mcolor,     0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), mark_color_btn,  1, row++, 1, 1);
 
     /* ── Icon size ── */
     GtkWidget *hdr_icon = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hdr_icon), "<b>Icons</b>");
     gtk_widget_set_halign(hdr_icon, GTK_ALIGN_START);
     gtk_widget_set_margin_top(hdr_icon, 10);
-    gtk_grid_attach(GTK_GRID(g1), hdr_icon, 0, row++, 2, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), hdr_icon, 0, row++, 2, 1);
 
     GtkWidget *lbl_iconsz = gtk_label_new("Icon size (px):");
     gtk_widget_set_halign(lbl_iconsz, GTK_ALIGN_END);
     GtkWidget *spin_iconsz = gtk_spin_button_new_with_range(8, 64, 2);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_iconsz),
         fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
-    gtk_grid_attach(GTK_GRID(g1), lbl_iconsz,  0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(g1), spin_iconsz, 1, row++, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), lbl_iconsz,  0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), spin_iconsz, 1, row++, 1, 1);
 
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g1,
-                             gtk_label_new("Panels"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g_disp,
+                             gtk_label_new("Display"));
 
     /* ═══════════════════════════════════════════════════════
      *  Tab 2 – Kurzor
@@ -940,6 +954,10 @@ void settings_dialog(FM *fm)
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_viewer_linenum), fm->viewer_line_numbers);
     gtk_grid_attach(GTK_GRID(g_viewer), chk_viewer_linenum, 0, row++, 2, 1);
 #endif
+
+    GtkWidget *chk_viewer_imgprev = gtk_check_button_new_with_label("Show image preview (F3 on images)");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_viewer_imgprev), fm->viewer_image_preview);
+    gtk_grid_attach(GTK_GRID(g_viewer), chk_viewer_imgprev, 0, row++, 2, 1);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g_viewer,
                              gtk_label_new("Viewer"));
@@ -1267,6 +1285,8 @@ void settings_dialog(FM *fm)
         fm->viewer_line_numbers =
             gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_viewer_linenum));
 #endif
+        fm->viewer_image_preview =
+            gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_viewer_imgprev));
         apply_viewer_css(fm);
 
         apply_gui_css(fm);

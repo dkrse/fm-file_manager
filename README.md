@@ -13,7 +13,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel
-- **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F)
+- **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS)
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
@@ -22,7 +22,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
 - **Per-panel hamburger menu** — SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Dark / Light theme** — runtime switching via Settings → System (libadwaita); colors auto-adapt (directories, symlinks, marks, editor scheme)
-- **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
+- **Settings** — tabbed dialog: Panels / Display / Cursor / Viewer / Editor / System
 
 ## Keyboard shortcuts
 
@@ -124,11 +124,13 @@ Makefile            — build system
 
 Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear icon):
 
-**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, row hover highlight, auto-refresh panels, directory color and bold, mark color, icon size (8–64 px)
+**Panels** — panel font, GUI font, column widths (name/size/date)
+
+**Display** — hidden files, row hover highlight, auto-refresh panels, directory color and bold, mark color, icon size (8–64 px)
 
 **Cursor** — style (filled color or outline only), cursor color
 
-**Viewer** — font and size for file viewer (F3)
+**Viewer** — font and size for file viewer (F3), syntax highlighting, line numbers, image preview toggle
 
 **Editor** — text font, editor GUI font, line number font size, line numbers, syntax highlighting, color scheme
 

@@ -12,10 +12,10 @@ Single-window GTK4 application (with optional libadwaita for runtime theme switc
 | `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), incremental search (Ctrl+S), per-panel hamburger menus, path entry navigation (`do_path_activate`), directory monitoring (`panel_monitor_start/stop`, `on_dir_changed`, `sftp_poll_tick`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
 | `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
-| `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display |
+| `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display; same-filesystem traversal (`-xdev`), symlink loop protection, visited-inode tracking, cancel support |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, theme (dark/light), `apply_*_css`, `apply_theme`; theme-aware color helpers (`fm_visible_color`, `fm_link_color`, `fm_exec_color`, `fm_scheme_for_theme`); SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
-| `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators |
+| `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators; image preview via `GtkPicture` for image files (configurable) |
 | `src/editor.c` | Text editor (F4) with menu bar, find/replace (Ctrl+F/H), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
 | `src/highlight.c` | Syntax highlighting: GtkSourceView wrapper or custom regex highlighter |
 | `data/sk.km.fm.desktop` | Desktop entry for application launchers |
@@ -96,7 +96,7 @@ gtk_window_destroy(GTK_WINDOW(dlg));
 │ Copying…                           │  phase_lbl
 │ document.pdf                       │  file_lbl
 │ ████████████░░░░░░░░░░  54 %       │  progress bar
-│ 12.3 MB / 22.8 MB  —  4.5 MB/s    │  detail_lbl
+│ 12.3 MB / 22.8 MB  —  4.5 MB/s     │  detail_lbl
 │                          [Cancel]  │  cancel button
 └────────────────────────────────────┘
 ```
@@ -142,6 +142,10 @@ Advanced search with results displayed in active panel (MC style):
 - Content search: `file_contains()` reads files line-by-line, binary detection via null-byte probe on first 512 bytes
 - Files only in results (directories appear as group headers)
 - `*.*` treated as `*` (DOS/Commander compatibility)
+- **Same-filesystem traversal:** `root_dev` (device of search root) checked before recursing — skips `/proc`, `/sys`, `/dev`, NFS mounts etc. (like `find -xdev`)
+- **Symlink safety:** directory symlinks not followed (`S_ISLNK` check before recursion); `fstatat(AT_SYMLINK_NOFOLLOW)` for all entries
+- **Loop detection:** `GHashTable<(dev,ino)>` tracks visited directories — prevents revisiting via bind mounts or hard-linked dirs
+- **Cancel button:** shown during search, sets `cancelled` flag checked every iteration; progress updates every 8192 files scanned
 
 **Panel integration:**
 - Sorter disabled (`gtk_sort_list_model_set_sorter(NULL)`) to preserve grouped order
@@ -286,6 +290,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `syntax_highlight` | Syntax highlighting enabled |
 | `viewer_syntax_highlight` | Viewer syntax highlighting |
 | `viewer_line_numbers` | Viewer line numbers |
+| `viewer_image_preview` | Show image files as pictures in viewer (default true) |
 | `editor_style_scheme` | Color scheme (GtkSourceView) |
 | `theme` | Theme: 0=dark, 1=light (default 1) |
 

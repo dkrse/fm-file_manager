@@ -2,6 +2,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <stdio.h>
 
@@ -97,7 +98,11 @@ typedef struct {
     const char  *content;
     gint64       size_min;
     gint64       size_max;
-    int          count;
+    int          count;         /* matched results */
+    int          scanned;       /* total files visited */
+    gboolean    *cancelled;    /* pointer to cancel flag (set by UI button) */
+    dev_t        root_dev;     /* device of search root (for -xdev semantics) */
+    GHashTable  *visited;      /* set of visited (dev,ino) pairs — loop detection */
     GtkWidget   *counter_label;
 } SearchCtx;
 
@@ -121,29 +126,71 @@ static void add_result(SearchCtx *ctx, const char *base_interned,
     }
 }
 
+/* Hash/equal for (dev_t, ino_t) pair — used for visited-directory tracking */
+static guint devino_hash(gconstpointer p)
+{
+    const guint64 *v = p;   /* v[0]=dev, v[1]=ino */
+    return g_int64_hash(&v[0]) ^ g_int64_hash(&v[1]);
+}
+
+static gboolean devino_equal(gconstpointer a, gconstpointer b)
+{
+    const guint64 *va = a, *vb = b;
+    return va[0] == vb[0] && va[1] == vb[1];
+}
+
 static void search_dir(SearchCtx *ctx, const char *base, int depth)
 {
-    if (depth > 64) return;
+    if (depth > 64 || *ctx->cancelled) return;
+
+    struct stat base_st;
+    if (lstat(base, &base_st) != 0) return;
+
+    /* Skip symlinks to directories — prevents loops (like find -P) */
+    if (S_ISLNK(base_st.st_mode)) return;
+
+    /* Stay on same filesystem as search root (like find -xdev).
+     * Skips /proc, /sys, /dev etc. when searching from / */
+    if (base_st.st_dev != ctx->root_dev) return;
+
+    /* Loop detection: skip already-visited (dev, ino) pairs.
+     * Handles hard-linked directories and bind mounts. */
+    guint64 key[2] = { base_st.st_dev, base_st.st_ino };
+    if (g_hash_table_contains(ctx->visited, key)) return;
+    guint64 *stored = g_memdup2(key, sizeof(key));
+    g_hash_table_add(ctx->visited, stored);
 
     DIR *dir = opendir(base);
     if (!dir) return;
 
     const char *base_interned = string_pool_intern(ctx->pool, base);
+    int dfd = dirfd(dir);
 
     struct dirent *de;
     struct stat st;
-    char full[4096];
 
     while ((de = readdir(dir)) != NULL) {
+        if (*ctx->cancelled) break;
+
         if (de->d_name[0] == '.') {
             if (de->d_name[1] == '\0') continue;
             if (de->d_name[1] == '.' && de->d_name[2] == '\0') continue;
         }
 
-        g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-        if (lstat(full, &st) != 0) continue;
+        if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
 
-        gboolean is_dir = S_ISDIR(st.st_mode);
+        gboolean is_dir  = S_ISDIR(st.st_mode);
+        gboolean is_link = S_ISLNK(st.st_mode);
+
+        ctx->scanned++;
+        if ((ctx->scanned & 0x1FFF) == 0) {   /* every 8192 files scanned */
+            gchar msg[80];
+            g_snprintf(msg, sizeof(msg), "Scanning: %d files, %d found",
+                       ctx->scanned, ctx->count);
+            gtk_label_set_text(GTK_LABEL(ctx->counter_label), msg);
+            while (g_main_context_pending(NULL))
+                g_main_context_iteration(NULL, FALSE);
+        }
 
         if (!is_dir) {
             gboolean name_match = fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0;
@@ -153,7 +200,12 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
             }
             if (name_match) {
                 if (ctx->content) {
-                    gchar *ml = file_contains(full, ctx->content);
+                    gchar *ml = NULL;
+                    if (!is_link) {
+                        char full[4096];
+                        g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
+                        ml = file_contains(full, ctx->content);
+                    }
                     if (ml) {
                         add_result(ctx, base_interned, de->d_name, &st);
                         g_free(ml);
@@ -164,8 +216,11 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
             }
         }
 
-        if (is_dir)
+        if (is_dir && !is_link) {
+            char full[4096];
+            g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
             search_dir(ctx, full, depth + 1);
+        }
     }
     closedir(dir);
 }
@@ -440,6 +495,14 @@ static gboolean show_input_dialog(FM *fm, gchar **out_pattern, gchar **out_conte
     return TRUE;
 }
 
+/* ── Cancel callback ─────────────────────────────────────────────── */
+
+static void on_search_cancel(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    *((gboolean *)data) = TRUE;
+}
+
 /* ── Main search entry point ─────────────────────────────────────── */
 
 void search_run(FM *fm)
@@ -474,11 +537,26 @@ void search_run(FM *fm)
     p->inhibit_sel = TRUE;
     fm->panels[0].inhibit_sel = TRUE;
     fm->panels[1].inhibit_sel = TRUE;
+
+    /* Show cancel button below status label */
+    gboolean search_cancelled = FALSE;
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel search");
+    gtk_widget_add_css_class(cancel_btn, "fm-fkey");
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_search_cancel), &search_cancelled);
+    GtkWidget *frame = gtk_widget_get_parent(p->status_label);
+    gtk_box_append(GTK_BOX(frame), cancel_btn);
+
     while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
 
     /* Phase 1: collect lightweight result records */
     StringPool pool;
     string_pool_init(&pool);
+
+    /* Get device of search root for -xdev semantics */
+    struct stat root_st;
+    dev_t root_dev = 0;
+    if (lstat(search_dir_path, &root_st) == 0)
+        root_dev = root_st.st_dev;
 
     SearchCtx ctx = {
         .results       = g_ptr_array_sized_new(4096),
@@ -488,12 +566,20 @@ void search_run(FM *fm)
         .size_min      = size_min,
         .size_max      = size_max,
         .count         = 0,
+        .scanned       = 0,
+        .cancelled     = &search_cancelled,
+        .root_dev      = root_dev,
+        .visited       = g_hash_table_new_full(devino_hash, devino_equal, g_free, NULL),
         .counter_label = p->status_label,
     };
     g_ptr_array_set_free_func(ctx.results, search_result_free);
 
     search_dir(&ctx, search_dir_path, 0);
     int result_count = ctx.count;
+    g_hash_table_destroy(ctx.visited);
+
+    /* Remove cancel button */
+    gtk_box_remove(GTK_BOX(frame), cancel_btn);
 
     /* Phase 2: sort + build grouped FileItem list */
     gtk_label_set_text(GTK_LABEL(p->status_label), "Building list...");
@@ -529,8 +615,9 @@ void search_run(FM *fm)
     gtk_widget_set_visible(p->search_btn, TRUE);
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), info_text);
 
-    gchar *done_msg = g_strdup_printf("Found: %d files  (Enter=go to file, Backspace=back)",
-                                      result_count);
+    const char *suffix = search_cancelled ? " (cancelled)" : "";
+    gchar *done_msg = g_strdup_printf("Found: %d files%s  (Enter=go to file, Backspace=back)",
+                                      result_count, suffix);
     gtk_label_set_text(GTK_LABEL(p->status_label), done_msg);
     g_free(done_msg);
     g_free(info_text);
