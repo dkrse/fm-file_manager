@@ -157,6 +157,10 @@ The dialog (panel hamburger menu → SSH/SFTP) allows:
 - Copy operations refuse to follow symlinks (`O_NOFOLLOW`)
 - Remote file preview uses unique temp directories (`g_dir_make_tmp`)
 
+## Author
+
+krse
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
