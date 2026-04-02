@@ -9,7 +9,7 @@ Single-window GTK4 application — a Total Commander clone. A single global `FM`
 | File | Responsibility |
 |------|---------------|
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
-| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), incremental search (Ctrl+S), per-panel hamburger menus, path entry navigation (`do_path_activate`) |
+| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), incremental search (Ctrl+S), per-panel hamburger menus, path entry navigation (`do_path_activate`), directory monitoring (`panel_monitor_start/stop`, `on_dir_changed`, `sftp_poll_tick`) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
 | `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
 | `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display |
@@ -63,6 +63,8 @@ Each `Panel` has:
 - `mask_pattern` — glob mask filter (files only, case sensitive)
 - `search_mode`, `search_prev_cwd`, `search_btn` — search results mode state
 - `default_sorter` — saved sorter for restoring after search mode
+- `dir_monitor` — `GFileMonitor` for local auto-refresh (inotify); NULL when not watching
+- `poll_id` — `g_timeout` source ID for SFTP auto-refresh polling; 0 when off
 
 **Sort:** Always `..` first, then directories, then files (enforced via `GtkMultiSorter`: a standalone `dirs_first_func` sorter as primary, column view sorter as secondary — direction toggle never affects directory-first ordering). Within each group by active column.
 
@@ -161,6 +163,25 @@ Advanced search with results displayed in active panel (MC style):
 
 **Pack:** Dialog with format dropdown (6 options), archive name entry, destination entry. Builds argv based on selected format: `tar czf/cjf/cJf/--zstd`, `zip -r`, `7z a`.
 
+## Auto-refresh (directory monitoring)
+
+`panel_monitor_start()` / `panel_monitor_stop()` in `main.c`. Enabled via Settings → Panels → "Auto-refresh panels".
+
+**Local panels — `GFileMonitor` (inotify):**
+- `g_file_monitor_directory()` with rate limit 500ms
+- `on_dir_changed` callback handles CREATED / DELETED / CHANGES_DONE_HINT / ATTRIBUTE_CHANGED
+- Incremental: CREATED → `g_list_store_append`; DELETED → `g_list_store_remove`; CHANGED → remove + re-insert (updates size/date)
+- Zero CPU cost while idle (kernel inotify)
+
+**SFTP panels — timer polling:**
+- `g_timeout_add_seconds(5, sftp_poll_tick, panel)` — polls every 5 seconds
+- `sftp_poll_tick`: opens remote directory with `libssh2_sftp_opendir`, builds `GHashTable` of remote filenames
+- Pass 1: remove items no longer on remote (iterate store backwards)
+- Pass 2: add new items from remote (check if already in store)
+- One network round-trip per tick; CPU cost: O(n) hash lookups
+
+**Lifecycle:** Monitor auto-starts in `panel_load()` and `panel_load_remote()`. Stops in `panel_monitor_stop()` (called at start of each load, on SSH disconnect, on setting toggle).
+
 ## Per-panel hamburger menus
 
 Each panel has its own `GtkMenuButton` (☰) in the path bar with a `GSimpleActionGroup` using prefix `p0`/`p1`. Menu items: SSH/SFTP, Create archive, Extract archive, File mask, Search files, Filter files. Each callback sets the panel as active before executing the action. Actions are inserted on the menu button widget itself via `gtk_widget_insert_action_group()`.
@@ -219,9 +240,9 @@ SSH connection runs in a background thread via `GTask`:
 ## SSH connections — data model
 
 ```
-SshBookmark { name, user, host, port }   // fm.h
+SshBookmark { name, user, host, port, key_path }   // fm.h
 settings.ini [ssh]
-  connections = name|user|host|port;name2|user2|host2|port2
+  connections = name|user|host|port|key_path;name2|user2|host2|port2|key_path2
 ```
 
 `settings_load_ssh_bookmarks` reads both new format and old `user@host` (backward compat).
@@ -249,6 +270,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `col_name_width`, `col_size_width`, `col_date_width` | Column widths |
 | `show_hidden` | Hidden files |
 | `show_hover` | Row hover highlight (default true) |
+| `auto_refresh` | Auto-refresh panels via inotify/polling (default false) |
 | `icon_size` | File icon pixel size (8–64, default 16) |
 | `terminal_app` | Terminal emulator |
 | `cursor_color`, `cursor_outline` | Cursor style |
@@ -295,3 +317,5 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 - Filter model uses `filter_model` (not `sort_model`) for all item access: `panel_cursor_name`, `panel_selection`, cursor navigation, search result lookup
 - `icon_for_entry()` returns static string constants — safe for `FileItem.icon_name` (not freed in finalize)
 - Ctrl+S search bar key controller uses `GTK_PHASE_CAPTURE` — required because GtkEntry otherwise consumes Enter/arrows before the handler sees them
+- `sync_cursor_from_selection()` — called before all keyboard actions in `on_tree_key_press` to sync `cursor_pos` from actual GTK selection; fixes mouse click + keyboard desync on SFTP panels where `on_selection_changed` may not reliably fire after `panel_load_remote`
+- SSH authentication tries password first, then public key (`key_path` from bookmark or default `~/.ssh/id_rsa`)

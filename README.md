@@ -18,7 +18,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS)
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
-- **Saved SSH connections** — named connections (name/host/user/port) in settings.ini, selectable via dropdown
+- **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
+- **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
 - **Per-panel hamburger menu** — SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Settings** — tabbed dialog: Panels / Cursor / Viewer / Editor / System
 
@@ -38,6 +39,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F4 | Text editor |
 | F5 | Copy |
 | F6 | Move |
+| Shift+F6 | Rename |
 | F7 | New directory |
 | F8 | Delete |
 | F10 | Quit |
@@ -119,7 +121,7 @@ Makefile            — build system
 
 Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear icon):
 
-**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, row hover highlight, directory color and bold, mark color, icon size (8–64 px)
+**Panels** — panel font, GUI font, column widths (name/size/date), hidden files, row hover highlight, auto-refresh panels, directory color and bold, mark color, icon size (8–64 px)
 
 **Cursor** — style (filled color or outline only), cursor color
 
@@ -131,13 +133,14 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 ## SSH connections
 
-Stored in `~/.config/fm/settings.ini`, section `[ssh]`, key `connections`. Format: `name|user|host|port` separated by `;`.
+Stored in `~/.config/fm/settings.ini`, section `[ssh]`, key `connections`. Format: `name|user|host|port|key_path` separated by `;`.
 
 The dialog (panel hamburger menu → SSH/SFTP) allows:
 - **Select** a saved connection from the dropdown → fills the form
 - **New** — clears the form for entering a new connection
 - **Save** — saves/updates the connection (password is not saved)
 - **Remove** — deletes the selected connection
+- **Key** — path to private key (optional, defaults to `~/.ssh/id_rsa`), with file browser
 - **Connect** — connects with the current details and password (async, non-blocking UI)
 
 ## License

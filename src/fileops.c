@@ -620,7 +620,8 @@ void on_browse_clicked(GtkButton *btn, gpointer user_data)
  *  Destination dialog (copy / move)
  * ─────────────────────────────────────────────────────────────────── */
 
-static gchar *ask_destination(FM *fm, const char *title, const char *default_dst)
+static gchar *ask_destination(FM *fm, const char *title, const char *default_dst,
+                              GList *files)
 {
     DlgCtx ctx;
     dlg_ctx_init(&ctx);
@@ -636,6 +637,35 @@ static gchar *ask_destination(FM *fm, const char *title, const char *default_dst
     gtk_widget_set_margin_end(vbox, 12);
     gtk_widget_set_margin_top(vbox, 12);
     gtk_widget_set_margin_bottom(vbox, 12);
+
+    /* File list */
+    if (files) {
+        int n = g_list_length(files);
+        gchar *files_hdr = g_strdup_printf("Files (%d):", n);
+        GtkWidget *flbl = gtk_label_new(files_hdr);
+        g_free(files_hdr);
+        gtk_widget_set_halign(flbl, GTK_ALIGN_START);
+        gtk_box_append(GTK_BOX(vbox), flbl);
+
+        GtkWidget *sw = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+            GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        int vis_h = (n <= 6) ? -1 : 120;
+        gtk_widget_set_size_request(sw, -1, vis_h);
+        if (n > 6) gtk_scrolled_window_set_min_content_height(
+            GTK_SCROLLED_WINDOW(sw), 120);
+
+        GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        for (GList *l = files; l; l = l->next) {
+            GtkWidget *row = gtk_label_new((const char *)l->data);
+            gtk_widget_set_halign(row, GTK_ALIGN_START);
+            gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
+            gtk_widget_add_css_class(row, "dim-label");
+            gtk_box_append(GTK_BOX(fbox), row);
+        }
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
+        gtk_box_append(GTK_BOX(vbox), sw);
+    }
 
     GtkWidget *lbl = gtk_label_new("Destination directory:");
     gtk_widget_set_halign(lbl, GTK_ALIGN_START);
@@ -702,7 +732,7 @@ void fo_copy(FM *fm)
 #else
         dst->cwd;
 #endif
-    gchar *dest = ask_destination(fm, "Copy to", default_dst);
+    gchar *dest = ask_destination(fm, "Copy to", default_dst, targets);
     if (!dest) { g_list_free_full(targets, g_free); return; }
 
     int ok = 0, fail = 0;
@@ -871,7 +901,7 @@ void fo_move(FM *fm)
 #else
         dst->cwd;
 #endif
-    gchar *dest = ask_destination(fm, "Move to", default_dst);
+    gchar *dest = ask_destination(fm, "Move to", default_dst, targets);
     if (!dest) { g_list_free_full(targets, g_free); return; }
 
     int ok = 0, fail = 0;
@@ -1044,9 +1074,7 @@ void fo_delete(FM *fm)
     if (!targets) { fm_status(fm, "Nothing is selected"); return; }
 
     int n = g_list_length(targets);
-    gchar *question = (n == 1)
-        ? g_strdup_printf("Delete '%s'?", (char *)targets->data)
-        : g_strdup_printf("Delete %d items?", n);
+    gchar *question = g_strdup_printf("Delete %d item%s?", n, n == 1 ? "" : "s");
 
     /* Confirmation dialog */
     DlgCtx ctx;
@@ -1069,6 +1097,25 @@ void fo_delete(FM *fm)
     gtk_widget_set_halign(q_lbl, GTK_ALIGN_START);
     g_free(question);
 
+    /* File list */
+    GtkWidget *sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    int vis_h = (n <= 6) ? -1 : 120;
+    gtk_widget_set_size_request(sw, -1, vis_h);
+    if (n > 6) gtk_scrolled_window_set_min_content_height(
+        GTK_SCROLLED_WINDOW(sw), 120);
+
+    GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    for (GList *l = targets; l; l = l->next) {
+        GtkWidget *row = gtk_label_new((const char *)l->data);
+        gtk_widget_set_halign(row, GTK_ALIGN_START);
+        gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
+        gtk_widget_add_css_class(row, "dim-label");
+        gtk_box_append(GTK_BOX(fbox), row);
+    }
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
+
     GtkWidget *warn = gtk_label_new("This action is irreversible.");
     gtk_widget_set_halign(warn, GTK_ALIGN_START);
 
@@ -1082,6 +1129,7 @@ void fo_delete(FM *fm)
     gtk_box_append(GTK_BOX(btn_box), ok_btn);
 
     gtk_box_append(GTK_BOX(vbox), q_lbl);
+    gtk_box_append(GTK_BOX(vbox), sw);
     gtk_box_append(GTK_BOX(vbox), warn);
     gtk_box_append(GTK_BOX(vbox), btn_box);
     gtk_window_set_child(GTK_WINDOW(dlg), vbox);
@@ -1130,7 +1178,8 @@ void fo_delete(FM *fm)
                                     : "Deleted: %d  errors: %d", ok2, fail);
     }
     if (p->marks) g_hash_table_remove_all(p->marks);
-    panel_reload(p);
+    panel_reload(&fm->panels[0]);
+    panel_reload(&fm->panels[1]);
 
     /* Restore focus to active panel */
     p->inhibit_sel = TRUE;
@@ -1199,6 +1248,7 @@ void fo_mkdir(FM *fm)
                 if (r == 0) {
                     fm_status(fm, "Directory created: %s", name);
                     panel_load_remote(p, p->ssh_conn->remote_path);
+                    panel_reload(other_panel(fm));
                 } else {
                     fm_status(fm, "Error creating remote directory");
                 }
@@ -1209,7 +1259,8 @@ void fo_mkdir(FM *fm)
                 gchar *path = g_build_filename(p->cwd, name, NULL);
                 if (mkdir(path, 0755) == 0) {
                     fm_status(fm, "Directory created: %s", name);
-                    panel_reload(p);
+                    panel_reload(&fm->panels[0]);
+                    panel_reload(&fm->panels[1]);
                 } else {
                     fm_status(fm, "Error creating directory: %s", g_strerror(errno));
                 }
@@ -1285,6 +1336,7 @@ void fo_rename(FM *fm)
 
     gtk_window_present(GTK_WINDOW(dlg));
 
+    gchar *renamed_to = NULL;
     if (dlg_ctx_run(&ctx) == 1) {
         const gchar *new_name = gtk_editable_get_text(GTK_EDITABLE(entry));
         if (new_name && new_name[0] && strcmp(new_name, old_name) != 0
@@ -1296,7 +1348,9 @@ void fo_rename(FM *fm)
                 int r = libssh2_sftp_rename(p->ssh_conn->sftp, old_rp, new_rp);
                 if (r == 0) {
                     fm_status(fm, "Renamed: %s → %s", old_name, new_name);
+                    renamed_to = g_strdup(new_name);
                     panel_load_remote(p, p->ssh_conn->remote_path);
+                    panel_reload(other_panel(fm));
                 } else {
                     fm_status(fm, "Error renaming remote file");
                 }
@@ -1308,7 +1362,9 @@ void fo_rename(FM *fm)
                 gchar *dst_path = g_build_filename(p->cwd, new_name, NULL);
                 if (rename(src_path, dst_path) == 0) {
                     fm_status(fm, "Renamed: %s → %s", old_name, new_name);
-                    panel_reload(p);
+                    renamed_to = g_strdup(new_name);
+                    panel_reload(&fm->panels[0]);
+                    panel_reload(&fm->panels[1]);
                 } else {
                     fm_status(fm, "Error renaming: %s", g_strerror(errno));
                 }
@@ -1318,6 +1374,25 @@ void fo_rename(FM *fm)
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
     g_free(old_name);
+
+    /* Position cursor on the renamed file */
+    if (renamed_to) {
+        p->inhibit_sel = TRUE;
+        guint n2 = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+        for (guint i = 0; i < n2; i++) {
+            FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+            if (fi && strcmp(fi->name, renamed_to) == 0) {
+                g_object_unref(fi);
+                p->cursor_pos = i;
+                gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
+                                          NULL, GTK_LIST_SCROLL_SELECT, NULL);
+                break;
+            }
+            if (fi) g_object_unref(fi);
+        }
+        p->inhibit_sel = FALSE;
+        g_free(renamed_to);
+    }
 
     /* Restore focus to active panel */
     p->inhibit_sel = TRUE;
@@ -1448,7 +1523,7 @@ void fo_extract(FM *fm)
 
     /* Ask destination */
     Panel *dst = other_panel(fm);
-    gchar *dest = ask_destination(fm, "Extract to", dst->cwd);
+    gchar *dest = ask_destination(fm, "Extract to", dst->cwd, NULL);
     if (!dest) { g_free(name); g_free(archive); return; }
 
     const gchar *argv[10];
@@ -1548,6 +1623,35 @@ void fo_pack(FM *fm)
     gtk_widget_set_margin_end(vbox, 12);
     gtk_widget_set_margin_top(vbox, 12);
     gtk_widget_set_margin_bottom(vbox, 12);
+
+    /* File list */
+    {
+        int n = g_list_length(targets);
+        gchar *files_hdr = g_strdup_printf("Files (%d):", n);
+        GtkWidget *flbl = gtk_label_new(files_hdr);
+        g_free(files_hdr);
+        gtk_widget_set_halign(flbl, GTK_ALIGN_START);
+        gtk_box_append(GTK_BOX(vbox), flbl);
+
+        GtkWidget *sw = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+            GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        int vis_h = (n <= 6) ? -1 : 120;
+        gtk_widget_set_size_request(sw, -1, vis_h);
+        if (n > 6) gtk_scrolled_window_set_min_content_height(
+            GTK_SCROLLED_WINDOW(sw), 120);
+
+        GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        for (GList *l = targets; l; l = l->next) {
+            GtkWidget *row = gtk_label_new((const char *)l->data);
+            gtk_widget_set_halign(row, GTK_ALIGN_START);
+            gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
+            gtk_widget_add_css_class(row, "dim-label");
+            gtk_box_append(GTK_BOX(fbox), row);
+        }
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
+        gtk_box_append(GTK_BOX(vbox), sw);
+    }
 
     /* Format dropdown */
     GtkWidget *lbl_fmt = gtk_label_new("Format:");

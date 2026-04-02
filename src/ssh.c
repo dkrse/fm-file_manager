@@ -18,6 +18,7 @@
 
 static SshConn *ssh_conn_new(const char *host, const char *user,
                               int port, const char *password,
+                              const char *key_path,
                               gchar **out_error)
 {
     *out_error = NULL;
@@ -66,9 +67,16 @@ static SshConn *ssh_conn_new(const char *host, const char *user,
         auth_ok = (libssh2_userauth_password(session, user, password) == 0);
 
     if (!auth_ok) {
-        const gchar *home = g_get_home_dir();
-        gchar *pub  = g_build_filename(home, ".ssh", "id_rsa.pub", NULL);
-        gchar *priv = g_build_filename(home, ".ssh", "id_rsa",     NULL);
+        gchar *priv = NULL;
+        gchar *pub  = NULL;
+        if (key_path && key_path[0]) {
+            priv = g_strdup(key_path);
+            pub  = g_strdup_printf("%s.pub", key_path);
+        } else {
+            const gchar *home = g_get_home_dir();
+            priv = g_build_filename(home, ".ssh", "id_rsa",     NULL);
+            pub  = g_build_filename(home, ".ssh", "id_rsa.pub", NULL);
+        }
         auth_ok = (libssh2_userauth_publickey_fromfile(
                        session, user, pub, priv, "") == 0);
         g_free(pub); g_free(priv);
@@ -104,6 +112,8 @@ static SshConn *ssh_conn_new(const char *host, const char *user,
 
 void ssh_panel_close(Panel *p)
 {
+    panel_monitor_stop(p);
+
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
 
@@ -274,6 +284,45 @@ void panel_load_remote(Panel *p, const char *path)
     }
 
     p->inhibit_sel = FALSE;
+
+    /* Start SFTP poll if auto-refresh enabled */
+    panel_monitor_start(p);
+}
+
+/* ── File browse helper (for SSH key path) ───────────────────────── */
+
+static void on_file_browse_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    GtkFileDialog *fd = GTK_FILE_DIALOG(source);
+    GtkWidget *entry = GTK_WIDGET(user_data);
+    GFile *file = gtk_file_dialog_open_finish(fd, res, NULL);
+    if (file) {
+        gchar *path = g_file_get_path(file);
+        if (path) {
+            gtk_editable_set_text(GTK_EDITABLE(entry), path);
+            g_free(path);
+        }
+        g_object_unref(file);
+    }
+}
+
+static void on_key_browse_clicked(GtkButton *btn, gpointer user_data)
+{
+    GtkWidget *entry = GTK_WIDGET(user_data);
+    GtkFileDialog *fd = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(fd, "Select private key");
+
+    const gchar *home = g_get_home_dir();
+    gchar *ssh_dir = g_build_filename(home, ".ssh", NULL);
+    GFile *f = g_file_new_for_path(ssh_dir);
+    gtk_file_dialog_set_initial_folder(fd, f);
+    g_object_unref(f);
+    g_free(ssh_dir);
+
+    GtkWidget *toplevel = GTK_WIDGET(gtk_widget_get_root(GTK_WIDGET(btn)));
+    gtk_file_dialog_open(fd, GTK_WINDOW(toplevel), NULL,
+                          on_file_browse_done, entry);
+    g_object_unref(fd);
 }
 
 /* ── Connection dialog helpers ───────────────────────────────────── */
@@ -285,6 +334,7 @@ typedef struct {
     GtkWidget     *host_entry;
     GtkWidget     *user_entry;
     GtkWidget     *port_entry;
+    GtkWidget     *key_entry;
     GList         *bookmarks;   /* GList<SshBookmark*>, owned */
     FM            *fm;
     gboolean       block_sel;   /* TRUE while rebuilding dropdown */
@@ -332,6 +382,7 @@ static void ssh_dlg_fill_form(SshDlgData *d, SshBookmark *bm)
     gchar *ps = g_strdup_printf("%d", bm->port > 0 ? bm->port : 22);
     gtk_editable_set_text(GTK_EDITABLE(d->port_entry), ps);
     g_free(ps);
+    gtk_editable_set_text(GTK_EDITABLE(d->key_entry), bm->key_path ? bm->key_path : "");
 }
 
 static void on_ssh_dropdown_selected(GObject *obj, GParamSpec *pspec, SshDlgData *d)
@@ -351,6 +402,7 @@ static void on_ssh_bm_save(GtkButton *btn, SshDlgData *d)
     const gchar *host = gtk_editable_get_text(GTK_EDITABLE(d->host_entry));
     const gchar *user = gtk_editable_get_text(GTK_EDITABLE(d->user_entry));
     const gchar *ps   = gtk_editable_get_text(GTK_EDITABLE(d->port_entry));
+    const gchar *kp   = gtk_editable_get_text(GTK_EDITABLE(d->key_entry));
     if (!host || !host[0]) return;
 
     int port = atoi(ps && ps[0] ? ps : "22");
@@ -366,12 +418,14 @@ static void on_ssh_bm_save(GtkButton *btn, SshDlgData *d)
         g_free(bm->host); bm->host = g_strdup(host);
         g_free(bm->user); bm->user = g_strdup(user ? user : "");
         bm->port = port;
+        g_free(bm->key_path); bm->key_path = (kp && kp[0]) ? g_strdup(kp) : NULL;
     } else {
         bm = g_new0(SshBookmark, 1);
         bm->name = g_strdup(bm_name);
         bm->host = g_strdup(host);
         bm->user = g_strdup(user ? user : "");
         bm->port = port;
+        bm->key_path = (kp && kp[0]) ? g_strdup(kp) : NULL;
         d->bookmarks = g_list_append(d->bookmarks, bm);
     }
     settings_save_ssh_bookmarks(d->fm, d->bookmarks);
@@ -388,6 +442,7 @@ static void on_ssh_bm_new(GtkButton *btn, SshDlgData *d)
     gtk_editable_set_text(GTK_EDITABLE(d->host_entry), "");
     gtk_editable_set_text(GTK_EDITABLE(d->user_entry), "");
     gtk_editable_set_text(GTK_EDITABLE(d->port_entry), "22");
+    gtk_editable_set_text(GTK_EDITABLE(d->key_entry), "");
     gtk_widget_grab_focus(d->name_entry);
 }
 
@@ -411,6 +466,7 @@ typedef struct {
     gchar *host;
     gchar *user;
     gchar *password;
+    gchar *key_path;
     int    port;
 } SshConnectArgs;
 
@@ -420,6 +476,7 @@ static void ssh_connect_args_free(gpointer p)
     g_free(a->host);
     g_free(a->user);
     g_free(a->password);
+    g_free(a->key_path);
     g_free(a);
 }
 
@@ -430,7 +487,7 @@ static void ssh_connect_thread(GTask *task, gpointer source,
     SshConnectArgs *args = task_data;
     gchar *errmsg = NULL;
     SshConn *conn = ssh_conn_new(args->host, args->user, args->port,
-                                  args->password, &errmsg);
+                                  args->password, args->key_path, &errmsg);
     if (conn) {
         g_task_return_pointer(task, conn, NULL);
     } else {
@@ -550,6 +607,21 @@ void ssh_connect_dialog(FM *fm)
     gtk_widget_set_hexpand(pw_entry, TRUE);
     FORM_ROW("Password:", pw_entry, grid, row++)
 
+    d->key_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(d->key_entry), "~/.ssh/id_rsa");
+    gtk_widget_set_hexpand(d->key_entry, TRUE);
+    GtkWidget *key_browse = gtk_button_new_with_label("...");
+    g_signal_connect(key_browse, "clicked", G_CALLBACK(on_key_browse_clicked), d->key_entry);
+    GtkWidget *key_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_append(GTK_BOX(key_box), d->key_entry);
+    gtk_box_append(GTK_BOX(key_box), key_browse);
+    gtk_widget_set_hexpand(key_box, TRUE);
+    { GtkWidget *_l = gtk_label_new("Key:");
+      gtk_widget_set_halign(_l, GTK_ALIGN_END);
+      gtk_grid_attach(GTK_GRID(grid), _l,      0, row, 1, 1);
+      gtk_grid_attach(GTK_GRID(grid), key_box, 1, row, 1, 1); }
+    row++;
+
 #undef FORM_ROW
 
     /* Fill dropdown after all form entries exist */
@@ -557,7 +629,7 @@ void ssh_connect_dialog(FM *fm)
 
     GtkWidget *hint = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hint),
-        "<small>Empty password = SSH key authentication (~/.ssh/id_rsa)</small>");
+        "<small>Empty password = SSH key authentication (default: ~/.ssh/id_rsa)</small>");
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
     gtk_grid_attach(GTK_GRID(grid), hint, 0, row++, 2, 1);
@@ -616,6 +688,7 @@ void ssh_connect_dialog(FM *fm)
         if (port <= 0 || port > 65535) port = 22;
         if (!user || !user[0]) user = "root";
 
+        const gchar *kp = gtk_editable_get_text(GTK_EDITABLE(d->key_entry));
         if (host && host[0]) {
             Panel *p = active_panel(fm);
             if (p->ssh_conn) ssh_panel_close(p);
@@ -627,6 +700,7 @@ void ssh_connect_dialog(FM *fm)
             args->host     = g_strdup(host);
             args->user     = g_strdup(user);
             args->password = g_strdup(pw);
+            args->key_path = (kp && kp[0]) ? g_strdup(kp) : NULL;
             args->port     = port;
 
             SshConnectCtx *cctx = g_new0(SshConnectCtx, 1);

@@ -45,10 +45,11 @@ FileItem *file_item_new_take(const char *icon_name, const char *name,
 
 /* ── SSH saved connection (bookmark) ─────────────────────────────── */
 typedef struct {
-    gchar *name;   /* display label                */
+    gchar *name;      /* display label                */
     gchar *user;
     gchar *host;
     int    port;
+    gchar *key_path;  /* path to private key (NULL = default ~/.ssh/id_rsa) */
 } SshBookmark;
 
 /* ── SSH connection state ─────────────────────────────────────────── */
@@ -102,6 +103,9 @@ typedef struct {
     GtkCustomFilter    *custom_filter;
     gchar              *filter_text;   /* current filter string (lowercase)    */
     gchar              *mask_pattern;  /* glob mask (e.g. "*.c"), NULL = off   */
+    /* directory monitor (auto-refresh) */
+    GFileMonitor       *dir_monitor;   /* local: inotify watcher             */
+    guint               poll_id;       /* SFTP: periodic poll timer (0=off)  */
     /* search results mode */
     gboolean            search_mode;   /* TRUE when panel shows search results */
     char                search_prev_cwd[4096]; /* cwd to restore on leaving search */
@@ -158,6 +162,8 @@ struct _FM {
     gboolean        dir_bold;                 /* bold font for directories      */
     /* mark color */
     gchar          *mark_color;               /* hex color for marked items     */
+    /* auto-refresh */
+    gboolean        auto_refresh;             /* watch directories for changes  */
 };
 
 /* ── Dialog helper (replaces gtk_dialog_run with GMainLoop) ───────── */
@@ -207,6 +213,10 @@ gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
 gchar *panel_cursor_fullpath(Panel *p);     /* full path (search-aware), caller must g_free() */
 GList *panel_selection(Panel *p);            /* g_list_free_full(l, g_free) */
 void   panel_update_status(Panel *p);
+
+/* ── directory monitoring ─────────────────────────────────────────── */
+void panel_monitor_start(Panel *p);
+void panel_monitor_stop(Panel *p);
 
 /* ── fileops ──────────────────────────────────────────────────────── */
 void fo_copy(FM *fm);

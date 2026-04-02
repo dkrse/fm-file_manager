@@ -45,6 +45,7 @@
 #define DEFAULT_MARK_COLOR       "#D32F2F"
 #define KEY_ICON_SIZE            "icon_size"
 #define DEFAULT_ICON_SIZE        16
+#define KEY_AUTO_REFRESH         "auto_refresh"
 
 #define DEFAULT_TERMINAL       "gnome-terminal"
 #define DEFAULT_CURSOR_COLOR   "#1A73E8"
@@ -355,6 +356,10 @@ void settings_load(FM *fm)
     if (fm->icon_size < 8)  fm->icon_size = 8;
     if (fm->icon_size > 64) fm->icon_size = 64;
 
+    GError *arerr = NULL;
+    fm->auto_refresh = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, &arerr);
+    if (arerr) { g_clear_error(&arerr); fm->auto_refresh = FALSE; }
+
     g_key_file_free(kf);
 
     apply_font_css(fm);
@@ -421,6 +426,7 @@ void settings_save(FM *fm)
                           fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_ICON_SIZE,
                            fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, fm->auto_refresh);
 
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {
@@ -442,6 +448,7 @@ void ssh_bookmark_free(gpointer p)
     g_free(bm->name);
     g_free(bm->user);
     g_free(bm->host);
+    g_free(bm->key_path);
     g_free(bm);
 }
 
@@ -472,7 +479,7 @@ GList *settings_load_ssh_bookmarks(FM *fm)
     GList *list = NULL;
     for (int i = 0; parts[i]; i++) {
         if (!parts[i][0]) continue;
-        gchar **f = g_strsplit(parts[i], "|", 4);
+        gchar **f = g_strsplit(parts[i], "|", 5);
         int nf = g_strv_length(f);
         SshBookmark *bm = g_new0(SshBookmark, 1);
         if (nf >= 4) {
@@ -480,6 +487,8 @@ GList *settings_load_ssh_bookmarks(FM *fm)
             bm->user = g_strdup(f[1]);
             bm->host = g_strdup(f[2]);
             bm->port = atoi(f[3]);
+            if (nf >= 5 && f[4][0])
+                bm->key_path = g_strdup(f[4]);
         } else {
             /* old "user@host" format */
             const gchar *at = strchr(parts[i], '@');
@@ -516,11 +525,12 @@ void settings_save_ssh_bookmarks(FM *fm, GList *list)
     for (GList *l = list; l; l = l->next) {
         SshBookmark *bm = l->data;
         if (s->len) g_string_append_c(s, ';');
-        g_string_append_printf(s, "%s|%s|%s|%d",
+        g_string_append_printf(s, "%s|%s|%s|%d|%s",
             bm->name ? bm->name : "",
             bm->user ? bm->user : "",
             bm->host ? bm->host : "",
-            bm->port > 0 ? bm->port : 22);
+            bm->port > 0 ? bm->port : 22,
+            bm->key_path ? bm->key_path : "");
     }
     g_key_file_set_string(kf, SETTINGS_GROUP_SSH, KEY_SSH_CONNECTIONS, s->str);
     g_string_free(s, TRUE);
@@ -667,6 +677,10 @@ void settings_dialog(FM *fm)
     GtkWidget *chk_hover = gtk_check_button_new_with_label("Show row hover highlight");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_hover), fm->show_hover);
     gtk_grid_attach(GTK_GRID(g1), chk_hover, 0, row++, 2, 1);
+
+    GtkWidget *chk_auto_refresh = gtk_check_button_new_with_label("Auto-refresh panels (watch for file changes)");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_auto_refresh), fm->auto_refresh);
+    gtk_grid_attach(GTK_GRID(g1), chk_auto_refresh, 0, row++, 2, 1);
 
     /* ── Directory appearance ── */
     GtkWidget *hdr_dir = gtk_label_new(NULL);
@@ -997,6 +1011,18 @@ void settings_dialog(FM *fm)
         /* show hidden */
         fm->show_hidden = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_hidden));
         fm->show_hover = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_hover));
+
+        /* auto-refresh */
+        gboolean new_ar = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_auto_refresh));
+        if (new_ar != fm->auto_refresh) {
+            fm->auto_refresh = new_ar;
+            for (int i = 0; i < 2; i++) {
+                if (fm->auto_refresh)
+                    panel_monitor_start(&fm->panels[i]);
+                else
+                    panel_monitor_stop(&fm->panels[i]);
+            }
+        }
 
         /* directory appearance */
         {

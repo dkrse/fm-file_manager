@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.11.0] — 2026-04-02
+
+### Auto-refresh, SSH private key, file list in dialogs, rename/cursor fixes
+
+**Auto-refresh panels (Settings → Panels):**
+- New setting "Auto-refresh panels (watch for file changes)" — off by default
+- **Local panels:** uses `GFileMonitor` (inotify on Linux) — instant, zero CPU cost while idle; rate-limited to 500ms
+- **SFTP panels:** timer-based polling every 5 seconds — one `readdir` per tick, compares with current store via `GHashTable`
+- **Incremental updates only:** on file create → `g_list_store_append`; on delete → `g_list_store_remove`; on change → remove + re-insert at same position. No full directory reload
+- `GtkColumnView` only re-renders visible rows (virtualization), so even huge directories stay fast
+- Monitor starts/stops automatically on directory change, SSH connect/disconnect, setting toggle
+
+**SSH private key path:**
+- New `Key:` field in SSH/SFTP connection dialog with file browser (opens `~/.ssh/` by default)
+- Per-connection private key path saved in bookmarks (5th field: `name|user|host|port|key_path`)
+- Empty = default `~/.ssh/id_rsa`; custom path tries `key_path` + `key_path.pub`
+- `SshBookmark.key_path` added to struct, persisted in `settings.ini`
+
+**File list in operation dialogs:**
+- Copy (F5), Move (F6), Delete (F8), and Pack (Alt+P) dialogs now show a scrollable list of affected files
+- Scrolls if more than 6 files; long filenames ellipsized with `PANGO_ELLIPSIZE_MIDDLE`
+- Delete dialog now shows "Delete N items?" with full file list instead of a single potentially very long filename
+
+**Rename (Shift+F6):**
+- Added Shift+F6 as keybinding for rename (in addition to F9)
+- After rename, cursor moves to the renamed file (previously jumped to first item)
+
+**Cursor sync fix (SFTP panels):**
+- Mouse click on SFTP panel now correctly syncs `cursor_pos` with GTK selection
+- Arrow keys, Enter, Space, Backspace all call `sync_cursor_from_selection()` before acting — prevents jumping to wrong position after mouse click
+
+**Both panels refresh after all operations:**
+- Delete (F8), Mkdir (F7), and Rename now reload both panels (previously only reloaded active panel)
+- Copy, Move, Extract, Pack already reloaded both panels
+
+**Search freeze fix:**
+- Both panels' `inhibit_sel` set to TRUE during search to prevent freeze when clicking on ColumnView during synchronous search processing
+
+---
+
 ## [2.10.0] — 2026-03-28
 
 ### MC-style incremental search, per-panel hamburger menus, toolbar reorder, hover setting

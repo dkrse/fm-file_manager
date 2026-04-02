@@ -467,6 +467,11 @@ void search_run(FM *fm)
 
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), info_text);
     gtk_label_set_text(GTK_LABEL(p->status_label), "Searching...");
+
+    /* Block selection callbacks during search to prevent freeze on mouse click */
+    p->inhibit_sel = TRUE;
+    fm->panels[0].inhibit_sel = TRUE;
+    fm->panels[1].inhibit_sel = TRUE;
     while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
 
     /* Phase 1: collect lightweight result records */
@@ -501,6 +506,9 @@ void search_run(FM *fm)
     /* Phase 3: load into panel */
     gtk_sort_list_model_set_sorter(p->sort_model, NULL);
 
+    /* Restore inhibit on both panels (was set to block clicks during search) */
+    fm->panels[0].inhibit_sel = FALSE;
+    fm->panels[1].inhibit_sel = FALSE;
     p->inhibit_sel = TRUE;
     if (p->marks)
         g_hash_table_remove_all(p->marks);
