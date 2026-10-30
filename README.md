@@ -2,6 +2,19 @@
 
 Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
+## Screenshots
+
+![Two panels](screenshots/01.png)
+
+| | |
+|:---:|:---:|
+| ![Keyboard shortcuts](screenshots/02.png) | ![Search files](screenshots/03.png) |
+| F1 — keyboard shortcuts | F2 — search files |
+| ![SSH / SFTP connections](screenshots/04.png) | ![Editor](screenshots/05.png) |
+| SSH / SFTP connections | F4 — editor |
+| ![Viewer](screenshots/06.png) | |
+| F3 — viewer | |
+
 ## Features
 
 - **Two panels** — navigation like in Total Commander
