@@ -569,8 +569,12 @@ void ssh_bookmark_free(gpointer p)
     g_free(bm);
 }
 
-/* Format: "name|user|host|port" separated by ";" .
- * Also reads old "user@host" entries for backward compatibility. */
+/* One group per bookmark: [ssh-bookmark-N] name/user/host/port/key
+ * (GKeyFile escapes the values).  Older files used a single string
+ * "name|user|host|port|key;..." or "user@host;..." – still read, and
+ * migrated on the next save. */
+#define SSH_BM_GROUP_PREFIX "ssh-bookmark-"
+
 GList *settings_load_ssh_bookmarks(FM *fm)
 {
     (void)fm;
@@ -578,6 +582,26 @@ GList *settings_load_ssh_bookmarks(FM *fm)
     GKeyFile *kf = g_key_file_new();
     g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
     g_free(path);
+
+    GList *list = NULL;
+    gchar **groups = g_key_file_get_groups(kf, NULL);
+    for (int i = 0; groups[i]; i++) {
+        if (!g_str_has_prefix(groups[i], SSH_BM_GROUP_PREFIX)) continue;
+        SshBookmark *bm = g_new0(SshBookmark, 1);
+        bm->name = g_key_file_get_string(kf, groups[i], "name", NULL);
+        bm->user = g_key_file_get_string(kf, groups[i], "user", NULL);
+        bm->host = g_key_file_get_string(kf, groups[i], "host", NULL);
+        bm->port = g_key_file_get_integer(kf, groups[i], "port", NULL);
+        bm->key_path = g_key_file_get_string(kf, groups[i], "key", NULL);
+        if (!bm->name) bm->name = g_strdup("");
+        if (!bm->user) bm->user = g_strdup("");
+        if (!bm->host) bm->host = g_strdup("");
+        if (bm->key_path && !bm->key_path[0]) g_clear_pointer(&bm->key_path, g_free);
+        if (bm->port <= 0 || bm->port > 65535) bm->port = 22;
+        list = g_list_append(list, bm);
+    }
+    g_strfreev(groups);
+    if (list) { g_key_file_free(kf); return list; }
 
     /* Try new key first, fall back to old key */
     gchar *raw = g_key_file_get_string(kf, SETTINGS_GROUP_SSH,
@@ -593,7 +617,6 @@ GList *settings_load_ssh_bookmarks(FM *fm)
     gchar **parts = g_strsplit(raw, ";", -1);
     g_free(raw);
 
-    GList *list = NULL;
     for (int i = 0; parts[i]; i++) {
         if (!parts[i][0]) continue;
         gchar **f = g_strsplit(parts[i], "|", 5);
@@ -638,19 +661,26 @@ void settings_save_ssh_bookmarks(FM *fm, GList *list)
     GKeyFile *kf = g_key_file_new();
     g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
 
-    GString *s = g_string_new(NULL);
+    /* drop old groups and the legacy single-string keys */
+    gchar **groups = g_key_file_get_groups(kf, NULL);
+    for (int i = 0; groups[i]; i++)
+        if (g_str_has_prefix(groups[i], SSH_BM_GROUP_PREFIX))
+            g_key_file_remove_group(kf, groups[i], NULL);
+    g_strfreev(groups);
+    g_key_file_remove_key(kf, SETTINGS_GROUP_SSH, KEY_SSH_CONNECTIONS, NULL);
+    g_key_file_remove_key(kf, SETTINGS_GROUP_SSH, KEY_BOOKMARKS, NULL);
+
+    int n = 0;
     for (GList *l = list; l; l = l->next) {
         SshBookmark *bm = l->data;
-        if (s->len) g_string_append_c(s, ';');
-        g_string_append_printf(s, "%s|%s|%s|%d|%s",
-            bm->name ? bm->name : "",
-            bm->user ? bm->user : "",
-            bm->host ? bm->host : "",
-            bm->port > 0 ? bm->port : 22,
-            bm->key_path ? bm->key_path : "");
+        gchar grp[64];
+        g_snprintf(grp, sizeof(grp), SSH_BM_GROUP_PREFIX "%d", n++);
+        g_key_file_set_string (kf, grp, "name", bm->name ? bm->name : "");
+        g_key_file_set_string (kf, grp, "user", bm->user ? bm->user : "");
+        g_key_file_set_string (kf, grp, "host", bm->host ? bm->host : "");
+        g_key_file_set_integer(kf, grp, "port", bm->port > 0 ? bm->port : 22);
+        g_key_file_set_string (kf, grp, "key",  bm->key_path ? bm->key_path : "");
     }
-    g_key_file_set_string(kf, SETTINGS_GROUP_SSH, KEY_SSH_CONNECTIONS, s->str);
-    g_string_free(s, TRUE);
 
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {

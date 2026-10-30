@@ -2,6 +2,7 @@
 fm
 build/*.o
 build/
+build-debug/
 
 # Editor files
 *.swp

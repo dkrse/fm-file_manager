@@ -1,4 +1,5 @@
 #include "fm.h"
+#include "dialogs.h"
 #include <string.h>
 #include <stdlib.h>
 #include <locale.h>
@@ -7,32 +8,13 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <glib/gstdio.h>
 
 static FM g_fm;
 
 /* ─────────────────────────────────────────────────────────────────── *
  *  Utility
  * ─────────────────────────────────────────────────────────────────── */
-
-gchar *fmt_size(goffset sz)
-{
-    if (sz < 0)            return g_strdup("");
-    if (sz < 1024)         return g_strdup_printf("%lld B",  (long long)sz);
-    if (sz < 1024*1024LL)  return g_strdup_printf("%.1f KB", sz / 1024.0);
-    if (sz < 1024*1024*1024LL)
-                           return g_strdup_printf("%.1f MB", sz / (1024.0*1024));
-    return                        g_strdup_printf("%.1f GB", sz / (1024.0*1024*1024));
-}
-
-gchar *fmt_date(gint64 t)
-{
-    time_t tt = (time_t)t;
-    struct tm tm_buf;
-    char buf[32] = "";
-    if (localtime_r(&tt, &tm_buf))
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-    return g_strdup(buf);
-}
 
 void fm_status(FM *fm, const char *fmt, ...)
 {
@@ -45,187 +27,6 @@ void fm_status(FM *fm, const char *fmt, ...)
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
- *  Icon name helpers — freedesktop standard content-type icons
- * ─────────────────────────────────────────────────────────────────── */
-
-/* Well-known directory names → themed folder icons */
-static const char *icon_for_dir(const char *name)
-{
-    static const struct { const char *name; const char *icon; } dirs[] = {
-        { "Desktop",       "folder-desktop"       },
-        { "Documents",     "folder-documents"     },
-        { "Downloads",     "folder-download"      },
-        { "Music",         "folder-music"         },
-        { "Pictures",      "folder-pictures"      },
-        { "Videos",        "folder-videos"        },
-        { "Templates",     "folder-templates"     },
-        { "Public",        "folder-publicshare"   },
-        { ".git",          "folder-git"           },
-        { NULL, NULL }
-    };
-    if (!name) return "folder";
-    for (int i = 0; dirs[i].name; i++)
-        if (strcmp(name, dirs[i].name) == 0) return dirs[i].icon;
-    return "folder";
-}
-
-/* File extension → standard freedesktop icon name */
-static const char *icon_for_file(const char *name)
-{
-    if (!name) return "text-x-generic";
-
-    const char *dot = strrchr(name, '.');
-    if (!dot || dot == name) {
-        /* No extension — check special filenames */
-        if (g_str_has_prefix(name, "Makefile") ||
-            g_str_has_prefix(name, "CMakeLists") ||
-            g_str_has_prefix(name, "Dockerfile") ||
-            g_str_has_prefix(name, "Vagrantfile"))
-            return "text-x-script";
-        if (strcmp(name, "LICENSE") == 0 || strcmp(name, "COPYING") == 0)
-            return "text-x-copying";
-        if (strcmp(name, "README") == 0)
-            return "text-x-readme";
-        return "text-x-generic";
-    }
-
-    const char *ext = dot + 1;
-
-    /* Images */
-    if (!g_ascii_strcasecmp(ext, "png")  || !g_ascii_strcasecmp(ext, "jpg") ||
-        !g_ascii_strcasecmp(ext, "jpeg") || !g_ascii_strcasecmp(ext, "gif") ||
-        !g_ascii_strcasecmp(ext, "bmp")  || !g_ascii_strcasecmp(ext, "svg") ||
-        !g_ascii_strcasecmp(ext, "webp") || !g_ascii_strcasecmp(ext, "ico") ||
-        !g_ascii_strcasecmp(ext, "tiff") || !g_ascii_strcasecmp(ext, "tif") ||
-        !g_ascii_strcasecmp(ext, "raw")  || !g_ascii_strcasecmp(ext, "psd"))
-        return "image-x-generic";
-
-    /* Audio */
-    if (!g_ascii_strcasecmp(ext, "mp3")  || !g_ascii_strcasecmp(ext, "ogg") ||
-        !g_ascii_strcasecmp(ext, "flac") || !g_ascii_strcasecmp(ext, "wav") ||
-        !g_ascii_strcasecmp(ext, "aac")  || !g_ascii_strcasecmp(ext, "wma") ||
-        !g_ascii_strcasecmp(ext, "m4a")  || !g_ascii_strcasecmp(ext, "opus"))
-        return "audio-x-generic";
-
-    /* Video */
-    if (!g_ascii_strcasecmp(ext, "mp4")  || !g_ascii_strcasecmp(ext, "mkv") ||
-        !g_ascii_strcasecmp(ext, "avi")  || !g_ascii_strcasecmp(ext, "mov") ||
-        !g_ascii_strcasecmp(ext, "wmv")  || !g_ascii_strcasecmp(ext, "flv") ||
-        !g_ascii_strcasecmp(ext, "webm") || !g_ascii_strcasecmp(ext, "m4v"))
-        return "video-x-generic";
-
-    /* Archives */
-    if (!g_ascii_strcasecmp(ext, "zip")  || !g_ascii_strcasecmp(ext, "tar") ||
-        !g_ascii_strcasecmp(ext, "gz")   || !g_ascii_strcasecmp(ext, "bz2") ||
-        !g_ascii_strcasecmp(ext, "xz")   || !g_ascii_strcasecmp(ext, "7z")  ||
-        !g_ascii_strcasecmp(ext, "rar")  || !g_ascii_strcasecmp(ext, "zst") ||
-        !g_ascii_strcasecmp(ext, "tgz")  || !g_ascii_strcasecmp(ext, "tbz2") ||
-        !g_ascii_strcasecmp(ext, "txz")  || !g_ascii_strcasecmp(ext, "deb") ||
-        !g_ascii_strcasecmp(ext, "rpm"))
-        return "package-x-generic";
-
-    /* PDF */
-    if (!g_ascii_strcasecmp(ext, "pdf"))
-        return "application-pdf";
-
-    /* Office documents */
-    if (!g_ascii_strcasecmp(ext, "doc")  || !g_ascii_strcasecmp(ext, "docx") ||
-        !g_ascii_strcasecmp(ext, "odt")  || !g_ascii_strcasecmp(ext, "rtf"))
-        return "x-office-document";
-    if (!g_ascii_strcasecmp(ext, "xls")  || !g_ascii_strcasecmp(ext, "xlsx") ||
-        !g_ascii_strcasecmp(ext, "ods")  || !g_ascii_strcasecmp(ext, "csv"))
-        return "x-office-spreadsheet";
-    if (!g_ascii_strcasecmp(ext, "ppt")  || !g_ascii_strcasecmp(ext, "pptx") ||
-        !g_ascii_strcasecmp(ext, "odp"))
-        return "x-office-presentation";
-
-    /* Web / markup */
-    if (!g_ascii_strcasecmp(ext, "html") || !g_ascii_strcasecmp(ext, "htm") ||
-        !g_ascii_strcasecmp(ext, "xhtml"))
-        return "text-html";
-    if (!g_ascii_strcasecmp(ext, "css"))
-        return "text-css";
-    if (!g_ascii_strcasecmp(ext, "xml")  || !g_ascii_strcasecmp(ext, "xsl") ||
-        !g_ascii_strcasecmp(ext, "xslt"))
-        return "text-xml";
-    if (!g_ascii_strcasecmp(ext, "json"))
-        return "application-json";
-
-    /* Source code */
-    if (!g_ascii_strcasecmp(ext, "c")    || !g_ascii_strcasecmp(ext, "h") ||
-        !g_ascii_strcasecmp(ext, "cpp")  || !g_ascii_strcasecmp(ext, "cc") ||
-        !g_ascii_strcasecmp(ext, "cxx")  || !g_ascii_strcasecmp(ext, "hpp"))
-        return "text-x-csrc";
-    if (!g_ascii_strcasecmp(ext, "py")   || !g_ascii_strcasecmp(ext, "pyw"))
-        return "text-x-python";
-    if (!g_ascii_strcasecmp(ext, "java")  || !g_ascii_strcasecmp(ext, "class") ||
-        !g_ascii_strcasecmp(ext, "jar"))
-        return "application-x-java";
-    if (!g_ascii_strcasecmp(ext, "js")   || !g_ascii_strcasecmp(ext, "mjs") ||
-        !g_ascii_strcasecmp(ext, "ts")   || !g_ascii_strcasecmp(ext, "jsx") ||
-        !g_ascii_strcasecmp(ext, "tsx"))
-        return "application-javascript";
-    if (!g_ascii_strcasecmp(ext, "rs"))
-        return "text-x-rust";
-    if (!g_ascii_strcasecmp(ext, "go"))
-        return "text-x-go";
-    if (!g_ascii_strcasecmp(ext, "rb"))
-        return "application-x-ruby";
-    if (!g_ascii_strcasecmp(ext, "php"))
-        return "application-x-php";
-    if (!g_ascii_strcasecmp(ext, "sql"))
-        return "text-x-sql";
-
-    /* Shell / scripts */
-    if (!g_ascii_strcasecmp(ext, "sh")   || !g_ascii_strcasecmp(ext, "bash") ||
-        !g_ascii_strcasecmp(ext, "zsh")  || !g_ascii_strcasecmp(ext, "fish") ||
-        !g_ascii_strcasecmp(ext, "pl")   || !g_ascii_strcasecmp(ext, "lua"))
-        return "text-x-script";
-
-    /* Config / data */
-    if (!g_ascii_strcasecmp(ext, "conf") || !g_ascii_strcasecmp(ext, "cfg") ||
-        !g_ascii_strcasecmp(ext, "ini")  || !g_ascii_strcasecmp(ext, "toml") ||
-        !g_ascii_strcasecmp(ext, "yaml") || !g_ascii_strcasecmp(ext, "yml"))
-        return "text-x-generic";
-
-    /* Markdown / docs */
-    if (!g_ascii_strcasecmp(ext, "md")   || !g_ascii_strcasecmp(ext, "rst") ||
-        !g_ascii_strcasecmp(ext, "txt")  || !g_ascii_strcasecmp(ext, "log"))
-        return "text-x-generic";
-
-    /* Fonts */
-    if (!g_ascii_strcasecmp(ext, "ttf")  || !g_ascii_strcasecmp(ext, "otf") ||
-        !g_ascii_strcasecmp(ext, "woff") || !g_ascii_strcasecmp(ext, "woff2"))
-        return "font-x-generic";
-
-    /* Shared libraries */
-    if (!g_ascii_strcasecmp(ext, "so")   || !g_ascii_strcasecmp(ext, "dll") ||
-        !g_ascii_strcasecmp(ext, "dylib"))
-        return "application-x-sharedlib";
-
-    /* Disk images */
-    if (!g_ascii_strcasecmp(ext, "iso")  || !g_ascii_strcasecmp(ext, "img"))
-        return "application-x-cd-image";
-
-    /* Database */
-    if (!g_ascii_strcasecmp(ext, "db")   || !g_ascii_strcasecmp(ext, "sqlite") ||
-        !g_ascii_strcasecmp(ext, "sqlite3"))
-        return "application-vnd.oasis.opendocument.database";
-
-    return "text-x-generic";
-}
-
-/* Combined: pick icon based on entry type + name */
-const char *icon_for_entry(const char *name, gboolean is_dir,
-                           gboolean is_link, gboolean is_exec)
-{
-    if (is_link) return "emblem-symbolic-link";
-    if (is_dir)  return icon_for_dir(name);
-    if (is_exec) return "application-x-executable";
-    return icon_for_file(name);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
  *  Panel helpers
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -235,10 +36,20 @@ void panel_update_status(Panel *p)
     guint total = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
 
     gchar *msg;
-    if (n_marks > 0)
-        msg = g_strdup_printf("%u marked  |  %u items",
-                              n_marks, total > 0 ? total - 1 : 0);
-    else
+    if (n_marks > 0) {
+        /* total size of marked files (directories are not walked) */
+        gint64 bytes = 0;
+        guint ns = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+        for (guint i = 0; i < ns; i++) {
+            FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+            if (it->marked && !it->is_dir && it->size_raw > 0) bytes += it->size_raw;
+            g_object_unref(it);
+        }
+        gchar *sz = fmt_size(bytes);
+        msg = g_strdup_printf("%u marked (%s)  |  %u items",
+                              n_marks, sz, total > 0 ? total - 1 : 0);
+        g_free(sz);
+    } else
         msg = g_strdup_printf("%u items", total > 0 ? total - 1 : 0);
     gtk_label_set_text(GTK_LABEL(p->status_label), msg);
     g_free(msg);
@@ -297,16 +108,277 @@ GList *panel_selection(Panel *p)
     return NULL;
 }
 
+const char *panel_dir(Panel *p)
+{
+    return p->ssh_conn ? p->ssh_conn->remote_path : p->cwd;
+}
+
+/* Full paths of marked items (or cursor item); remote paths for SFTP,
+ * the real location for search results. */
+GList *panel_selection_paths(Panel *p)
+{
+    GList *out = NULL;
+    gboolean have_marks = FALSE;
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+
+    /* The items' own flags decide: the key set may hold names that are
+     * hidden by the mask or keyed differently (search results). */
+    for (guint i = 0; i < n && !have_marks; i++) {
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+        if (!it) continue;
+        have_marks = it->marked && strcmp(it->name, "..") != 0;
+        g_object_unref(it);
+    }
+
+    for (guint i = 0; i < n; i++) {
+        if (!have_marks && i != p->cursor_pos) continue;
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+        if (!it) continue;
+        if ((!have_marks || it->marked) && strcmp(it->name, "..") != 0 &&
+            !(p->search_mode && !it->dir_path)) {          /* skip group headers */
+            gchar *path;
+            if (p->ssh_conn)
+                path = fs_remote_join(p->ssh_conn->remote_path, it->name);
+            else if (p->search_mode)
+                path = g_build_filename(it->dir_path, it->name, NULL);
+            else
+                path = g_build_filename(p->cwd, it->name, NULL);
+            out = g_list_prepend(out, path);
+        }
+        g_object_unref(it);
+    }
+    return g_list_reverse(out);
+}
+
+void panel_select_name(Panel *p, const char *name)
+{
+    if (!name) return;
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    for (guint i = 0; i < n; i++) {
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+        gboolean hit = fi && strcmp(fi->name, name) == 0;
+        if (fi) g_object_unref(fi);
+        if (!hit) continue;
+        p->cursor_pos = i;
+        p->inhibit_sel = TRUE;
+        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i, NULL,
+            p->fm->active == p->idx ? GTK_LIST_SCROLL_SELECT : GTK_LIST_SCROLL_NONE,
+            NULL);
+        p->inhibit_sel = FALSE;
+        return;
+    }
+}
+
 /* ─────────────────────────────────────────────────────────────────── *
  *  Panel: load directory
  * ─────────────────────────────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Directory reading off the main thread
+ *
+ *  readdir + fstatat run in a worker.  Local disks answer within a few
+ *  ms and the caller simply waits (panel_load stays synchronous for its
+ *  callers).  When a slow or network mount takes longer than
+ *  DIR_WAIT_MS a small modal "Reading…" window appears; Esc / Cancel
+ *  leaves the panel where it was and the worker result is discarded.
+ * ─────────────────────────────────────────────────────────────────── */
+
+#define DIR_WAIT_MS 150
+
+typedef struct { struct stat st; char name[]; } DirEnt;
+
+typedef struct {
+    gchar     *path;
+    gboolean   hidden;
+    GPtrArray *ents;          /* DirEnt*, NULL = opendir failed */
+    GMutex     m;
+    GCond      c;
+    gboolean   done;
+    GMainLoop *loop;          /* set when the main thread waits in a loop */
+    gint       refs;
+} DirLoad;
+
+static void dir_load_unref(DirLoad *d)
+{
+    if (!g_atomic_int_dec_and_test(&d->refs)) return;
+    if (d->ents) g_ptr_array_unref(d->ents);
+    g_mutex_clear(&d->m);
+    g_cond_clear(&d->c);
+    g_free(d->path);
+    g_free(d);
+}
+
+static gboolean dir_load_quit_idle(gpointer loop)
+{
+    g_main_loop_quit(loop);
+    g_main_loop_unref(loop);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer dir_load_thread(gpointer data)
+{
+    DirLoad *d = data;
+    GPtrArray *ents = NULL;
+    DIR *dir = opendir(d->path);
+    if (dir) {
+        ents = g_ptr_array_new_with_free_func(g_free);
+        int dfd = dirfd(dir);
+        struct dirent *de;
+        struct stat st;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                continue;
+            if (!d->hidden && de->d_name[0] == '.') continue;
+            if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+            size_t len = strlen(de->d_name) + 1;
+            DirEnt *e = g_malloc(sizeof(DirEnt) + len);
+            e->st = st;
+            memcpy(e->name, de->d_name, len);
+            g_ptr_array_add(ents, e);
+        }
+        closedir(dir);
+    }
+    g_mutex_lock(&d->m);
+    d->ents = ents;
+    d->done = TRUE;
+    g_cond_signal(&d->c);
+    if (d->loop) g_idle_add(dir_load_quit_idle, g_main_loop_ref(d->loop));
+    g_mutex_unlock(&d->m);
+    dir_load_unref(d);
+    return NULL;
+}
+
+typedef struct { GMainLoop *loop; gboolean cancelled; } DirWait;
+
+static void dir_wait_cancel(DirWait *w)
+{
+    w->cancelled = TRUE;
+    g_main_loop_quit(w->loop);
+}
+
+static gboolean dir_wait_key(GtkEventControllerKey *k, guint keyval, guint code,
+                             GdkModifierType st, DirWait *w)
+{
+    (void)k; (void)code; (void)st;
+    if (keyval != GDK_KEY_Escape) return FALSE;
+    dir_wait_cancel(w);
+    return TRUE;
+}
+
+static gboolean dir_wait_close(GtkWindow *win, DirWait *w)
+{
+    (void)win;
+    dir_wait_cancel(w);
+    return TRUE;
+}
+
+/* Returns the entries (caller unrefs; NULL = unreadable) or sets
+ * *cancelled when the user gave up waiting. */
+static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
+{
+    *cancelled = FALSE;
+    DirLoad *d = g_new0(DirLoad, 1);
+    d->path   = g_strdup(path);
+    d->hidden = fm->show_hidden;
+    d->refs   = 2;
+    g_mutex_init(&d->m);
+    g_cond_init(&d->c);
+    g_thread_unref(g_thread_new("fm-readdir", dir_load_thread, d));
+
+    gint64 until = g_get_monotonic_time() + DIR_WAIT_MS * G_TIME_SPAN_MILLISECOND;
+    g_mutex_lock(&d->m);
+    while (!d->done && g_cond_wait_until(&d->c, &d->m, until))
+        ;
+    DirWait w = { NULL, FALSE };
+    if (!d->done) {
+        w.loop = g_main_loop_new(NULL, FALSE);
+        d->loop = w.loop;
+    }
+    g_mutex_unlock(&d->m);
+
+    if (w.loop) {
+        GtkWidget *win = gtk_window_new();
+        gtk_window_set_title(GTK_WINDOW(win), "Reading directory");
+        gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(fm->window));
+        gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+        gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+        gtk_widget_set_margin_top(box, 16);
+        gtk_widget_set_margin_bottom(box, 16);
+        gtk_widget_set_margin_start(box, 20);
+        gtk_widget_set_margin_end(box, 20);
+        gchar *msg = g_strdup_printf("Reading %s\u2026", path);
+        GtkWidget *lbl = gtk_label_new(msg);
+        g_free(msg);
+        gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_MIDDLE);
+        gtk_label_set_max_width_chars(GTK_LABEL(lbl), 60);
+        GtkWidget *spin = gtk_spinner_new();
+        gtk_spinner_start(GTK_SPINNER(spin));
+        GtkWidget *btn = gtk_button_new_with_label("Cancel");
+        gtk_widget_set_halign(btn, GTK_ALIGN_END);
+        g_signal_connect_swapped(btn, "clicked", G_CALLBACK(dir_wait_cancel), &w);
+        gtk_box_append(GTK_BOX(box), lbl);
+        gtk_box_append(GTK_BOX(box), spin);
+        gtk_box_append(GTK_BOX(box), btn);
+        gtk_window_set_child(GTK_WINDOW(win), box);
+        GtkEventController *kc = gtk_event_controller_key_new();
+        g_signal_connect(kc, "key-pressed", G_CALLBACK(dir_wait_key), &w);
+        gtk_widget_add_controller(win, kc);
+        g_signal_connect(win, "close-request", G_CALLBACK(dir_wait_close), &w);
+        gtk_window_present(GTK_WINDOW(win));
+        gtk_widget_grab_focus(btn);
+
+        g_main_loop_run(w.loop);
+
+        g_signal_handlers_disconnect_by_data(win, &w);
+        gtk_window_destroy(GTK_WINDOW(win));
+        g_mutex_lock(&d->m);
+        d->loop = NULL;
+        g_mutex_unlock(&d->m);
+        g_main_loop_unref(w.loop);
+    }
+
+    GPtrArray *ents = NULL;
+    if (w.cancelled) {
+        *cancelled = TRUE;              /* worker frees its result */
+    } else {
+        ents  = d->ents;
+        d->ents = NULL;
+    }
+    dir_load_unref(d);
+    return ents;
+}
 
 void panel_load(Panel *p, const char *path)
 {
     if (p->ssh_conn) { panel_load_remote(p, path); return; }
 
+    if (p->busy) return;            /* a search is filling this panel */
     struct stat st;
     if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    if (strlen(path) >= sizeof(p->cwd)) {
+        fm_status(p->fm, "Path too long: %.60s...", path);
+        return;
+    }
+
+    /* path may point into p->cwd – keep a copy across the wait */
+    gchar *want = g_strdup(path);
+    gboolean cancelled;
+    panel_monitor_stop(p);          /* no reloads from events while waiting */
+    GPtrArray *ents = dir_read(p->fm, want, &cancelled);
+    if (cancelled) {
+        fm_status(p->fm, "Reading the directory was cancelled");
+        panel_monitor_start(p);     /* stay in the old directory */
+        g_free(want);
+        return;
+    }
+    path = want;
+
+    /* Leaving search results: they stay reachable via Alt+Left */
+    gboolean was_search = p->search_mode;
+    search_detach(p);
 
     /* Clear marks when entering a different directory */
     if (strcmp(p->cwd, path) != 0 && p->marks)
@@ -317,8 +389,6 @@ void panel_load(Panel *p, const char *path)
 
     g_strlcpy(p->cwd, path, sizeof(p->cwd));
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), path);
-
-    DIR *dir = opendir(path);
 
     /* Collect all items into a GPtrArray first, then splice once.
      * This emits a single items-changed on the store so GtkSortListModel
@@ -332,46 +402,14 @@ void panel_load(Panel *p, const char *path)
                       TRUE, vis_dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
                       (gint64)-2, (gint64)0));
 
-    if (dir) {
-        int dfd = dirfd(dir);   /* for fstatat – avoids building full path */
-        struct dirent *de;
-        struct stat fst;
-
-        while ((de = readdir(dir)) != NULL) {
-            if (de->d_name[0] == '.' &&
-                (de->d_name[1] == '\0' ||
-                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
-                continue;
-            if (!p->fm->show_hidden && de->d_name[0] == '.')
-                continue;
-
-            if (fstatat(dfd, de->d_name, &fst, AT_SYMLINK_NOFOLLOW) != 0)
-                continue;
-
-            gboolean is_dir  = S_ISDIR(fst.st_mode);
-            gboolean is_link = S_ISLNK(fst.st_mode);
-            gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
-
-            const char *icon = icon_for_entry(de->d_name, is_dir, is_link, is_exec);
-
-            const gchar *fg = NULL;
-            gint         wt = PANGO_WEIGHT_NORMAL;
-            if      (is_dir)  { fg = vis_dir_color; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-            else if (is_link) { fg = fm_link_color(p->fm); }
-            else if (is_exec) { fg = fm_exec_color(p->fm); }
-
-            /* file_item_new_take takes ownership of size/date strings */
-            FileItem *fi = file_item_new_take(icon, de->d_name,
-                              is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
-                              fmt_date(fst.st_mtime),
-                              is_dir, fg, wt,
-                              (gint64)fst.st_size, (gint64)fst.st_mtime);
-            if (p->marks && g_hash_table_contains(p->marks, de->d_name))
-                fi->marked = TRUE;
-            g_ptr_array_add(items, fi);
-        }
-        closedir(dir);
+    for (guint i = 0; ents && i < ents->len; i++) {
+        DirEnt *e = g_ptr_array_index(ents, i);
+        FileItem *fi = file_item_from_stat(p->fm, e->name, &e->st);
+        if (p->marks && g_hash_table_contains(p->marks, e->name))
+            fi->marked = TRUE;
+        g_ptr_array_add(items, fi);
     }
+    if (ents) g_ptr_array_unref(ents);
     g_free(vis_dir_color);
 
     /* Replace store: avoids expensive remove_all signal on large lists.
@@ -383,6 +421,9 @@ void panel_load(Panel *p, const char *path)
     gtk_sort_list_model_set_model(p->sort_model, G_LIST_MODEL(new_store));
     g_object_unref(p->store);   /* old store freed (items unreffed) */
     p->store = new_store;
+    if (was_search)             /* results are unsorted; restore after swap */
+        gtk_sort_list_model_set_sorter(p->sort_model, p->default_sorter);
+    search_update_buttons(p);
 
     panel_update_status(p);
 
@@ -402,6 +443,7 @@ void panel_load(Panel *p, const char *path)
 
     /* Start directory monitor if auto-refresh is enabled */
     panel_monitor_start(p);
+    g_free(want);
 }
 
 void panel_reload(Panel *p)
@@ -410,6 +452,8 @@ void panel_reload(Panel *p)
         panel_load_remote(p, p->ssh_conn->remote_path);
         return;
     }
+    /* Results are not a directory: reloading p->cwd would drop them */
+    if (p->search_mode || p->busy) return;
 
     gchar *saved = panel_cursor_name(p);
     panel_load(p, p->cwd);  /* inhibit_sel is handled inside panel_load */
@@ -466,10 +510,11 @@ void panel_go_up(Panel *p)
     }
 
     if (p->search_mode) {
-        p->search_mode = FALSE;
-        gtk_widget_set_visible(p->search_btn, FALSE);
-        panel_load(p, p->search_prev_cwd);  /* replaces store first */
-        gtk_sort_list_model_set_sorter(p->sort_model, g_object_ref(p->default_sorter));
+        gchar *name = g_strdup(p->search_prev_name);
+        panel_load(p, p->search_prev_cwd);  /* results kept for Alt+Left */
+        if (!p->search_mode && name)        /* back on the item from before */
+            panel_select_name(p, name);
+        g_free(name);
         return;
     }
     if (strcmp(p->cwd, "/") == 0) return;
@@ -497,285 +542,6 @@ void panel_go_up(Panel *p)
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
- *  Directory monitoring (auto-refresh via GFileMonitor / inotify)
- *
- *  Uses incremental updates: on file create/delete we add/remove
- *  a single item in the GListStore.  GtkColumnView only re-renders
- *  visible rows, so even huge directories stay fast.
- * ─────────────────────────────────────────────────────────────────── */
-
-static void on_dir_changed(GFileMonitor *monitor, GFile *file,
-                           GFile *other, GFileMonitorEvent event,
-                           Panel *p)
-{
-    (void)monitor; (void)other;
-
-    /* Only handle create / delete / attribute-change */
-    if (event != G_FILE_MONITOR_EVENT_CREATED &&
-        event != G_FILE_MONITOR_EVENT_DELETED &&
-        event != G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED &&
-        event != G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT)
-        return;
-
-    /* Skip SFTP and search mode panels */
-    if (p->ssh_conn || p->search_mode) return;
-
-    gchar *basename = g_file_get_basename(file);
-    if (!basename) return;
-
-    /* Skip hidden files if not showing them */
-    if (!p->fm->show_hidden && basename[0] == '.') {
-        g_free(basename);
-        return;
-    }
-
-    /* Skip "." and ".." */
-    if (strcmp(basename, ".") == 0 || strcmp(basename, "..") == 0) {
-        g_free(basename);
-        return;
-    }
-
-    if (event == G_FILE_MONITOR_EVENT_DELETED) {
-        /* Remove item from store */
-        guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-        for (guint i = 0; i < n; i++) {
-            FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-            if (fi && strcmp(fi->name, basename) == 0) {
-                g_object_unref(fi);
-                p->inhibit_sel = TRUE;
-                g_list_store_remove(p->store, i);
-                p->inhibit_sel = FALSE;
-                panel_update_status(p);
-                break;
-            }
-            if (fi) g_object_unref(fi);
-        }
-    } else if (event == G_FILE_MONITOR_EVENT_CREATED) {
-        /* Check if already in store (avoid duplicates) */
-        guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-        for (guint i = 0; i < n; i++) {
-            FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-            if (fi && strcmp(fi->name, basename) == 0) {
-                g_object_unref(fi);
-                g_free(basename);
-                return; /* already present */
-            }
-            if (fi) g_object_unref(fi);
-        }
-        /* Stat the new file and add it */
-        gchar *fullpath = g_build_filename(p->cwd, basename, NULL);
-        struct stat fst;
-        if (lstat(fullpath, &fst) == 0) {
-            gboolean is_dir  = S_ISDIR(fst.st_mode);
-            gboolean is_link = S_ISLNK(fst.st_mode);
-            gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
-            const char *icon = icon_for_entry(basename, is_dir, is_link, is_exec);
-            gchar *vdc = fm_visible_color(p->fm, p->fm->dir_color);
-            const gchar *fg = NULL;
-            gint wt = PANGO_WEIGHT_NORMAL;
-            if      (is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-            else if (is_link) { fg = fm_link_color(p->fm); }
-            else if (is_exec) { fg = fm_exec_color(p->fm); }
-            FileItem *fi = file_item_new_take(icon, basename,
-                              is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
-                              fmt_date(fst.st_mtime),
-                              is_dir, fg, wt,
-                              (gint64)fst.st_size, (gint64)fst.st_mtime);
-            g_free(vdc);
-            p->inhibit_sel = TRUE;
-            g_list_store_append(p->store, fi);
-            g_object_unref(fi);
-            p->inhibit_sel = FALSE;
-            panel_update_status(p);
-        }
-        g_free(fullpath);
-    } else if (event == G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT ||
-               event == G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED) {
-        /* Update size/date of existing item */
-        gchar *fullpath = g_build_filename(p->cwd, basename, NULL);
-        struct stat fst;
-        if (lstat(fullpath, &fst) == 0) {
-            guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-            for (guint i = 0; i < n; i++) {
-                FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-                if (fi && strcmp(fi->name, basename) == 0) {
-                    /* Update in-place: remove + re-insert to trigger re-render */
-                    gboolean is_dir  = S_ISDIR(fst.st_mode);
-                    gboolean is_link = S_ISLNK(fst.st_mode);
-                    gboolean is_exec = !is_dir && (fst.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
-                    const char *icon = icon_for_entry(basename, is_dir, is_link, is_exec);
-                    gchar *vdc2 = fm_visible_color(p->fm, p->fm->dir_color);
-                    const gchar *fg = NULL;
-                    gint wt = PANGO_WEIGHT_NORMAL;
-                    if      (is_dir)  { fg = vdc2; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-                    else if (is_link) { fg = fm_link_color(p->fm); }
-                    else if (is_exec) { fg = fm_exec_color(p->fm); }
-                    FileItem *nfi = file_item_new_take(icon, basename,
-                                      is_dir ? g_strdup("<DIR>") : fmt_size(fst.st_size),
-                                      fmt_date(fst.st_mtime),
-                                      is_dir, fg, wt,
-                                      (gint64)fst.st_size, (gint64)fst.st_mtime);
-                    g_free(vdc2);
-                    if (fi->marked) nfi->marked = TRUE;
-                    p->inhibit_sel = TRUE;
-                    g_list_store_remove(p->store, i);
-                    g_list_store_insert(p->store, i, nfi);
-                    g_object_unref(nfi);
-                    p->inhibit_sel = FALSE;
-                    g_object_unref(fi);
-                    break;
-                }
-                if (fi) g_object_unref(fi);
-            }
-        }
-        g_free(fullpath);
-    }
-    g_free(basename);
-}
-
-/* ── SFTP polling: periodic incremental refresh ──────────────────── */
-
-#ifdef HAVE_LIBSSH2
-static gboolean sftp_poll_tick(gpointer data)
-{
-    Panel *p = data;
-    if (!p->ssh_conn || !p->ssh_conn->sftp || p->search_mode)
-        return G_SOURCE_CONTINUE;
-
-    SshConn *conn = p->ssh_conn;
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp,
-                                                         conn->remote_path);
-    if (!handle) return G_SOURCE_CONTINUE;
-
-    /* Build hash set of remote filenames → attrs */
-    GHashTable *remote = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                                g_free, g_free);
-    char name_buf[512], longentry[512];
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    while (libssh2_sftp_readdir_ex(handle, name_buf, sizeof(name_buf),
-                                    longentry, sizeof(longentry), &attrs) > 0) {
-        if (strcmp(name_buf, ".") == 0 || strcmp(name_buf, "..") == 0)
-            continue;
-        if (!p->fm->show_hidden && name_buf[0] == '.')
-            continue;
-        LIBSSH2_SFTP_ATTRIBUTES *a = g_new(LIBSSH2_SFTP_ATTRIBUTES, 1);
-        *a = attrs;
-        g_hash_table_insert(remote, g_strdup(name_buf), a);
-    }
-    libssh2_sftp_closedir(handle);
-
-    gboolean changed = FALSE;
-
-    /* Pass 1: remove items no longer on remote */
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-    for (guint i = n; i > 0; i--) {
-        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i - 1);
-        if (!fi) continue;
-        if (strcmp(fi->name, "..") != 0 &&
-            !g_hash_table_contains(remote, fi->name)) {
-            p->inhibit_sel = TRUE;
-            g_list_store_remove(p->store, i - 1);
-            p->inhibit_sel = FALSE;
-            changed = TRUE;
-        }
-        g_object_unref(fi);
-    }
-
-    /* Pass 2: add new items from remote */
-    GHashTableIter iter;
-    gpointer key, val;
-    g_hash_table_iter_init(&iter, remote);
-    while (g_hash_table_iter_next(&iter, &key, &val)) {
-        const char *rname = key;
-        /* Check if already in store */
-        gboolean found = FALSE;
-        n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-        for (guint i = 0; i < n; i++) {
-            FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-            if (fi && strcmp(fi->name, rname) == 0) { found = TRUE; g_object_unref(fi); break; }
-            if (fi) g_object_unref(fi);
-        }
-        if (found) continue;
-
-        LIBSSH2_SFTP_ATTRIBUTES *a = val;
-        gboolean is_dir  = (a->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            LIBSSH2_SFTP_S_ISDIR(a->permissions);
-        gboolean is_link = (a->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            LIBSSH2_SFTP_S_ISLNK(a->permissions);
-        gboolean is_exec = !is_dir &&
-                            (a->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            (a->permissions & (S_IXUSR | S_IXGRP | S_IXOTH));
-        const char *icon = icon_for_entry(rname, is_dir, is_link, is_exec);
-        gint64 size_raw = (a->flags & LIBSSH2_SFTP_ATTR_SIZE) ? (gint64)a->filesize : 0;
-        gint64 mtime    = (a->flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (gint64)a->mtime : 0;
-        gchar *vdc3 = fm_visible_color(p->fm, p->fm->dir_color);
-        const gchar *fg = NULL;
-        gint wt = PANGO_WEIGHT_NORMAL;
-        if      (is_dir)  { fg = vdc3; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-        else if (is_link) { fg = fm_link_color(p->fm); }
-        else if (is_exec) { fg = fm_exec_color(p->fm); }
-        FileItem *fi = file_item_new_take(icon, rname,
-                          is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
-                          fmt_date(mtime),
-                          is_dir, fg, wt, size_raw, mtime);
-        g_free(vdc3);
-        p->inhibit_sel = TRUE;
-        g_list_store_append(p->store, fi);
-        g_object_unref(fi);
-        p->inhibit_sel = FALSE;
-        changed = TRUE;
-    }
-
-    g_hash_table_destroy(remote);
-    if (changed) panel_update_status(p);
-
-    return G_SOURCE_CONTINUE;
-}
-#endif /* HAVE_LIBSSH2 */
-
-void panel_monitor_stop(Panel *p)
-{
-    if (p->dir_monitor) {
-        g_file_monitor_cancel(p->dir_monitor);
-        g_object_unref(p->dir_monitor);
-        p->dir_monitor = NULL;
-    }
-    if (p->poll_id) {
-        g_source_remove(p->poll_id);
-        p->poll_id = 0;
-    }
-}
-
-void panel_monitor_start(Panel *p)
-{
-    panel_monitor_stop(p);
-
-    if (!p->fm->auto_refresh) return;
-    if (p->search_mode) return;
-
-#ifdef HAVE_LIBSSH2
-    if (p->ssh_conn) {
-        /* SFTP: poll every 5 seconds */
-        p->poll_id = g_timeout_add_seconds(5, sftp_poll_tick, p);
-        return;
-    }
-#endif
-
-    if (!p->cwd[0]) return;
-
-    GFile *dir = g_file_new_for_path(p->cwd);
-    p->dir_monitor = g_file_monitor_directory(dir,
-        G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);
-    g_object_unref(dir);
-
-    if (p->dir_monitor) {
-        g_file_monitor_set_rate_limit(p->dir_monitor, 500); /* ms */
-        g_signal_connect(p->dir_monitor, "changed",
-                         G_CALLBACK(on_dir_changed), p);
-    }
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
  *  Sort comparators
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -786,8 +552,8 @@ static int dirs_first_func(gconstpointer a, gconstpointer b, gpointer data)
     (void)data;
     FileItem *fa = FILE_ITEM((gpointer)a);
     FileItem *fb = FILE_ITEM((gpointer)b);
-    if (strcmp(fa->name, "..") == 0) return -1;
-    if (strcmp(fb->name, "..") == 0) return  1;
+    if (fa->size_raw == -2) return -1;      /* ".." entry */
+    if (fb->size_raw == -2) return  1;
     if (fa->is_dir && !fb->is_dir)  return -1;
     if (!fa->is_dir && fb->is_dir)  return  1;
     return 0;
@@ -798,7 +564,7 @@ static int name_sort_func(gconstpointer a, gconstpointer b, gpointer data)
     (void)data;
     FileItem *fa = FILE_ITEM((gpointer)a);
     FileItem *fb = FILE_ITEM((gpointer)b);
-    return g_utf8_collate(fa->name, fb->name);
+    return strcmp(file_item_sort_key(fa), file_item_sort_key(fb));
 }
 
 static int size_sort_func(gconstpointer a, gconstpointer b, gpointer data)
@@ -844,6 +610,9 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     GtkWidget *label = gtk_widget_get_next_sibling(image);
     FileItem  *item  = gtk_list_item_get_item(li);
 
+    /* lets the context-menu gesture find the row under the pointer */
+    g_object_set_data(G_OBJECT(box), "fm-item", item);
+
     gtk_image_set_from_icon_name(GTK_IMAGE(image), item->icon_name);
     gtk_image_set_pixel_size(GTK_IMAGE(image),
         p->fm->icon_size > 0 ? p->fm->icon_size : 16);
@@ -858,6 +627,19 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
         g_free(markup);
     } else {
         gtk_label_set_text(GTK_LABEL(label), item->name);
+    }
+
+    /* content search: ":line  matching text" after the name */
+    if (item->snippet) {
+        gchar *head = fg ? g_markup_printf_escaped(
+                               "<span foreground='%s' weight='%d'>%s</span>",
+                               fg, wt, item->name)
+                         : g_markup_escape_text(item->name, -1);
+        gchar *tail = g_markup_printf_escaped("  <span alpha='55%%'>:%d  %s</span>",
+                                              item->line, item->snippet);
+        gchar *mk = g_strconcat(head, tail, NULL);
+        gtk_label_set_markup(GTK_LABEL(label), mk);
+        g_free(mk); g_free(head); g_free(tail);
     }
 }
 
@@ -920,9 +702,76 @@ static void date_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     }
 }
 
+/* Marking re-renders a bound row in place (FileItem "mark-changed")
+ * instead of touching the model, which would re-sort the whole panel. */
+typedef void (*BindFn)(GtkSignalListItemFactory *, GtkListItem *, gpointer);
+
+static void on_item_mark_changed(FileItem *item, GtkListItem *li)
+{
+    (void)item;
+    BindFn fn = g_object_get_data(G_OBJECT(li), "fm-bind");
+    fn(NULL, li, g_object_get_data(G_OBJECT(li), "fm-panel"));
+}
+
+static void watch_unbind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
+{
+    (void)f; (void)d;
+    /* disconnect from the item the handler was attached to – on a rebind
+     * without unbind gtk_list_item_get_item() already returns the new one */
+    gulong hid = GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(li), "fm-hid"));
+    GObject *item = g_object_get_data(G_OBJECT(li), "fm-hitem");
+    if (hid && item) g_signal_handler_disconnect(item, hid);
+    g_object_set_data(G_OBJECT(li), "fm-hid", NULL);
+    g_object_set_data(G_OBJECT(li), "fm-hitem", NULL);
+}
+
+static void watch_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
+{
+    g_object_set_data(G_OBJECT(li), "fm-bind", g_object_get_data(G_OBJECT(f), "fm-bind"));
+    g_object_set_data(G_OBJECT(li), "fm-panel", d);
+    watch_unbind(f, li, d);         /* rebind without unbind: drop the old one */
+    gpointer item = gtk_list_item_get_item(li);
+    gulong hid = g_signal_connect(item, "mark-changed",
+                                  G_CALLBACK(on_item_mark_changed), li);
+    g_object_set_data(G_OBJECT(li), "fm-hid", GSIZE_TO_POINTER(hid));
+    g_object_set_data(G_OBJECT(li), "fm-hitem", item);
+}
+
+static void factory_watch_marks(GtkListItemFactory *f, BindFn fn, Panel *p)
+{
+    g_object_set_data(G_OBJECT(f), "fm-bind", fn);
+    g_signal_connect(f, "bind",   G_CALLBACK(watch_bind),   p);
+    g_signal_connect(f, "unbind", G_CALLBACK(watch_unbind), p);
+}
+
 /* ─────────────────────────────────────────────────────────────────── *
  *  Callbacks – column view
  * ─────────────────────────────────────────────────────────────────── */
+
+#ifdef HAVE_LIBSSH2
+/* Temp dirs holding downloaded remote files; the external app may still
+ * read them, so they go when fm exits (see main). */
+static GSList *view_tmpdirs;
+#endif
+
+static void view_tmpdirs_cleanup(void)
+{
+#ifdef HAVE_LIBSSH2
+    for (GSList *l = view_tmpdirs; l; l = l->next) {
+        GDir *d = g_dir_open(l->data, 0, NULL);
+        const char *e;
+        while (d && (e = g_dir_read_name(d))) {
+            gchar *f = g_build_filename(l->data, e, NULL);
+            g_unlink(f);
+            g_free(f);
+        }
+        if (d) g_dir_close(d);
+        g_rmdir(l->data);
+    }
+    g_slist_free_full(view_tmpdirs, g_free);
+    view_tmpdirs = NULL;
+#endif
+}
 
 static void activate_item(Panel *p)
 {
@@ -946,8 +795,9 @@ static void activate_item(Panel *p)
             g_free(np);
         } else {
 #ifdef HAVE_LIBSSH2
+            /* No main-loop pump here: re-entering would let the panel
+             * change under us while the (blocking) download runs. */
             fm_status(p->fm, "Downloading '%s'...", name);
-            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
             gchar *remote_path = g_strdup_printf("%s/%s",
                 p->ssh_conn->remote_path, name);
             gsize len = 0;
@@ -967,10 +817,11 @@ static void activate_item(Panel *p)
                         }
                         fm_status(p->fm, "Opened: %s", name);
                     } else {
+                        g_unlink(tmp);
                         fm_status(p->fm, "Error writing to temp directory");
                     }
                     g_free(tmp);
-                    g_free(tmpdir);
+                    view_tmpdirs = g_slist_prepend(view_tmpdirs, tmpdir);
                 } else {
                     fm_status(p->fm, "Error creating temp directory");
                 }
@@ -987,37 +838,23 @@ static void activate_item(Panel *p)
     }
 
     if (p->search_mode) {
-        /* In search mode:
-         * - On a file (has dir_path): open in viewer (F3-style) — keeps search list
-         * - On a directory header (dir_path==NULL): navigate to that directory */
+        /* Results stay: a file opens in its default application,
+         * a directory header jumps there (Alt+Left comes back). */
         FileItem *si = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
                                              p->cursor_pos);
-        if (si && si->dir_path) {
-            /* File result — navigate to its directory and position cursor */
-            gchar *dir = g_strdup(si->dir_path);
-            gchar *fname = g_strdup(si->name);
-            g_object_unref(si);
-            p->search_mode = FALSE;
-            gtk_widget_set_visible(p->search_btn, FALSE);
-            panel_load(p, dir);
-            gtk_sort_list_model_set_sorter(p->sort_model, g_object_ref(p->default_sorter));
-            /* position cursor on the file */
-            guint n2 = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
-            for (guint i = 0; i < n2; i++) {
-                FileItem *fi2 = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
-                if (fi2 && strcmp(fi2->name, fname) == 0) {
-                    g_object_unref(fi2);
-                    p->cursor_pos = i;
-                    gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
-                                              NULL, GTK_LIST_SCROLL_SELECT, NULL);
-                    break;
-                }
-                if (fi2) g_object_unref(fi2);
+        gboolean is_file = si && si->dir_path;
+        if (si) g_object_unref(si);
+        if (is_file) {
+            gchar *full = panel_cursor_fullpath(p);
+            gchar *uri = full ? g_filename_to_uri(full, NULL, NULL) : NULL;
+            if (uri) {
+                gtk_show_uri(GTK_WINDOW(p->fm->window), uri, GDK_CURRENT_TIME);
+                fm_status(p->fm, "Opened: %s", full);
             }
-            g_free(dir);
-            g_free(fname);
+            g_free(uri);
+            g_free(full);
         } else {
-            if (si) g_object_unref(si);
+            search_goto_file(p);
         }
         g_free(name);
         return;
@@ -1069,14 +906,24 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
                                    guint keyval, guint keycode,
                                    GdkModifierType state, Panel *p)
 {
-    (void)ctrl; (void)keycode; (void)state;
+    (void)ctrl; (void)keycode;
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (n == 0) return FALSE;
+
+    /* search results: Ctrl+PgDn / Ctrl+Enter jump to the file's directory */
+    if (p->search_mode && (state & GDK_CONTROL_MASK) &&
+        (keyval == GDK_KEY_Page_Down || keyval == GDK_KEY_Return ||
+         keyval == GDK_KEY_KP_Enter)) {
+        sync_cursor_from_selection(p);
+        search_goto_file(p);
+        return TRUE;
+    }
 
     switch (keyval) {
 
     case GDK_KEY_Up:
         sync_cursor_from_selection(p);
+        if (state & GDK_SHIFT_MASK) sel_toggle_cursor(p, FALSE);
         if (p->cursor_pos > 0) p->cursor_pos--;
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
             p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
@@ -1084,6 +931,7 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
 
     case GDK_KEY_Down:
         sync_cursor_from_selection(p);
+        if (state & GDK_SHIFT_MASK) sel_toggle_cursor(p, FALSE);
         if (p->cursor_pos < n - 1) p->cursor_pos++;
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
             p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
@@ -1116,36 +964,10 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
         return TRUE;
 
     case GDK_KEY_space:
-    case GDK_KEY_Insert: {
+    case GDK_KEY_Insert:
         sync_cursor_from_selection(p);
-        FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model),
-                                                p->cursor_pos);
-        if (item && strcmp(item->name, "..") != 0) {
-            item->marked = !item->marked;
-            if (!p->marks)
-                p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-            if (item->marked)
-                g_hash_table_add(p->marks, g_strdup(item->name));
-            else
-                g_hash_table_remove(p->marks, item->name);
-            /* Force re-render: remove and re-insert in store */
-            guint sp;
-            if (g_list_store_find(p->store, item, &sp)) {
-                g_object_ref(item);
-                g_list_store_remove(p->store, sp);
-                g_list_store_insert(p->store, sp, item);
-                g_object_unref(item);
-            }
-        }
-        if (item) g_object_unref(item);
-        if (p->cursor_pos < n - 1) p->cursor_pos++;
-        p->inhibit_sel = TRUE;
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
-            p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
-        p->inhibit_sel = FALSE;
-        panel_update_status(p);
+        sel_toggle_cursor(p, TRUE);
         return TRUE;
-    }
 
     case GDK_KEY_BackSpace:
         sync_cursor_from_selection(p);
@@ -1158,26 +980,19 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
         activate_item(p);
         return TRUE;
 
+    /* TC-style group marking */
     case GDK_KEY_plus:
-    case GDK_KEY_KP_Add: {
-        /* Toggle mark all: if any are marked, unmark all; otherwise mark all */
-        if (!p->marks)
-            p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-        gboolean has_marks = g_hash_table_size(p->marks) > 0;
-        if (has_marks) {
-            g_hash_table_remove_all(p->marks);
-        } else {
-            guint count = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-            for (guint i = 0; i < count; i++) {
-                FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-                if (it && strcmp(it->name, "..") != 0)
-                    g_hash_table_add(p->marks, g_strdup(it->name));
-                if (it) g_object_unref(it);
-            }
-        }
-        panel_reload(p);
+    case GDK_KEY_KP_Add:
+        sel_group_dialog(p->fm, TRUE);
         return TRUE;
-    }
+    case GDK_KEY_minus:
+    case GDK_KEY_KP_Subtract:
+        sel_group_dialog(p->fm, FALSE);
+        return TRUE;
+    case GDK_KEY_asterisk:
+    case GDK_KEY_KP_Multiply:
+        sel_invert(p);
+        return TRUE;
 
     default:
         break;
@@ -1361,12 +1176,16 @@ static void on_search_exit_clicked(GtkButton *btn, Panel *p)
 {
     (void)btn;
     if (p->search_mode) {
-        p->search_mode = FALSE;
-        gtk_widget_set_visible(p->search_btn, FALSE);
         panel_load(p, p->search_prev_cwd);
-        gtk_sort_list_model_set_sorter(p->sort_model, g_object_ref(p->default_sorter));
         gtk_widget_grab_focus(p->column_view);
     }
+}
+
+static void on_results_clicked(GtkButton *btn, Panel *p)
+{
+    (void)btn;
+    set_active_panel(p->fm, p->idx);
+    search_restore(p);
 }
 
 static void on_terminal_clicked(GtkButton *btn, Panel *p)
@@ -1539,18 +1358,113 @@ static void panel_show_filter(Panel *p)
 
 static void menu_mask(GSimpleAction *a, GVariant *v, gpointer d);
 /* Per-panel hamburger menu callbacks */
-static void pmenu_ssh(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); ssh_connect_dialog(p->fm); }
-static void pmenu_pack(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); fo_pack(p->fm); }
-static void pmenu_extract(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); fo_extract(p->fm); }
-static void pmenu_mask(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); menu_mask(a, v, p->fm); }
-static void pmenu_search(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); search_run(p->fm); }
-static void pmenu_filter(GSimpleAction *a, GVariant *v, gpointer d)
-    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); panel_show_filter(p); }
+/* Every panel menu entry makes its panel active, then runs an FM action */
+#define PMENU(fn, call) \
+    static void fn(GSimpleAction *a, GVariant *v, gpointer d) \
+    { (void)a; (void)v; Panel *p = d; set_active_panel(p->fm, p->idx); call; }
+
+PMENU(pmenu_ssh,      ssh_connect_dialog(p->fm))
+PMENU(pmenu_pack,     fo_pack(p->fm))
+PMENU(pmenu_extract,  fo_extract(p->fm))
+PMENU(pmenu_mask,     menu_mask(a, v, p->fm))
+PMENU(pmenu_search,   search_run(p->fm))
+PMENU(pmenu_filter,   panel_show_filter(p))
+PMENU(pmenu_sresults, search_restore(p))
+PMENU(pmenu_shistory, search_history_dialog(p->fm))
+PMENU(pmenu_copy,     clip_copy(p->fm, FALSE))
+PMENU(pmenu_cut,      clip_copy(p->fm, TRUE))
+PMENU(pmenu_paste,    clip_paste(p->fm))
+PMENU(pmenu_copypath, clip_copy_paths(p->fm))
+PMENU(pmenu_dup,      fo_copy_here(p->fm))
+PMENU(pmenu_rename,   fo_rename(p->fm))
+PMENU(pmenu_delete,   fo_delete(p->fm))
+PMENU(pmenu_mkdir,    fo_mkdir(p->fm))
+PMENU(pmenu_newfile,  fo_newfile(p->fm))
+PMENU(pmenu_props,    fo_properties(p->fm))
+PMENU(pmenu_selall,   sel_mark_all(p, TRUE))
+PMENU(pmenu_selnone,  sel_mark_all(p, FALSE))
+PMENU(pmenu_selgroup, sel_group_dialog(p->fm, TRUE))
+PMENU(pmenu_unselgrp, sel_group_dialog(p->fm, FALSE))
+PMENU(pmenu_invert,   sel_invert(p))
+#undef PMENU
+
+typedef struct { const char *label, *action; } MenuEntry;
+
+/* Section of `menu` built from entries, actions prefixed with the group */
+static void menu_section(GMenu *menu, const char *grp, const MenuEntry *e, gsize n)
+{
+    GMenu *sec = g_menu_new();
+    for (gsize i = 0; i < n; i++) {
+        gchar *act = g_strdup_printf("%s.%s", grp, e[i].action);
+        g_menu_append(sec, e[i].label, act);
+        g_free(act);
+    }
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(sec));
+    g_object_unref(sec);
+}
+
+static GMenu *build_file_menu(const char *grp)
+{
+    static const MenuEntry edit[] = {
+        { "Copy    Ctrl+C",            "copy"     },
+        { "Cut    Ctrl+X",             "cut"      },
+        { "Paste    Ctrl+V",           "paste"    },
+        { "Copy path    Ctrl+Shift+C", "copypath" },
+    };
+    static const MenuEntry file[] = {
+        { "Duplicate\u2026    Shift+F5",   "dup"      },
+        { "Rename\u2026    Shift+F6",      "rename"   },
+        { "Delete\u2026    Del",           "delete"   },
+        { "New directory\u2026    F7",     "mkdir"    },
+        { "New file\u2026    Shift+F4",    "newfile"  },
+        { "Properties\u2026    Alt+Enter", "props"    },
+    };
+    static const MenuEntry sel[] = {
+        { "Select all    Ctrl+A",          "selall"   },
+        { "Unselect all    Ctrl+Shift+A",  "selnone"  },
+        { "Select group\u2026    +",       "selgroup" },
+        { "Unselect group\u2026    -",     "unselgrp" },
+        { "Invert selection    *",         "invert"   },
+    };
+    GMenu *m = g_menu_new();
+    menu_section(m, grp, edit, G_N_ELEMENTS(edit));
+    menu_section(m, grp, file, G_N_ELEMENTS(file));
+    menu_section(m, grp, sel,  G_N_ELEMENTS(sel));
+    return m;
+}
+
+/* Right click: move cursor to the clicked row, then show the file menu */
+static void on_cv_right_click(GtkGestureClick *g, int n_press, double x, double y, Panel *p)
+{
+    (void)n_press;
+    set_active_panel(p->fm, p->idx);
+
+    GtkWidget *w = gtk_widget_pick(p->column_view, x, y, GTK_PICK_DEFAULT);
+    FileItem *hit = NULL;
+    for (; w && w != p->column_view; w = gtk_widget_get_parent(w))
+        if ((hit = g_object_get_data(G_OBJECT(w), "fm-item"))) break;
+    if (hit) {
+        guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+        for (guint i = 0; i < n; i++) {
+            FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+            g_object_unref(it);
+            if (it == hit) {
+                p->cursor_pos = i;
+                p->inhibit_sel = TRUE;
+                gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
+                                          NULL, GTK_LIST_SCROLL_SELECT, NULL);
+                p->inhibit_sel = FALSE;
+                break;
+            }
+        }
+    }
+
+    GtkWidget *pop = g_object_get_data(G_OBJECT(p->column_view), "fm-ctx-menu");
+    GdkRectangle r = { (int)x, (int)y, 1, 1 };
+    gtk_popover_set_pointing_to(GTK_POPOVER(pop), &r);
+    gtk_popover_popup(GTK_POPOVER(pop));
+    gtk_gesture_set_state(GTK_GESTURE(g), GTK_EVENT_SEQUENCE_CLAIMED);
+}
 
 /*─────────────────────────────────────────────────────────────────── *
  *  Panel: widget setup
@@ -1588,74 +1502,92 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_widget_set_tooltip_text(p->search_btn, "Exit search results");
     gtk_widget_set_visible(p->search_btn, FALSE);
 
+    /* Back-to-results button – shown after leaving search results */
+    p->results_btn = gtk_button_new_from_icon_name("edit-find-symbolic");
+    gtk_widget_set_tooltip_text(p->results_btn, "Back to search results (Alt+\u2190)");
+    gtk_widget_set_visible(p->results_btn, FALSE);
+
     /* Terminal button – always visible */
     p->terminal_btn = gtk_button_new_from_icon_name("utilities-terminal-symbolic");
     gtk_widget_set_tooltip_text(p->terminal_btn, "Open terminal");
 
-    /* ── Per-panel hamburger menu ── */
+    /* ── Per-panel actions: hamburger menu + right-click menu ── */
+    gchar *grp = g_strdup_printf("p%d", idx);
+    GSimpleActionGroup *ag = g_simple_action_group_new();
     {
-        gchar *grp = g_strdup_printf("p%d", idx);
-
-        GSimpleActionGroup *ag = g_simple_action_group_new();
         struct { const char *name; GCallback cb; } acts[] = {
-            { "ssh",     G_CALLBACK(pmenu_ssh)     },
-            { "pack",    G_CALLBACK(pmenu_pack)    },
-            { "extract", G_CALLBACK(pmenu_extract) },
-            { "mask",    G_CALLBACK(pmenu_mask)    },
-            { "search",  G_CALLBACK(pmenu_search)  },
-            { "filter",  G_CALLBACK(pmenu_filter)  },
+            { "ssh",      G_CALLBACK(pmenu_ssh)      },
+            { "pack",     G_CALLBACK(pmenu_pack)     },
+            { "extract",  G_CALLBACK(pmenu_extract)  },
+            { "mask",     G_CALLBACK(pmenu_mask)     },
+            { "search",   G_CALLBACK(pmenu_search)   },
+            { "filter",   G_CALLBACK(pmenu_filter)   },
+            { "sresults", G_CALLBACK(pmenu_sresults) },
+            { "shistory", G_CALLBACK(pmenu_shistory) },
+            { "copy",     G_CALLBACK(pmenu_copy)     },
+            { "cut",      G_CALLBACK(pmenu_cut)      },
+            { "paste",    G_CALLBACK(pmenu_paste)    },
+            { "copypath", G_CALLBACK(pmenu_copypath) },
+            { "dup",      G_CALLBACK(pmenu_dup)      },
+            { "rename",   G_CALLBACK(pmenu_rename)   },
+            { "delete",   G_CALLBACK(pmenu_delete)   },
+            { "mkdir",    G_CALLBACK(pmenu_mkdir)    },
+            { "newfile",  G_CALLBACK(pmenu_newfile)  },
+            { "props",    G_CALLBACK(pmenu_props)    },
+            { "selall",   G_CALLBACK(pmenu_selall)   },
+            { "selnone",  G_CALLBACK(pmenu_selnone)  },
+            { "selgroup", G_CALLBACK(pmenu_selgroup) },
+            { "unselgrp", G_CALLBACK(pmenu_unselgrp) },
+            { "invert",   G_CALLBACK(pmenu_invert)   },
         };
         for (gsize i = 0; i < G_N_ELEMENTS(acts); i++) {
             GSimpleAction *sa = g_simple_action_new(acts[i].name, NULL);
             g_signal_connect(sa, "activate", acts[i].cb, p);
             g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(sa));
+            g_object_unref(sa);
         }
 
+        static const MenuEntry conn[] = {
+            { "SSH / SFTP\u2026", "ssh" },
+        };
+        static const MenuEntry arc[] = {
+            { "Create archive\u2026    Alt+P",  "pack"    },
+            { "Extract archive\u2026    Alt+E", "extract" },
+        };
+        static const MenuEntry find[] = {
+            { "File mask\u2026",             "mask"   },
+            { "Search files\u2026    F2",     "search" },
+            { "Filter files\u2026    Ctrl+S", "filter" },
+            { "Back to search results    Alt+\u2190", "sresults" },
+            { "Search history\u2026    Shift+F2",  "shistory" },
+        };
         GMenu *pmenu = g_menu_new();
-        GMenu *s1 = g_menu_new();
-        gchar *a_ssh = g_strdup_printf("%s.ssh", grp);
-        g_menu_append(s1, "SSH / SFTP\u2026", a_ssh);
-        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s1));
-
-        GMenu *s2 = g_menu_new();
-        gchar *a_pack    = g_strdup_printf("%s.pack", grp);
-        gchar *a_extract = g_strdup_printf("%s.extract", grp);
-        g_menu_append(s2, "Create archive\u2026", a_pack);
-        g_menu_append(s2, "Extract archive\u2026", a_extract);
-        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s2));
-
-        GMenu *s3 = g_menu_new();
-        gchar *a_mask   = g_strdup_printf("%s.mask", grp);
-        gchar *a_search = g_strdup_printf("%s.search", grp);
-        gchar *a_filter = g_strdup_printf("%s.filter", grp);
-        g_menu_append(s3, "File mask\u2026", a_mask);
-        g_menu_append(s3, "Search files\u2026    F2", a_search);
-        g_menu_append(s3, "Filter files\u2026    Ctrl+S", a_filter);
-        g_menu_append_section(pmenu, NULL, G_MENU_MODEL(s3));
+        menu_section(pmenu, grp, conn, G_N_ELEMENTS(conn));
+        GMenu *files = build_file_menu(grp);
+        g_menu_append_submenu(pmenu, "Files", G_MENU_MODEL(files));
+        g_object_unref(files);
+        menu_section(pmenu, grp, arc,  G_N_ELEMENTS(arc));
+        menu_section(pmenu, grp, find, G_N_ELEMENTS(find));
 
         GtkWidget *hbtn = gtk_menu_button_new();
         gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(hbtn), "open-menu-symbolic");
         gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(hbtn), G_MENU_MODEL(pmenu));
         gtk_widget_set_tooltip_text(hbtn, "Panel menu");
         gtk_widget_set_focusable(hbtn, FALSE);
-
-        /* Insert action group on the menu button itself */
-        gtk_widget_insert_action_group(hbtn, grp, G_ACTION_GROUP(ag));
+        g_object_unref(pmenu);
 
         gtk_box_append(GTK_BOX(path_box), p->path_entry);
         gtk_box_append(GTK_BOX(path_box), hbtn);
         gtk_box_append(GTK_BOX(path_box), p->terminal_btn);
         gtk_box_append(GTK_BOX(path_box), p->disconnect_btn);
         gtk_box_append(GTK_BOX(path_box), p->search_btn);
+        gtk_box_append(GTK_BOX(path_box), p->results_btn);
         gtk_box_append(GTK_BOX(path_box), up_btn);
         gtk_box_append(GTK_BOX(path_box), home_btn);
-
-        g_object_unref(ag);
-        g_object_unref(s1); g_object_unref(s2); g_object_unref(s3);
-        g_object_unref(pmenu);
-        g_free(grp); g_free(a_ssh); g_free(a_pack); g_free(a_extract);
-        g_free(a_mask); g_free(a_search); g_free(a_filter);
     }
+    /* group on the frame: reachable from the hamburger and the popover */
+    gtk_widget_insert_action_group(p->frame, grp, G_ACTION_GROUP(ag));
+    g_object_unref(ag);
 
     /* ── GListStore ── */
     p->store = g_list_store_new(FILE_ITEM_TYPE);
@@ -1670,6 +1602,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     GtkListItemFactory *name_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(name_factory, "setup", G_CALLBACK(name_setup), NULL);
     g_signal_connect(name_factory, "bind",  G_CALLBACK(name_bind),  p);
+    factory_watch_marks(name_factory, name_bind, p);
     GtkColumnViewColumn *col_name = gtk_column_view_column_new("Name", name_factory);
     gtk_column_view_column_set_resizable(col_name, TRUE);
     gtk_column_view_column_set_expand(col_name, TRUE);
@@ -1685,6 +1618,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     GtkListItemFactory *size_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(size_factory, "setup", G_CALLBACK(size_setup), NULL);
     g_signal_connect(size_factory, "bind",  G_CALLBACK(size_bind),  p);
+    factory_watch_marks(size_factory, size_bind, p);
     GtkColumnViewColumn *col_size = gtk_column_view_column_new("Size", size_factory);
     gtk_column_view_column_set_resizable(col_size, TRUE);
     gtk_column_view_column_set_fixed_width(col_size,
@@ -1699,6 +1633,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     GtkListItemFactory *date_factory = gtk_signal_list_item_factory_new();
     g_signal_connect(date_factory, "setup", G_CALLBACK(date_setup), NULL);
     g_signal_connect(date_factory, "bind",  G_CALLBACK(date_bind),  p);
+    factory_watch_marks(date_factory, date_bind, p);
     GtkColumnViewColumn *col_date = gtk_column_view_column_new("Modified", date_factory);
     gtk_column_view_column_set_resizable(col_date, TRUE);
     gtk_column_view_column_set_fixed_width(col_date,
@@ -1788,7 +1723,25 @@ void panel_setup(Panel *p, FM *fm, int idx)
     g_signal_connect(home_btn,          "clicked", G_CALLBACK(on_home_clicked), p);
     g_signal_connect(p->disconnect_btn, "clicked", G_CALLBACK(on_disconnect_clicked), p);
     g_signal_connect(p->search_btn,     "clicked", G_CALLBACK(on_search_exit_clicked), p);
+    g_signal_connect(p->results_btn,    "clicked", G_CALLBACK(on_results_clicked), p);
     g_signal_connect(p->terminal_btn, "clicked", G_CALLBACK(on_terminal_clicked), p);
+
+    /* Right-click context menu */
+    {
+        GMenu *cm = build_file_menu(grp);
+        GtkWidget *pop = gtk_popover_menu_new_from_model(G_MENU_MODEL(cm));
+        g_object_unref(cm);
+        gtk_popover_set_has_arrow(GTK_POPOVER(pop), FALSE);
+        gtk_widget_set_halign(pop, GTK_ALIGN_START);
+        gtk_widget_set_parent(pop, p->column_view);
+        g_object_set_data(G_OBJECT(p->column_view), "fm-ctx-menu", pop);
+
+        GtkGesture *rc = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(rc), GDK_BUTTON_SECONDARY);
+        g_signal_connect(rc, "pressed", G_CALLBACK(on_cv_right_click), p);
+        gtk_widget_add_controller(p->column_view, GTK_EVENT_CONTROLLER(rc));
+    }
+    g_free(grp);
 
     /* Key controller on column view (CAPTURE to intercept before default) */
     GtkEventController *key_ctrl = gtk_event_controller_key_new();
@@ -1818,6 +1771,7 @@ static void btn_copy(GtkButton *b, gpointer d)    { (void)b; fo_copy(d);   }
 static void btn_move(GtkButton *b, gpointer d)    { (void)b; fo_move(d);   }
 static void btn_mkdir(GtkButton *b, gpointer d)   { (void)b; fo_mkdir(d);  }
 static void btn_delete(GtkButton *b, gpointer d)  { (void)b; fo_delete(d); }
+static void btn_help(GtkButton *b, gpointer d)    { (void)b; help_show(d); }
 static void btn_find(GtkButton *b, gpointer d)    { (void)b; search_run(d); }
 static void btn_view(GtkButton *b, gpointer d)    { (void)b; viewer_show(d); }
 static void btn_editor(GtkButton *b, gpointer d)  { (void)b; editor_show(d); }
@@ -1830,6 +1784,7 @@ static GtkWidget *create_toolbar(FM *fm)
         const char *tooltip;
         void (*cb)(GtkButton *, gpointer);
     } btns[] = {
+        { "F1 Help",    "Keyboard shortcuts",        btn_help    },
         { "F2 Search",  "Search files",              btn_find    },
         { "F3 View",    "View file contents",        btn_view    },
         { "F4 Editor",  "Open file in editor",       btn_editor  },
@@ -1881,19 +1836,67 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(fm->window));
     if (focus && GTK_IS_ENTRY(focus)) return FALSE;
 
+    gboolean shift = (state & GDK_SHIFT_MASK) != 0;
+    gboolean ctl   = (state & GDK_CONTROL_MASK) != 0;
+    gboolean alt   = (state & GDK_ALT_MASK) != 0;
+
     switch (keyval) {
-    case GDK_KEY_F5:  fo_copy(fm);            return TRUE;
+    case GDK_KEY_F5:
+        if (shift) fo_copy_here(fm); else fo_copy(fm);
+        return TRUE;
     case GDK_KEY_F6:
-        if (state & GDK_SHIFT_MASK) fo_rename(fm);
-        else                        fo_move(fm);
+        if (shift) fo_rename(fm); else fo_move(fm);
         return TRUE;
     case GDK_KEY_F7:  fo_mkdir(fm);           return TRUE;
-    case GDK_KEY_F8:  fo_delete(fm);          return TRUE;
+    case GDK_KEY_F8:
+    case GDK_KEY_Delete:
+    case GDK_KEY_KP_Delete:
+        if (shift) fo_delete_permanent(fm); else fo_delete(fm);
+        return TRUE;
     case GDK_KEY_F9:  fo_rename(fm);          return TRUE;
-    case GDK_KEY_F2:  search_run(fm);         return TRUE;
+    case GDK_KEY_F2:
+        if (shift) search_history_dialog(fm); else search_run(fm);
+        return TRUE;
+
+    /* Alt+Left – back to the last search results */
+    case GDK_KEY_Left:
+        if (alt) {
+            if (!search_restore(active_panel(fm)))
+                fm_status(fm, "No search results to return to (Shift+F2 = history)");
+            return TRUE;
+        }
+        break;
     case GDK_KEY_F3:  viewer_show(fm);        return TRUE;
-    case GDK_KEY_F4:  editor_show(fm);        return TRUE;
+    case GDK_KEY_F4:
+        if (shift) fo_newfile(fm); else editor_show(fm);
+        return TRUE;
+    case GDK_KEY_F1:  help_show(fm);         return TRUE;
     case GDK_KEY_F10: g_application_quit(G_APPLICATION(fm->app)); return TRUE;
+
+    /* Alt+Enter – properties */
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:
+        if (alt) { fo_properties(fm); return TRUE; }
+        break;
+
+    /* Clipboard / marking */
+    case GDK_KEY_c:
+    case GDK_KEY_C:
+        if (ctl && shift) { clip_copy_paths(fm);  return TRUE; }
+        if (ctl)          { clip_copy(fm, FALSE); return TRUE; }
+        break;
+    case GDK_KEY_x:
+    case GDK_KEY_X:
+        if (ctl) { clip_copy(fm, TRUE); return TRUE; }
+        break;
+    case GDK_KEY_v:
+    case GDK_KEY_V:
+        if (ctl) { clip_paste(fm); return TRUE; }
+        break;
+    case GDK_KEY_a:
+    case GDK_KEY_A:
+        if (ctl) { sel_mark_all(active_panel(fm), !shift); return TRUE; }
+        break;
 
     /* Alt+E – extract archive */
     case GDK_KEY_e:
@@ -1943,8 +1946,37 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     /* Ctrl+= – synchronize panels */
     case GDK_KEY_equal:
         if (state & GDK_CONTROL_MASK) {
-            Panel *o = other_panel(fm);
-            panel_load(o, active_panel(fm)->cwd);
+            Panel *a = active_panel(fm), *o = other_panel(fm);
+            if (a->ssh_conn || o->ssh_conn) {
+                /* remote → remote only within the same server */
+                SshConn *ac = a->ssh_conn, *oc = o->ssh_conn;
+                if (ac && oc && ac->port == oc->port &&
+                    g_strcmp0(ac->host, oc->host) == 0 &&
+                    g_strcmp0(ac->user, oc->user) == 0) {
+                    panel_load(o, ac->remote_path);
+                    fm_status(fm, "Panels synchronized");
+                } else {
+                    fm_status(fm, "Cannot synchronize a local and an SFTP panel "
+                                  "(or two different servers)");
+                }
+                return TRUE;
+            }
+            /* search results: the directory of the found file under the
+             * cursor, otherwise the directory the search started from */
+            const char *dir = a->cwd;
+            FileItem *it = NULL;
+            if (a->search_mode) {
+                dir = a->search_prev_cwd;
+                guint n = g_list_model_get_n_items(G_LIST_MODEL(a->filter_model));
+                if (a->cursor_pos < n)
+                    it = g_list_model_get_item(G_LIST_MODEL(a->filter_model), a->cursor_pos);
+                if (it && it->dir_path) dir = it->dir_path;
+                else if (it && it->size_raw == -1) dir = it->name;  /* group header */
+            }
+            gchar *d = g_strdup(dir);
+            if (it) g_object_unref(it);
+            panel_load(o, d);
+            g_free(d);
             fm_status(fm, "Panels synchronized");
             return TRUE;
         }
@@ -2192,8 +2224,11 @@ int main(int argc, char *argv[])
     GtkApplication *app = gtk_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS);
 #endif
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), &g_fm);
+    /* lets worker-thread prompts (SSH host key) find the main window */
+    g_object_set_data(G_OBJECT(app), "fm", &g_fm);
 
     int status = g_application_run(G_APPLICATION(app), argc, argv);
+    view_tmpdirs_cleanup();
     g_object_unref(app);
     return status;
 }

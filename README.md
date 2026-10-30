@@ -6,13 +6,18 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 - **Two panels** — navigation like in Total Commander
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
-- **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI)
-- **File marking** — Insert/Space marks files (colored), `+` marks all; marks used for copy/move/delete
-- **Copy, move, delete** — F5/F6/F8 with progress dialog (animated phases, byte-level tracking, speed display, cancel button); full recursive directory support over SFTP; remote-to-remote (SFTP→SFTP) supported
+- **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
+- **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
+- **Copy, move, delete** — Total Commander style: F5 → path of the other panel is pre-selected, Enter starts copying (type `dir/newname` to rename a single item); F8 → Yes/No confirmation; operations run in a background thread with a From/To progress window (current file + total bar, speed, time left, Esc = cancel); overwrite prompt (Overwrite / Overwrite all / Skip / Skip all / Cancel); permissions, timestamps and symlinks preserved; directories merged; copying a directory into itself is refused; full recursive SFTP support incl. remote-to-remote
+- **Trash** — F8/Del moves local files to the trash (freedesktop), Shift+Del / Shift+F8 deletes permanently
+- **Clipboard** — Ctrl+C / Ctrl+X / Ctrl+V interoperable with other file managers (Nautilus, Dolphin, …); paste into an SFTP panel uploads
+- **Context menu** — right click on a file: copy, cut, paste, duplicate, rename, delete, new folder/file, properties, selection
+- **Properties** — Alt+Enter: size (directories computed in background), owner, dates, symlink target, editable permissions (also over SFTP)
+- **New file / duplicate** — Shift+F4 creates a file and opens the editor; Shift+F5 copies in place under a new name; F7 accepts nested paths (`a/b/c`)
 - **Archive support** — extract and create archives (tar.gz, tar.bz2, tar.xz, tar.zst, zip, 7z, rar)
 - **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
-- **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel
+- **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel. Results are kept: Enter opens a file in its default app, Ctrl+PgDn / Ctrl+Enter jumps to the file's directory, Alt+← (or the 🔍 button) returns to the results, Shift+F2 lists the last 10 searches. Content search shows `:line  matching text` next to each file; F3 opens the viewer on that match with the text highlighted (F3 / Shift+F3 = next / previous)
 - **File viewer** — F3, displays text (max 50 MB) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS)
@@ -34,15 +39,30 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Escape | Cancel path editing / close filter |
 | Backspace | Go up one level |
 | Space / Insert | Mark file + move cursor |
-| + | Mark/unmark all |
+| Shift+Up / Shift+Down | Mark while moving |
+| + / Num+ | Select group (pattern) |
+| - / Num- | Unselect group |
+| * / Num* | Invert selection |
+| Ctrl+A / Ctrl+Shift+A | Mark all / unmark all |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste (system clipboard) |
+| Ctrl+Shift+C | Copy full path(s) as text |
+| Alt+Enter | Properties / permissions |
+| Right click | Context menu |
+| F1 | Keyboard shortcut help |
 | F2 | Search files |
+| Shift+F2 | Search history (last 10 searches) |
+| Ctrl+PgDn / Ctrl+Enter | In results: go to the file's directory |
+| Alt+← | Back to the last search results |
 | F3 | View file |
 | F4 | Text editor |
+| Shift+F4 | New file (opens editor) |
 | F5 | Copy |
+| Shift+F5 | Duplicate in the same directory |
 | F6 | Move |
 | Shift+F6 | Rename |
-| F7 | New directory |
-| F8 | Delete |
+| F7 | New directory (nested `a/b/c` allowed) |
+| F8 / Del | Delete (local: move to trash) |
+| Shift+F8 / Shift+Del | Delete permanently |
 | F10 | Quit |
 | Ctrl+S | Incremental search (MC-style jump to file) |
 | Ctrl+H | Hidden files |
@@ -97,15 +117,32 @@ sudo make install     # install to /usr/local/bin/fm + icons + .desktop
 make user-install     # install for current user (~/.local/)
 make uninstall        # remove system install
 make clean            # clean build artifacts
+make test             # unit tests of the file-operation core (no display needed)
+make test-asan        # the same under AddressSanitizer + UBSan
+make debug            # debug build with sanitizers (build-debug/fm)
 ```
+
+CI (`.github/workflows/ci.yml`) builds with `-Werror`, runs the tests (also under sanitizers) and checks a minimal build without optional libraries.
 
 ## Project structure
 
 ```
 include/fm.h        — shared types and declarations
-src/main.c          — window, panels, keys, CSS, filter, hamburger menu
+include/util.h      — GLib-only helpers (formatting, path safety, archive types, clipboard parsing)
+include/fsops.h     — file operation engine API (thread-safe, GTK-free)
+src/main.c          — window, panels, keys, CSS, filter, panel + context menus
 src/fileitem.c      — FileItem GObject (model for file list)
-src/fileops.c       — file operations (copy, move, delete, mkdir, rename, extract, pack)
+src/fileops.c       — copy/move/delete/mkdir/new file/rename/properties (dialogs + jobs)
+src/fsops.c         — engine: local + SFTP copy/move/delete, conflicts, progress, cancel
+src/util.c          — pure helpers used by the engine and the UI
+src/job.c           — worker thread + modal progress dialog + overwrite prompt
+src/dialogs.c       — shared dialogs (destination, text entry, multi-button choice)
+src/archive.c       — extract / pack via tar, zip, 7z, unrar
+src/selection.c     — marking: group select, invert, select all
+src/clipboard.c     — system clipboard copy/cut/paste
+src/monitor.c       — auto-refresh (inotify / SFTP polling)
+src/icons.c         — content-type icons
+tests/test_core.c   — unit tests (GLib test framework)
 src/search.c        — file search
 src/ssh.c           — SSH/SFTP connection and browsing
 src/settings.c      — settings (font, cursor, editor, viewer, terminal, icon size, theme)
@@ -145,10 +182,14 @@ The dialog (panel hamburger menu → SSH/SFTP) allows:
 - **New** — clears the form for entering a new connection
 - **Save** — saves/updates the connection (password is not saved)
 - **Remove** — deletes the selected connection
-- **Key** — path to private key (optional, defaults to `~/.ssh/id_rsa`), with file browser
+- **Key** — path to private key (optional; default tries ssh-agent, then `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`), with file browser. The password field is also used as key passphrase
 - **Connect** — connects with the current details and password (async, non-blocking UI)
 
 ## Security
+
+- SSH host keys are checked against `~/.ssh/known_hosts`; an unknown host shows its SHA256 fingerprint and is added only after confirmation; a **changed** key aborts the connection (possible MITM)
+- Copy never writes through an existing destination file or symlink (`O_EXCL`), never truncates the source when source = destination, and removes partial files on error/cancel
+- libssh2 sessions are guarded by a per-connection lock (file jobs run in a worker thread)
 
 - Path traversal guard on all file operations (copy, move, delete, rename, mkdir)
 - Archive extract/pack: `--` separator prevents flag injection from malicious filenames

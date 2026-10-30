@@ -96,8 +96,10 @@ static void viewer_search_goto_match(ViewerCtx *ctx, int index)
         count++;
         if (count == index) {
             gtk_text_buffer_select_range(ctx->buffer, &match_start, &match_end);
-            gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(ctx->text_view),
-                                          &match_start, 0.2, FALSE, 0, 0);
+            /* mark-based scroll also works before the view is laid out */
+            gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(ctx->text_view),
+                                         gtk_text_buffer_get_insert(ctx->buffer),
+                                         0.2, FALSE, 0, 0);
             ctx->current_match = index;
             if (ctx->match_lbl) {
                 gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
@@ -564,6 +566,26 @@ void viewer_show(FM *fm)
     g_signal_connect_swapped(ctx.window, "close-request", G_CALLBACK(g_main_loop_quit), ctx.loop);
 
     gtk_window_present(GTK_WINDOW(ctx.window));
+
+    /* Opened from content-search results: highlight the searched text and
+     * start at the match on the reported line; F3 / Shift+F3 walk matches. */
+    const char *needle = search_needle(p);
+    if (needle && needle[0]) {
+        int want_line = 0;
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->filter_model), p->cursor_pos);
+        if (it) { want_line = it->line; g_object_unref(it); }
+
+        gtk_widget_set_visible(ctx.search_bar, TRUE);
+        gtk_editable_set_text(GTK_EDITABLE(ctx.search_entry), needle);  /* → match 1 */
+        for (guint i = 0; want_line > 0 && i < ctx.match_lines->len; i++) {
+            if (g_array_index(ctx.match_lines, int, i) >= want_line - 1) {
+                viewer_search_goto_match(&ctx, (int)i + 1);
+                break;
+            }
+        }
+        gtk_widget_grab_focus(ctx.text_view);
+    }
+
     g_main_loop_run(ctx.loop);
     g_main_loop_unref(ctx.loop);
     g_array_free(ctx.match_lines, TRUE);

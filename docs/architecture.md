@@ -9,9 +9,18 @@ Single-window GTK4 application (with optional libadwaita for runtime theme switc
 | File | Responsibility |
 |------|---------------|
 | `include/fm.h` | Shared types, all cross-file declarations, `DlgCtx` helper |
-| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, sort comparator, key handlers, CSS, content-type icon resolving (`icon_for_entry`), incremental search (Ctrl+S), per-panel hamburger menus, path entry navigation (`do_path_activate`), directory monitoring (`panel_monitor_start/stop`, `on_dir_changed`, `sftp_poll_tick`) |
+| `include/util.h`, `src/util.c` | GLib-only helpers: `fmt_size/fmt_date`, `fs_name_is_safe`, `fs_relpath_is_safe`, `fs_path_is_inside`, `fs_remote_join`, `fs_unique_name`, `arc_detect/arc_extension/arc_with_extension`, `fs_parse_uri_list`, `fs_match_patterns` |
+| `include/fsops.h`, `src/fsops.c` | File operation engine (no GTK, worker-thread safe): `fs_copy/move/delete/trash/calc_size` and SFTP `fs_sftp_upload/download/delete/calc_size/exists`; conflicts, progress and cancel via `FsCtx` callbacks |
+| `include/job.h`, `src/job.c` | `Job`: worker thread + modal progress dialog (100 ms UI timer), overwrite prompt marshalled to the main thread; `fm_call_on_main()` |
+| `include/dialogs.h`, `src/dialogs.c` | `ask_destination`, `ask_text`, `ask_choice`, `dlg_file_list` |
+| `src/main.c` | `FM` struct, application entry, `panel_setup/load/reload/go_up`, `panel_selection(_paths)`, `panel_select_name`, sort comparators, key handlers, CSS, incremental search (Ctrl+S), panel + right-click menus, path entry navigation |
+| `src/icons.c` | Content-type icon resolving (`icon_for_entry`) |
+| `src/monitor.c` | `file_item_from_stat`, directory monitoring (`panel_monitor_start/stop`, `on_dir_changed` incl. renames/moves, `sftp_poll_tick` with try-lock) |
+| `src/selection.c` | Marking: `sel_toggle_cursor`, `sel_mark_all`, `sel_invert`, `sel_group_dialog`, `sel_refresh` |
+| `src/clipboard.c` | `clip_copy` / `clip_paste` / `clip_copy_paths` (x-special/gnome-copied-files, text/uri-list) |
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
-| `src/fileops.c` | copy/move/delete/mkdir/rename/extract/pack + progress dialog with cancel + path traversal guard; archive helpers (`arc_detect`, `run_archive_cmd`); recursive SFTP helpers (`sftp_upload_dir_r`, `sftp_download_dir_r`, `sftp_delete_r`, `sftp_calc_size_r`) |
+| `src/fileops.c` | Copy/move (`fo_transfer`), duplicate, delete/trash, mkdir, new file, rename, properties — dialogs on the main thread, work in `Job`s |
+| `src/archive.c` | Extract / pack: child process watched by a `Job` worker, stderr captured |
 | `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display; same-filesystem traversal (`-xdev`), symlink loop protection, visited-inode tracking, cancel support |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, theme (dark/light), `apply_*_css`, `apply_theme`; theme-aware color helpers (`fm_visible_color`, `fm_link_color`, `fm_exec_color`, `fm_scheme_for_theme`); SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
@@ -29,6 +38,9 @@ make clean        → rm -rf build/
 make install      → /usr/local/bin/fm + icons + .desktop
 make user-install → ~/.local/bin/fm + ~/.local/share/icons + ~/.local/share/applications
 make uninstall    → removes system install
+make test         → build/test_core (GLib tests of util.c + fsops.c)
+make debug        → build-debug/fm with -fsanitize=address,undefined
+make test-asan    → tests under sanitizers
 ```
 
 ## Data flow
@@ -70,10 +82,18 @@ Each `Panel` has:
 
 **Marking:** Files/directories are marked via Insert/Space (toggle) or `+` (all). Marks are stored in `Panel.marks` (`GHashTable<gchar*,NULL>`) — independent of GTK selection model. Marks survive panel reload but are cleared on directory change or after file operations (copy/move/delete). `panel_selection()` returns marked items if any exist, otherwise falls back to cursor row (TC style). Marked items are rendered with configurable `mark_color` (default red `#D32F2F`), bold.
 
+### Performance notes
+
+- `name_sort_func` compares `file_item_sort_key()` (lazy collation key) with `strcmp`; `..` is recognised by `size_raw == -2`.
+- Marks: `file_item_set_marked()` emits `mark-changed`; every column factory connects it in `watch_bind` / disconnects in `watch_unbind` and re-runs its bind function. Never call `items_changed` for a mark change — it re-sorts the panel.
+- `panel_load` reads the directory with `dir_read()` (worker thread + `GCond` wait of `DIR_WAIT_MS`, then a modal Cancel window). FileItems are still built on the main thread. The monitor is stopped while waiting.
+- SFTP poll (`sftp_poll_tick`) starts `sftp_poll_thread` (trylock, readdir) and merges in `sftp_poll_apply` on the main thread; `panel_monitor_stop` bumps `poll_gen` and joins the thread before the connection can be closed. Every main-thread SFTP call must hold `conn->lock`.
+- Directory monitor events are queued in `Panel.mon_pending` and applied by `monitor_flush` (`MON_BATCH_MS`, reload above `MON_RELOAD_LIMIT`).
+
 ## Key handling hierarchy
 
-1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global, Ctrl+S (filter), Alt+E (extract), Alt+P (pack) (skipped if `GtkEntry` has focus)
-2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+` (mark/unmark all)
+1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (incl. Shift+F4/F5/F8), Del/Shift+Del, Alt+Enter (properties), Ctrl+C/X/V, Ctrl+Shift+C, Ctrl+A/Ctrl+Shift+A, Ctrl+S (filter), Alt+E (extract), Alt+P (pack) (skipped if `GtkEntry` has focus)
+2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Shift+Up/Down (mark while moving), Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+`/`-` (select/unselect group), `*` (invert)
 3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
 4. `on_filter_key` (CAPTURE phase, filter entry) — Escape (close search bar), Enter (close + activate item), arrows/PgUp/PgDn/Home/End (close, cursor stays)
 
@@ -87,30 +107,45 @@ if (dlg_ctx_run(&ctx) == 1) { /* OK pressed */ }
 gtk_window_destroy(GTK_WINDOW(dlg));
 ```
 
-## Progress dialog
+## Background jobs (threading model)
 
-`ProgressDlg` in `fileops.c` — used by copy, move, delete operations:
+File operations never block the main loop:
 
 ```
-┌─ Copying ──────────────────────────┐
-│ Copying…                           │  phase_lbl
-│ document.pdf                       │  file_lbl
-│ ████████████░░░░░░░░░░  54 %       │  progress bar
-│ 12.3 MB / 22.8 MB  —  4.5 MB/s     │  detail_lbl
-│                          [Cancel]  │  cancel button
-└────────────────────────────────────┘
+main thread                               worker thread (job.c)
+───────────                               ─────────────────────
+dialogs (ask_destination, ask_choice)
+job_new() → modal progress window
+job_run() ── g_thread_new ──────────────▶ JobFunc (xfer/delete/archive)
+   nested GMainLoop                         fs_copy / fs_sftp_upload …
+   job_tick() every 100 ms  ◀── mutex ───   FsCtx.progress → job->done, file
+   Cancel → fs_cancel()     ── atomic ──▶   fs_cancelled() checks
+   conflict dialog          ◀─ fm_call_on_main ─ FsCtx.conflict (worker waits)
+   g_main_loop_quit         ◀── idle ────   return
+reload panels, status line
 ```
 
-**Features:**
-- Two modes: indeterminate (auto-pulsing, 80ms timer) and determinate (fraction + percentage)
-- Phases: "Calculating size…" → "Copying…" / "Moving…" / "Deleting…" → "Done"
-- During size calculation, GTK events pumped every 64–128 files to keep pulse animation alive
-- Speed display (MB/s) after 0.5 seconds elapsed
-- Cancel button: sets `pd->cancelled` flag, checked at multiple levels:
-  - Read/write loops (every 256KB chunk) — partial files cleaned up
-  - Recursive directory traversal — stops before next entry
-  - Main operation loop — skips remaining files
-  - Size calculation phase — skips to end
+- The progress window is modal, so the panels cannot start a second operation.
+- **SFTP sessions are not thread-safe:** `SshConn.lock` (`GRecMutex`) is held by the
+  worker for the whole job; the main thread only try-locks (`sftp_poll_tick`,
+  `ssh_read_file`, `ssh_write_file`, rename/mkdir/properties) and backs off.
+- Engine result codes are ordered by severity: `FS_OK < FS_SKIPPED < FS_CANCELLED < FS_ERR`;
+  directories report the worst result of their children (`fs_worst`). Moves delete the
+  source only on `FS_OK`.
+- Without a `conflict` callback the engine **skips** existing targets — it never
+  overwrites silently.
+
+Progress dialog:
+
+```
+┌─ Copying ──────────────────────────────────┐
+│ Copying…                                   │  phase
+│ document.pdf                               │  current file
+│ ████████████░░░░░░░░░░  54 %               │  bar (pulses while sizing)
+│ 12.3 MB / 22.8 MB — 4.5 MB/s — 00:03 left  │  detail
+│                                  [Cancel]  │
+└────────────────────────────────────────────┘
+```
 
 ## Incremental search (Ctrl+S) and file mask
 
@@ -145,7 +180,7 @@ Advanced search with results displayed in active panel (MC style):
 - **Same-filesystem traversal:** `root_dev` (device of search root) checked before recursing — skips `/proc`, `/sys`, `/dev`, NFS mounts etc. (like `find -xdev`)
 - **Symlink safety:** directory symlinks not followed (`S_ISLNK` check before recursion); `fstatat(AT_SYMLINK_NOFOLLOW)` for all entries
 - **Loop detection:** `GHashTable<(dev,ino)>` tracks visited directories — prevents revisiting via bind mounts or hard-linked dirs
-- **Cancel button:** shown during search, sets `cancelled` flag checked every iteration; progress updates every 8192 files scanned
+- **Worker thread:** `search_dir` runs in a GThread (`search_thread`); the main thread waits in a nested loop, a 100 ms timer shows "Scanning: N files, M found", and Cancel sets the atomic `cancelled` flag. A second F2 during a scan is refused.
 
 **Panel integration:**
 - Sorter disabled (`gtk_sort_list_model_set_sorter(NULL)`) to preserve grouped order
@@ -155,13 +190,25 @@ Advanced search with results displayed in active panel (MC style):
 - Exit search button (X icon) in path bar
 - On exit: store replaced first (small directory), then sorter restored — prevents sorting millions of items
 
+## Search results lifecycle
+
+Each finished search becomes a `SearchHist` (search.c: result `GListStore`, info text,
+needle, origin dir, remembered cursor), kept in a history queue (max 10, newest first).
+Panels only borrow pointers: `Panel.cur_search` while results are shown,
+`Panel.last_search` after leaving them. `panel_load()` calls `search_detach()` (and
+restores the sorter after swapping the store), so any navigation away keeps the results
+reachable via `search_restore()` (Alt+←, results button) or `search_history_dialog()`
+(Shift+F2). Enter on a result opens it (`gtk_show_uri`); `search_goto_file()`
+(Ctrl+PgDn / Ctrl+Enter / Enter on a directory header) loads the directory. The viewer
+asks `search_needle()` and `FileItem.line` to open on the matching line.
+
 ## Archive support
 
 `fo_extract()` and `fo_pack()` in `fileops.c`:
 
 **Detection:** `arc_detect(name)` returns `ArcType` enum based on file extension (double extensions like `.tar.gz` checked first).
 
-**Execution:** `run_archive_cmd()` — spawns external tool via `g_spawn_async`, polls child with `waitpid(WNOHANG)` in a loop, pumps GTK events every 50ms to keep pulse animation alive. Cancel sends `SIGTERM` to child process.
+**Execution:** `arc_worker()` in `archive.c` runs inside a `Job`: spawns the tool with `g_spawn_async_with_pipes` (working directory set per call — no process-wide `chdir`), drains stderr (last line shown on failure), polls `waitpid(WNOHANG)` every 50 ms. Cancel sends `SIGTERM` to the child.
 
 **Extract:** Detects format → builds appropriate argv (`tar xf`, `unzip`, `7z x`, `unrar x`) → runs with destination `-C`/`-d`/`-o` flag.
 
@@ -237,7 +284,9 @@ Without GtkSourceView (fallback):
 
 SSH connection runs in a background thread via `GTask`:
 1. User fills in host/user/port/password in dialog, clicks Connect
-2. `ssh_connect_thread` runs `ssh_conn_new()` off the main thread (DNS, TCP, handshake, auth)
+2. `ssh_connect_thread` runs `ssh_conn_new()` off the main thread: DNS (all addresses, IPv4/IPv6), TCP, handshake, **host key check**, auth
+   - host key: `~/.ssh/known_hosts` loaded line by line (`libssh2_knownhost_readline`, unparsable lines skipped); `MATCH` → continue, `MISMATCH` → abort with MITM warning, unknown → SHA256 fingerprint prompt on the main thread (`fm_call_on_main`), accepted keys appended (`[host]:port` for non-22 ports)
+   - auth order: ssh-agent → key files (`id_ed25519`, `id_ecdsa`, `id_rsa` or the configured key; password reused as passphrase) → password → keyboard-interactive
 3. `ssh_connect_done` callback on main thread sets `panel->ssh_conn` and loads remote directory
 4. UI stays responsive during the entire connection process
 
@@ -259,7 +308,9 @@ settings.ini [ssh]
 
 ## Security
 
-- **Path traversal guard:** `name_is_safe()` in fileops.c rejects exact `..`, `.`, `/` in filenames, and empty strings — applied to all file operations (copy, move, delete, rename, mkdir)
+- **SSH host keys:** verified against `~/.ssh/known_hosts` (see "SSH — async connect")
+- **No silent overwrite / no write-through:** destination files are created with `O_EXCL` after an explicit overwrite decision, so an existing symlink at the destination is replaced, never followed
+- **Path traversal guard:** `fs_name_is_safe()` in util.c rejects exact `..`, `.`, `/` in filenames, and empty strings — applied to all file operations (copy, move, delete, rename, mkdir)
 - **Command injection prevention:** Terminal launch uses `g_spawn_async()` with argv array (no shell parsing); SSH remote paths, user, and host quoted via `g_shell_quote()`
 - **Archive flag injection prevention:** `--` separator before archive path in all extract/pack commands (tar, unzip, 7z, unrar) — prevents malicious filenames from being interpreted as flags
 - **Symlink safety:** `copy_file()` opens source with `O_NOFOLLOW` — refuses to follow symlinks during copy

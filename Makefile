@@ -1,6 +1,6 @@
 CC      := gcc
 WARN    := -Wall -Wextra -Wno-deprecated-declarations
-CFLAGS  := -O2 $(WARN) -std=c11 -D_GNU_SOURCE
+CFLAGS  := -O2 $(WARN) -std=c11 -D_GNU_SOURCE $(CFLAGS_EXTRA)
 
 SRCDIR  := src
 INCDIR  := include
@@ -61,14 +61,30 @@ else
   $(info gtksourceview-5 not found – basic highlighting only. Install: sudo dnf install gtksourceview5-devel)
 endif
 
+# GLib-only core (unit-tested without GTK)
+CORE_SRCS := $(SRCDIR)/util.c $(SRCDIR)/fsops.c
 SRCS   := $(SRCDIR)/main.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
+          $(SRCDIR)/archive.c $(SRCDIR)/job.c $(SRCDIR)/dialogs.c \
+          $(SRCDIR)/selection.c $(SRCDIR)/clipboard.c $(SRCDIR)/monitor.c \
+          $(SRCDIR)/icons.c \
           $(SRCDIR)/search.c $(SRCDIR)/ssh.c $(SRCDIR)/settings.c \
-          $(SRCDIR)/viewer.c $(SRCDIR)/editor.c $(SRCDIR)/highlight.c
-OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
+          $(SRCDIR)/viewer.c $(SRCDIR)/editor.c $(SRCDIR)/highlight.c \
+          $(CORE_SRCS)
+HDRS   := $(wildcard $(INCDIR)/*.h)
 TARGET := fm
+
+# `make debug` / `make test SAN=1` → separate tree with ASan + UBSan
+ifeq ($(SAN),1)
+  BUILDDIR := build-debug
+  CFLAGS   := $(filter-out -O2,$(CFLAGS)) -O1 -g -fno-omit-frame-pointer \
+              -fsanitize=address,undefined
+  LDSAN    := -fsanitize=address,undefined
+endif
+
+OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 BIN    := $(BUILDDIR)/$(TARGET)
 
-.PHONY: all clean install user-install uninstall
+.PHONY: all clean install user-install uninstall debug test test-asan
 
 all: $(BIN)
 
@@ -76,14 +92,31 @@ $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 $(BIN): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LIBS)
+	$(CC) $(OBJS) -o $@ $(LIBS) $(LDSAN)
 	@echo "Done: $(BIN)"
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(INCDIR)/fm.h | $(BUILDDIR)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(HDRS) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+debug:
+	$(MAKE) SAN=1 all
+
+# ── unit tests (GLib/GIO only – no display needed) ──────────────────
+TEST_LIBS := $(shell pkg-config --libs gio-2.0) $(if $(findstring HAVE_LIBSSH2,$(CFLAGS)),$(_SSH2_LIBS) $(if $(_SSH2_LIBS),,-lssh2))
+TEST_BIN  := $(BUILDDIR)/test_core
+
+$(TEST_BIN): tests/test_core.c $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(CORE_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) tests/test_core.c $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(CORE_SRCS)) \
+	      -o $@ $(TEST_LIBS) $(LDSAN)
+
+test: $(TEST_BIN)
+	$(TEST_BIN)
+
+test-asan:
+	$(MAKE) SAN=1 test
+
 clean:
-	rm -rf $(BUILDDIR)
+	rm -rf build build-debug
 
 PREFIX  ?= /usr/local
 DATADIR ?= $(PREFIX)/share

@@ -1,585 +1,964 @@
 #include "fm.h"
+#include "job.h"
+#include "dialogs.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pwd.h>
+#include <grp.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <dirent.h>
 
-#define COPY_BUF (256 * 1024)
+/* ─────────────────────────────────────────────────────────────────── *
+ *  File operations – dialogs on the main thread, the actual work in a
+ *  Job worker thread using the fsops.c engine.
+ * ─────────────────────────────────────────────────────────────────── */
 
-/* ── Path traversal guard ─────────────────────────────────────────── */
-
-/* Reject filenames that could escape the target directory */
-static gboolean name_is_safe(const char *name)
+/* Restore keyboard focus to the panel after a dialog / job */
+static void refocus(Panel *p)
 {
-    if (!name || !name[0]) return FALSE;
-    if (strcmp(name, ".") == 0) return FALSE;
-    if (strcmp(name, "..") == 0) return FALSE;
-    if (strchr(name, '/') != NULL) return FALSE;
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
+}
+
+static void reload_both(FM *fm)
+{
+    panel_reload(&fm->panels[0]);
+    panel_reload(&fm->panels[1]);
+}
+
+/* After a failed SFTP job: drop the panel if the connection is gone */
+static gboolean conn_alive(Panel *p)
+{
+#ifdef HAVE_LIBSSH2
+    if (!p->ssh_conn) return TRUE;
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    if (!ssh_conn_trylock(p->ssh_conn)) return TRUE;
+    gboolean ok = libssh2_sftp_stat(p->ssh_conn->sftp,
+                                    p->ssh_conn->remote_path, &a) == 0;
+    ssh_conn_unlock(p->ssh_conn);
+    if (!ok) {
+        fm_status(p->fm, "SFTP connection lost – panel closed");
+        ssh_panel_close(p);
+    }
+    return ok;
+#else
+    (void)p;
     return TRUE;
+#endif
+}
+
+/* Status line summary: "Copied: 3  skipped: 1  errors: 1 – first error" */
+static void report_result(FM *fm, const char *verb, Job *job,
+                          int ok, int skipped, int fail)
+{
+    GString *s = g_string_new(NULL);
+    if (job_cancelled(job)) g_string_append_printf(s, "%s cancelled – ", verb);
+    g_string_append_printf(s, "%s: %d", verb, ok);
+    if (skipped) g_string_append_printf(s, "  skipped: %d", skipped);
+    if (fail)    g_string_append_printf(s, "  errors: %d", fail);
+    if (job->ctx.error) g_string_append_printf(s, "  –  %s", job->ctx.error);
+    fm_status(fm, "%s", s->str);
+    g_string_free(s, TRUE);
+}
+
+static void tally(int r, int *ok, int *skipped, int *fail)
+{
+    switch (r) {
+    case FS_OK:        (*ok)++;      break;
+    case FS_SKIPPED:   (*skipped)++; break;
+    case FS_CANCELLED:               break;
+    default:           (*fail)++;    break;
+    }
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
- *  Progress dialog (GTK4 – custom window + auto-pulse timer)
- *
- *  Two modes:
- *   - Indeterminate: auto-pulsing bar (for scanning / calculating)
- *   - Determinate:   fraction 0..1 with percentage text
- *
- *  progress_new()        → creates in indeterminate mode
- *  progress_set_phase()  → change the phase label (e.g. "Calculating…")
- *  progress_set_total()  → switch to determinate mode
- *  progress_tick()       → add bytes, update bar + speed display
- *  progress_set_file()   → set current filename being processed
- *  progress_pulse()      → manual pulse (for delete counters etc.)
- *  progress_free()       → destroy window + stop timer
+ *  Transfer (copy / move / paste) – local ↔ local / SFTP ↔ anything
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    GtkWidget *window;
-    GtkWidget *phase_lbl;    /* "Calculating…" / "Copying…" */
-    GtkWidget *file_lbl;     /* current filename */
-    GtkWidget *bar;
-    GtkWidget *detail_lbl;   /* "1.2 MB / 5.0 MB  —  2.3 MB/s" */
-    guint      pulse_id;     /* auto-pulse timer source id */
-    gint64     total_bytes;
-    gint64     done_bytes;
-    gint64     start_time;   /* g_get_monotonic_time at start */
-    gboolean   determinate;
-    gboolean   cancelled;    /* TRUE after user clicks Cancel */
-} ProgressDlg;
+    GList   *srcs;        /* full source paths                     */
+    gchar   *dest;        /* destination directory                 */
+    gchar   *rename_to;   /* single item: explicit target name     */
+    SshConn *sconn;
+    SshConn *dconn;
+    gboolean move;
+    int      ok, skipped, fail;
+    int      worst;       /* worst FS_* result of all items        */
+} Xfer;
 
-static gboolean pulse_tick(gpointer data)
+#ifdef HAVE_LIBSSH2
+static gboolean remote_exists(const char *dir, const char *name, gpointer user)
 {
-    ProgressDlg *pd = data;
-    if (!pd->determinate) {
-        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
-        while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+    SshConn *c = user;
+    gchar *p = fs_remote_join(dir, name);
+    gboolean r = fs_sftp_exists(c->sftp, p, NULL);
+    g_free(p);
+    return r;
+}
+#endif
+
+static gint64 item_size(Job *job, SshConn *conn, const char *path)
+{
+#ifdef HAVE_LIBSSH2
+    if (conn) return fs_sftp_calc_size(&job->ctx, conn->sftp, path);
+#else
+    (void)conn;
+#endif
+    return fs_calc_size(&job->ctx, path);
+}
+
+static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
+{
+    FsCtx *c = &job->ctx;
+    /* conflict dialog: no local stat() for remote paths */
+    job->src_remote = x->sconn != NULL;
+    job->dst_remote = x->dconn != NULL;
+
+    if (!x->sconn && !x->dconn)
+        return x->move ? fs_move(c, src, dst) : fs_copy(c, src, dst);
+
+#ifdef HAVE_LIBSSH2
+    int r;
+    if (!x->sconn) {                                    /* upload */
+        r = fs_sftp_upload(c, x->dconn->sftp, src, dst);
+        if (x->move && r == FS_OK) r = fs_delete(c, src);
+        return r;
     }
-    return G_SOURCE_CONTINUE;
+    if (!x->dconn) {                                    /* download */
+        r = fs_sftp_download(c, x->sconn->sftp, src, dst);
+        if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+        return r;
+    }
+    /* remote → remote through a private temp directory */
+    if (x->sconn == x->dconn) {
+        /* replacing an ancestor of the source would delete the source */
+        gchar *ns = g_canonicalize_filename(src, "/");
+        gchar *nd = g_canonicalize_filename(dst, "/");
+        gboolean inside = fs_path_is_inside(ns, nd) || fs_path_is_inside(nd, ns);
+        g_free(ns); g_free(nd);
+        if (inside) {
+            if (!c->error)
+                c->error = g_strdup_printf("Cannot copy '%s' onto '%s'", src, dst);
+            return FS_ERR;
+        }
+    }
+    job->src_remote = FALSE;           /* upload reads the local temp copy */
+    gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
+    if (!tmpdir) return FS_ERR;
+    gchar *base = g_path_get_basename(src);
+    gchar *tmp  = g_build_filename(tmpdir, base, NULL);
+    r = fs_sftp_download(c, x->sconn->sftp, src, tmp);
+    if (r == FS_OK) r = fs_sftp_upload(c, x->dconn->sftp, tmp, dst);
+    if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+    fs_delete(NULL, tmpdir);
+    g_free(base); g_free(tmp); g_free(tmpdir);
+    return r;
+#else
+    (void)job; (void)src; (void)dst;
+    return FS_ERR;
+#endif
 }
 
-static void on_progress_cancel(GtkButton *btn, gpointer data)
+static void xfer_worker(Job *job, gpointer d)
 {
-    (void)btn;
-    ProgressDlg *pd = data;
-    pd->cancelled = TRUE;
+    Xfer *x = d;
+    if (x->sconn) ssh_conn_lock(x->sconn);
+    if (x->dconn && x->dconn != x->sconn) ssh_conn_lock(x->dconn);
+
+    job_set_phase(job, "Calculating size…");
+    gint64 total = 0;
+    for (GList *l = x->srcs; l && !job_cancelled(job); l = l->next) {
+        gchar *base = g_path_get_basename(l->data);
+        job_set_file(job, base);
+        g_free(base);
+        total += item_size(job, x->sconn, l->data);
+    }
+    if (x->sconn && x->dconn) total *= 2;     /* download + upload */
+
+    if (!job_cancelled(job)) {
+        job_set_phase(job, x->move ? "Moving…" : "Copying…");
+        job_set_total(job, total);
+    }
+
+    for (GList *l = x->srcs; l && !job_cancelled(job); l = l->next) {
+        const char *src = l->data;
+        gchar *base = (x->rename_to && !x->srcs->next)
+                      ? g_strdup(x->rename_to) : g_path_get_basename(src);
+        if (!fs_name_is_safe(base)) {
+            x->fail++;
+            x->worst = fs_worst(x->worst, FS_ERR);
+            g_free(base);
+            continue;
+        }
+
+        gchar *dst = x->dconn ? fs_remote_join(x->dest, base)
+                              : g_build_filename(x->dest, base, NULL);
+
+        /* Same place: copy → duplicate under a new name, move → nothing */
+        if (x->sconn == x->dconn && strcmp(src, dst) == 0) {
+            if (x->move) {
+                x->skipped++;
+                x->worst = fs_worst(x->worst, FS_SKIPPED);
+                g_free(base); g_free(dst);
+                continue;
+            }
+            gchar *u;
+#ifdef HAVE_LIBSSH2
+            if (x->dconn) u = fs_unique_name(x->dest, base, remote_exists, x->dconn);
+            else
+#endif
+                u = fs_unique_name(x->dest, base, fs_local_exists, NULL);
+            g_free(dst);
+            dst = x->dconn ? fs_remote_join(x->dest, u) : g_build_filename(x->dest, u, NULL);
+            g_free(u);
+        }
+
+        int r = transfer_one(job, x, src, dst);
+        x->worst = fs_worst(x->worst, r);
+        tally(r, &x->ok, &x->skipped, &x->fail);
+        g_free(base);
+        g_free(dst);
+    }
+
+    if (x->dconn && x->dconn != x->sconn) ssh_conn_unlock(x->dconn);
+    if (x->sconn) ssh_conn_unlock(x->sconn);
 }
 
-static ProgressDlg *progress_new(GtkWindow *parent, const char *title)
+static Panel *panel_of_conn(FM *fm, SshConn *c)
 {
-    ProgressDlg *pd = g_new0(ProgressDlg, 1);
-    pd->window = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(pd->window), title);
-    gtk_window_set_modal(GTK_WINDOW(pd->window), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(pd->window), parent);
-    gtk_window_set_resizable(GTK_WINDOW(pd->window), FALSE);
-    gtk_window_set_default_size(GTK_WINDOW(pd->window), 420, -1);
-    gtk_window_set_deletable(GTK_WINDOW(pd->window), FALSE);
+    for (int i = 0; i < 2; i++)
+        if (c && fm->panels[i].ssh_conn == c) return &fm->panels[i];
+    return NULL;
+}
 
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+static void run_transfer(FM *fm, Xfer *x)
+{
+    Job *job = job_new(fm, x->move ? "Moving" : "Copying");
+    job_run(job, xfer_worker, x);
+    if (job_cancelled(job)) x->worst = fs_worst(x->worst, FS_CANCELLED);
+
+    report_result(fm, x->move ? "Moved" : "Copied", job, x->ok, x->skipped, x->fail);
+    job_free(job);
+
+    Panel *sp = panel_of_conn(fm, x->sconn);
+    Panel *dp = panel_of_conn(fm, x->dconn);
+    if (x->fail) {
+        if (sp) conn_alive(sp);
+        if (dp && dp != sp) conn_alive(dp);
+    }
+    reload_both(fm);
+}
+
+int fo_transfer(FM *fm, GList *paths, SshConn *sconn,
+                const char *dest_dir, SshConn *dconn, gboolean move)
+{
+    if (!paths || !dest_dir) return FS_ERR;
+    Xfer x = { 0 };
+    for (GList *l = paths; l; l = l->next)
+        x.srcs = g_list_prepend(x.srcs, g_strdup(l->data));
+    x.srcs  = g_list_reverse(x.srcs);
+    x.dest  = g_strdup(dest_dir);
+    x.sconn = sconn;
+    x.dconn = dconn;
+    x.move  = move;
+    run_transfer(fm, &x);
+    g_list_free_full(x.srcs, g_free);
+    g_free(x.dest);
+    return x.worst;
+}
+
+/* Is `path` an existing directory on the given side? */
+static gboolean is_dir_on(SshConn *conn, const char *path)
+{
+#ifdef HAVE_LIBSSH2
+    if (conn) {
+        gboolean d = FALSE, ok = FALSE;
+        if (ssh_conn_trylock(conn)) {
+            ok = fs_sftp_exists(conn->sftp, path, &d);
+            ssh_conn_unlock(conn);
+        }
+        return ok && d;
+    }
+#else
+    (void)conn;
+#endif
+    return g_file_test(path, G_FILE_TEST_IS_DIR);
+}
+
+/* F5 / F6 – Total Commander behaviour:
+ *   dialog shows "<other panel>/" selected, Enter copies there;
+ *   a single item may be given a new name ("/dst/newname"). */
+static void copy_or_move(FM *fm, gboolean move)
+{
+    Panel *src = active_panel(fm);
+    Panel *dst = other_panel(fm);
+
+    GList *paths = panel_selection_paths(src);
+    if (!paths) { fm_status(fm, "Nothing is selected"); return; }
+
+    gchar *prompt = dlg_count_prompt(move ? "Rename/move" : "Copy", paths, "to:");
+    gchar *dest = ask_destination(fm, move ? "Move" : "Copy", prompt, panel_dir(dst));
+    g_free(prompt);
+    if (!dest) { g_list_free_full(paths, g_free); refocus(src); return; }
+
+    /* With an SFTP target panel the typed path is remote, unless it
+     * names an existing local directory (user typed a local path). */
+    SshConn *dconn = NULL;
+    if (dst->ssh_conn && (strcmp(dest, panel_dir(dst)) == 0 ||
+                          !g_file_test(dest, G_FILE_TEST_IS_DIR)))
+        dconn = dst->ssh_conn;
+    /* relative path → relative to the source panel (TC semantics) */
+    if (!dconn && dest[0] != '/') {
+        gchar *abs = g_build_filename(panel_dir(src), dest, NULL);
+        g_free(dest);
+        dest = abs;
+    }
+
+    Xfer x = { 0 };
+    x.srcs  = paths;
+    x.sconn = src->ssh_conn;
+    x.dconn = dconn;
+    x.move  = move;
+
+    if (is_dir_on(dconn, dest)) {
+        x.dest = dest;
+        dest = NULL;
+    } else {
+        /* not a directory: "dir/newname" for a single item */
+        gchar *parent = g_path_get_dirname(dest);
+        gchar *name   = g_path_get_basename(dest);
+        if (paths->next || !is_dir_on(dconn, parent) || !fs_name_is_safe(name)) {
+            fm_status(fm, "Destination directory does not exist: %s",
+                      paths->next ? dest : parent);
+            g_free(parent); g_free(name); g_free(dest);
+            g_list_free_full(paths, g_free);
+            refocus(src);
+            return;
+        }
+        x.dest = parent;
+        x.rename_to = name;
+    }
+
+    run_transfer(fm, &x);
+    if (src->marks) g_hash_table_remove_all(src->marks);
+    panel_reload(src);
+    g_free(x.dest);
+    g_free(x.rename_to);
+    g_free(dest);
+    g_list_free_full(paths, g_free);
+    refocus(src);
+}
+
+void fo_copy(FM *fm) { copy_or_move(fm, FALSE); }
+void fo_move(FM *fm) { copy_or_move(fm, TRUE);  }
+
+/* Shift+F5: duplicate in the same directory, asking for the new name */
+void fo_copy_here(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    GList *paths = panel_selection_paths(p);
+    if (!paths) { fm_status(fm, "Nothing is selected"); return; }
+
+    Xfer x = { 0 };
+    x.srcs  = paths;
+    x.sconn = x.dconn = p->ssh_conn;
+
+    if (!paths->next) {
+        gchar *base = g_path_get_basename(paths->data);
+        gchar *dir  = g_path_get_dirname(paths->data);
+        gchar *suggest;
+#ifdef HAVE_LIBSSH2
+        if (p->ssh_conn) {
+            ssh_conn_lock(p->ssh_conn);
+            suggest = fs_unique_name(dir, base, remote_exists, p->ssh_conn);
+            ssh_conn_unlock(p->ssh_conn);
+        } else
+#endif
+            suggest = fs_unique_name(dir, base, fs_local_exists, NULL);
+        gchar *mk = g_markup_printf_escaped("Copy <b>%s</b> as:", base);
+        x.rename_to = ask_text(fm, "Copy", mk, suggest, "Copy", TRUE);
+        g_free(mk); g_free(suggest); g_free(base);
+        if (!x.rename_to) { g_free(dir); g_list_free_full(paths, g_free); refocus(p); return; }
+        if (!fs_name_is_safe(x.rename_to)) {
+            fm_status(fm, "Invalid name: %s", x.rename_to);
+            g_free(x.rename_to); g_free(dir);
+            g_list_free_full(paths, g_free);
+            refocus(p);
+            return;
+        }
+        x.dest = dir;
+    } else {
+        x.dest = g_path_get_dirname(paths->data);
+    }
+
+    run_transfer(fm, &x);
+    if (x.rename_to) panel_select_name(p, x.rename_to);
+    g_free(x.rename_to);
+    g_free(x.dest);
+    g_list_free_full(paths, g_free);
+    refocus(p);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Delete (trash or permanent)
+ * ─────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    GList   *paths;
+    SshConn *conn;
+    gboolean trash;
+    int      ok, skipped, fail;
+} DelJob;
+
+static void delete_worker(Job *job, gpointer d)
+{
+    DelJob *dj = d;
+    job_set_phase(job, dj->trash ? "Moving to trash…" : "Deleting…");
+    job_set_total_items(job, g_list_length(dj->paths));
+    if (dj->conn) ssh_conn_lock(dj->conn);
+
+    for (GList *l = dj->paths; l && !job_cancelled(job); l = l->next) {
+        int r;
+#ifdef HAVE_LIBSSH2
+        if (dj->conn) r = fs_sftp_delete(&job->ctx, dj->conn->sftp, l->data);
+        else
+#endif
+        r = dj->trash ? fs_trash(&job->ctx, l->data) : fs_delete(&job->ctx, l->data);
+        tally(r, &dj->ok, &dj->skipped, &dj->fail);
+        job_add_done(job, 1);
+    }
+    if (dj->conn) ssh_conn_unlock(dj->conn);
+}
+
+static void delete_impl(FM *fm, gboolean permanent)
+{
+    Panel *p = active_panel(fm);
+    GList *paths = panel_selection_paths(p);
+    if (!paths) { fm_status(fm, "Nothing is selected"); return; }
+
+    /* F8/Del: local → trash, Shift = permanent; SFTP is always permanent */
+    gboolean trash = !p->ssh_conn && !permanent;
+    gchar *what = dlg_count_prompt(trash ? "Do you really want to move" : "Do you really want to delete",
+                                   paths, trash ? "to the trash?" : "?");
+    if (!trash) {
+        gchar *t = g_strconcat(what, "\n<small>This cannot be undone.</small>", NULL);
+        g_free(what);
+        what = t;
+    }
+    gboolean go = ask_yes_no(fm, trash ? "Move to trash" : "Delete", what);
+    g_free(what);
+    if (!go) { g_list_free_full(paths, g_free); refocus(p); return; }
+
+    DelJob dj = { .paths = paths, .conn = p->ssh_conn, .trash = trash };
+    Job *job = job_new(fm, dj.trash ? "Moving to trash" : "Deleting");
+    job_run(job, delete_worker, &dj);
+    report_result(fm, dj.trash ? "Trashed" : "Deleted", job, dj.ok, dj.skipped, dj.fail);
+    job_free(job);
+
+    if (dj.fail) conn_alive(p);
+    if (p->marks) g_hash_table_remove_all(p->marks);
+    g_list_free_full(paths, g_free);
+    reload_both(fm);
+    refocus(p);
+}
+
+void fo_delete(FM *fm)           { delete_impl(fm, FALSE); }
+void fo_delete_permanent(FM *fm) { delete_impl(fm, TRUE);  }
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Mkdir (supports nested "a/b/c")
+ * ─────────────────────────────────────────────────────────────────── */
+
+void fo_mkdir(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    if (p->search_mode) { fm_status(fm, "Leave search results first"); return; }
+
+    gchar *name = ask_text(fm, "New directory",
+                           "New directory name (a/b/c creates nested):",
+                           NULL, "Create", FALSE);
+    if (!name) { refocus(p); return; }
+
+    if (!fs_relpath_is_safe(name)) {
+        fm_status(fm, "Invalid directory name: %s", name);
+        g_free(name);
+        refocus(p);
+        return;
+    }
+
+    gboolean ok = FALSE;
+#ifdef HAVE_LIBSSH2
+    if (p->ssh_conn) {
+        if (!ssh_conn_trylock(p->ssh_conn)) {
+            fm_status(fm, "SFTP connection is busy");
+        } else {
+            gchar **parts = g_strsplit(name, "/", -1);
+            gchar *cur = g_strdup(p->ssh_conn->remote_path);
+            ok = TRUE;
+            for (int i = 0; parts[i] && ok; i++) {
+                if (!parts[i][0]) continue;
+                gchar *next = fs_remote_join(cur, parts[i]);
+                g_free(cur);
+                cur = next;
+                gboolean is_dir = FALSE;
+                if (fs_sftp_exists(p->ssh_conn->sftp, cur, &is_dir) && is_dir
+                    && parts[i + 1]) continue;
+                if (libssh2_sftp_mkdir(p->ssh_conn->sftp, cur, 0755) != 0) ok = FALSE;
+            }
+            g_free(cur);
+            g_strfreev(parts);
+            ssh_conn_unlock(p->ssh_conn);
+            if (!ok) fm_status(fm, "Error creating remote directory: %s", name);
+        }
+    } else
+#endif
+    {
+        gchar *path = g_build_filename(p->cwd, name, NULL);
+        if (g_file_test(path, G_FILE_TEST_EXISTS))
+            fm_status(fm, "Already exists: %s", name);
+        else if (g_mkdir_with_parents(path, 0755) == 0)
+            ok = TRUE;
+        else
+            fm_status(fm, "Error creating directory: %s", g_strerror(errno));
+        g_free(path);
+    }
+
+    if (ok) {
+        fm_status(fm, "Directory created: %s", name);
+        reload_both(fm);
+        gchar **parts = g_strsplit(name, "/", 2);
+        panel_select_name(p, parts[0]);
+        g_strfreev(parts);
+    }
+    g_free(name);
+    refocus(p);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  New file (Shift+F4) – create empty file and open it in the editor
+ * ─────────────────────────────────────────────────────────────────── */
+
+void fo_newfile(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    if (p->search_mode) { fm_status(fm, "Leave search results first"); return; }
+
+    gchar *name = ask_text(fm, "New file", "New file name:", "new.txt", "Create", TRUE);
+    if (!name) { refocus(p); return; }
+    if (!fs_name_is_safe(name)) {
+        fm_status(fm, "Invalid file name: %s", name);
+        g_free(name);
+        refocus(p);
+        return;
+    }
+
+    gboolean ok = FALSE;
+#ifdef HAVE_LIBSSH2
+    if (p->ssh_conn) {
+        if (ssh_conn_trylock(p->ssh_conn)) {
+            gchar *rp = fs_remote_join(p->ssh_conn->remote_path, name);
+            LIBSSH2_SFTP_HANDLE *h = libssh2_sftp_open(p->ssh_conn->sftp, rp,
+                LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_EXCL, 0644);
+            if (h) { libssh2_sftp_close(h); ok = TRUE; }
+            ssh_conn_unlock(p->ssh_conn);
+            g_free(rp);
+        }
+        if (!ok) fm_status(fm, "Cannot create remote file (exists or busy): %s", name);
+    } else
+#endif
+    {
+        gchar *path = g_build_filename(p->cwd, name, NULL);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd >= 0) { close(fd); ok = TRUE; }
+        else fm_status(fm, "Cannot create %s: %s", name, g_strerror(errno));
+        g_free(path);
+    }
+
+    if (ok) {
+        panel_reload(p);
+        panel_select_name(p, name);
+        fm_status(fm, "Created: %s", name);
+        editor_show(fm);
+    } else {
+        refocus(p);
+    }
+    g_free(name);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Rename (Shift+F6)
+ * ─────────────────────────────────────────────────────────────────── */
+
+void fo_rename(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    gchar *old_name = panel_cursor_name(p);
+    if (!old_name || strcmp(old_name, "..") == 0) {
+        g_free(old_name);
+        fm_status(fm, "No file is selected");
+        return;
+    }
+
+    /* Directory that contains the item (search results live elsewhere) */
+    gchar *dir;
+    if (p->ssh_conn) {
+        dir = g_strdup(p->ssh_conn->remote_path);
+    } else {
+        gchar *full = panel_cursor_fullpath(p);
+        dir = g_path_get_dirname(full);
+        g_free(full);
+    }
+
+    gchar *mk = g_markup_printf_escaped("Rename <b>%s</b> to:", old_name);
+    gchar *new_name = ask_text(fm, "Rename", mk, old_name, "Rename", TRUE);
+    g_free(mk);
+
+    gboolean done = FALSE;
+    if (new_name && strcmp(new_name, old_name) != 0) {
+        if (!fs_name_is_safe(new_name)) {
+            fm_status(fm, "Invalid name: %s", new_name);
+            goto out;
+        }
+#ifdef HAVE_LIBSSH2
+        if (p->ssh_conn) {
+            if (!ssh_conn_trylock(p->ssh_conn)) {
+                fm_status(fm, "SFTP connection is busy");
+                goto out;
+            }
+            gchar *op = fs_remote_join(dir, old_name);
+            gchar *np = fs_remote_join(dir, new_name);
+            LIBSSH2_SFTP *sftp = p->ssh_conn->sftp;
+            gboolean exists_dir = FALSE, go = TRUE, replace = FALSE;
+            /* case-only rename: on a case-insensitive server np "exists"
+             * but is the source itself – never replace/unlink it */
+            if (g_ascii_strcasecmp(old_name, new_name) != 0 &&
+                fs_sftp_exists(sftp, np, &exists_dir)) {
+                gchar *q = g_markup_printf_escaped("<b>%s</b> already exists. Replace it?", new_name);
+                static const char *const b[] = { "Cancel", "Replace", NULL };
+                go = replace = !exists_dir && ask_choice(fm, "Rename", q, NULL, b, 1) == 1;
+                g_free(q);
+                if (exists_dir) fm_status(fm, "A directory with that name exists");
+            }
+            if (go) {
+                /* the old target is only removed if an overwriting
+                 * rename is refused (SFTP v3) */
+                done = replace ? fs_sftp_replace(sftp, op, np)
+                               : libssh2_sftp_rename(sftp, op, np) == 0;
+                if (!done) fm_status(fm, "Error renaming remote file");
+            }
+            ssh_conn_unlock(p->ssh_conn);
+            g_free(op); g_free(np);
+        } else
+#endif
+        {
+            gchar *op = g_build_filename(dir, old_name, NULL);
+            gchar *np = g_build_filename(dir, new_name, NULL);
+            struct stat st;
+            gboolean go = TRUE;
+            /* case-only rename on case-insensitive FS is the same inode – fine */
+            if (lstat(np, &st) == 0 && g_ascii_strcasecmp(old_name, new_name) != 0) {
+                gchar *q = g_markup_printf_escaped("<b>%s</b> already exists. Replace it?", new_name);
+                static const char *const b[] = { "Cancel", "Replace", NULL };
+                go = ask_choice(fm, "Rename", q, NULL, b, 1) == 1;
+                g_free(q);
+            }
+            if (go) {
+                if (rename(op, np) == 0) done = TRUE;
+                else fm_status(fm, "Error renaming: %s", g_strerror(errno));
+            }
+            g_free(op); g_free(np);
+        }
+    }
+
+    if (done) {
+        fm_status(fm, "Renamed: %s → %s", old_name, new_name);
+        if (p->marks) g_hash_table_remove(p->marks, old_name);
+        reload_both(fm);
+        panel_select_name(p, new_name);
+    }
+out:
+    g_free(new_name);
+    g_free(old_name);
+    g_free(dir);
+    refocus(p);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Properties (Alt+Enter) – info + permissions editor
+ * ─────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    GtkWidget *checks[9];
+    GtkWidget *octal;
+} PermUi;
+
+static guint perm_bits(PermUi *u)
+{
+    guint m = 0;
+    for (int i = 0; i < 9; i++)
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(u->checks[i])))
+            m |= 1u << (8 - i);
+    return m;
+}
+
+static void on_perm_toggled(GtkCheckButton *b, PermUi *u)
+{
+    (void)b;
+    gchar *t = g_strdup_printf("%03o", perm_bits(u));
+    gtk_label_set_text(GTK_LABEL(u->octal), t);
+    g_free(t);
+}
+
+/* Directory size in a thread; label is ref'd so it survives the dialog */
+typedef struct { gchar *path; FsCtx ctx; GtkWidget *label; } SizeTask;
+
+static void size_task_free(gpointer d)
+{
+    SizeTask *t = d;
+    g_free(t->path);
+    g_object_unref(t->label);
+    g_free(t);
+}
+
+static void size_thread(GTask *task, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    SizeTask *t = data;
+    gint64 *r = g_new(gint64, 1);
+    *r = fs_calc_size(&t->ctx, t->path);
+    g_task_return_pointer(task, r, g_free);
+}
+
+static void size_done(GObject *src, GAsyncResult *res, gpointer d)
+{
+    (void)src; (void)d;
+    SizeTask *t = g_task_get_task_data(G_TASK(res));
+    gint64 *sz = g_task_propagate_pointer(G_TASK(res), NULL);
+    if (sz && gtk_widget_get_root(t->label)) {
+        gchar *h = fmt_size(*sz);
+        gchar *s = g_strdup_printf("%s (%'" G_GINT64_FORMAT " bytes)", h, *sz);
+        gtk_label_set_text(GTK_LABEL(t->label), s);
+        g_free(s); g_free(h);
+    }
+    g_free(sz);
+}
+
+static void grid_row(GtkWidget *grid, int row, const char *key, GtkWidget *val)
+{
+    GtkWidget *k = gtk_label_new(key);
+    gtk_widget_set_halign(k, GTK_ALIGN_END);
+    gtk_widget_add_css_class(k, "dim-label");
+    gtk_widget_set_halign(val, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), k,   0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), val, 1, row, 1, 1);
+}
+
+static GtkWidget *sel_label(const char *text)
+{
+    GtkWidget *l = gtk_label_new(text);
+    gtk_label_set_selectable(GTK_LABEL(l), TRUE);
+    gtk_label_set_ellipsize(GTK_LABEL(l), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars(GTK_LABEL(l), 50);
+    return l;
+}
+
+void fo_properties(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    gchar *name = panel_cursor_name(p);
+    if (!name || strcmp(name, "..") == 0) { g_free(name); return; }
+
+    gchar *path;
+    guint  mode = 0;
+    gint64 size = 0, mtime = 0;
+    gboolean is_dir = FALSE, is_link = FALSE, have = FALSE;
+    gchar *owner = NULL, *link_target = NULL;
+
+#ifdef HAVE_LIBSSH2
+    if (p->ssh_conn) {
+        path = fs_remote_join(p->ssh_conn->remote_path, name);
+        if (ssh_conn_trylock(p->ssh_conn)) {
+            LIBSSH2_SFTP_ATTRIBUTES a;
+            if (libssh2_sftp_lstat(p->ssh_conn->sftp, path, &a) == 0) {
+                have = TRUE;
+                mode    = a.permissions;
+                size    = (gint64)a.filesize;
+                mtime   = (gint64)a.mtime;
+                is_dir  = LIBSSH2_SFTP_S_ISDIR(a.permissions);
+                is_link = LIBSSH2_SFTP_S_ISLNK(a.permissions);
+                owner   = g_strdup_printf("%lu:%lu", a.uid, a.gid);
+                if (is_link) {
+                    char buf[4096];
+                    int n = libssh2_sftp_readlink(p->ssh_conn->sftp, path, buf, sizeof(buf) - 1);
+                    if (n >= 0) { buf[n] = '\0'; link_target = g_strdup(buf); }
+                }
+            }
+            ssh_conn_unlock(p->ssh_conn);
+        }
+    } else
+#endif
+    {
+        path = panel_cursor_fullpath(p);
+        struct stat st;
+        if (path && lstat(path, &st) == 0) {
+            have = TRUE;
+            mode    = st.st_mode;
+            size    = st.st_size;
+            mtime   = st.st_mtime;
+            is_dir  = S_ISDIR(st.st_mode);
+            is_link = S_ISLNK(st.st_mode);
+            struct passwd *pw = getpwuid(st.st_uid);
+            struct group  *gr = getgrgid(st.st_gid);
+            owner = g_strdup_printf("%s : %s",
+                                    pw ? pw->pw_name : "?", gr ? gr->gr_name : "?");
+            if (is_link) link_target = g_file_read_link(path, NULL);
+        }
+    }
+    if (!have) {
+        fm_status(fm, "Cannot read properties of %s", name);
+        g_free(name); g_free(path);
+        return;
+    }
+
+    DlgCtx ctx;
+    dlg_ctx_init(&ctx);
+    GtkWidget *dlg = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dlg), "Properties");
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 420, -1);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_start(vbox, 16);
     gtk_widget_set_margin_end(vbox, 16);
     gtk_widget_set_margin_top(vbox, 14);
     gtk_widget_set_margin_bottom(vbox, 14);
 
-    pd->phase_lbl = gtk_label_new(title);
-    gtk_widget_set_halign(pd->phase_lbl, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(pd->phase_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    int row = 0;
 
-    pd->file_lbl = gtk_label_new("");
-    gtk_widget_set_halign(pd->file_lbl, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(pd->file_lbl), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_widget_add_css_class(pd->file_lbl, "dim-label");
+    grid_row(grid, row++, "Name:", sel_label(name));
+    gchar *loc = g_path_get_dirname(path);
+    grid_row(grid, row++, "Location:", sel_label(loc));
+    g_free(loc);
+    grid_row(grid, row++, "Type:", gtk_label_new(is_link ? "Symbolic link"
+                                               : is_dir ? "Directory" : "File"));
+    if (link_target) grid_row(grid, row++, "Target:", sel_label(link_target));
 
-    pd->bar = gtk_progress_bar_new();
-    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(pd->bar), FALSE);
-    gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(pd->bar), 0.03);
-
-    pd->detail_lbl = gtk_label_new("");
-    gtk_widget_set_halign(pd->detail_lbl, GTK_ALIGN_START);
-    gtk_label_set_ellipsize(GTK_LABEL(pd->detail_lbl), PANGO_ELLIPSIZE_END);
-
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    gtk_widget_set_halign(cancel_btn, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(cancel_btn, 4);
-    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_progress_cancel), pd);
-
-    gtk_box_append(GTK_BOX(vbox), pd->phase_lbl);
-    gtk_box_append(GTK_BOX(vbox), pd->file_lbl);
-    gtk_box_append(GTK_BOX(vbox), pd->bar);
-    gtk_box_append(GTK_BOX(vbox), pd->detail_lbl);
-    gtk_box_append(GTK_BOX(vbox), cancel_btn);
-    gtk_window_set_child(GTK_WINDOW(pd->window), vbox);
-
-    pd->determinate = FALSE;
-    pd->cancelled   = FALSE;
-    pd->start_time  = g_get_monotonic_time();
-
-    /* Auto-pulse every 80ms — keeps the bar animated during blocking work */
-    pd->pulse_id = g_timeout_add(80, pulse_tick, pd);
-
-    gtk_window_present(GTK_WINDOW(pd->window));
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-    return pd;
-}
-
-static void progress_set_phase(ProgressDlg *pd, const char *phase)
-{
-    gtk_label_set_text(GTK_LABEL(pd->phase_lbl), phase);
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-}
-
-static void progress_set_file(ProgressDlg *pd, const char *name)
-{
-    gtk_label_set_text(GTK_LABEL(pd->file_lbl), name ? name : "");
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-}
-
-static void progress_set_total(ProgressDlg *pd, gint64 total)
-{
-    pd->total_bytes = total;
-    pd->done_bytes  = 0;
-    pd->determinate = TRUE;
-    pd->start_time  = g_get_monotonic_time();
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), 0.0);
-    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(pd->bar), TRUE);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), "0 %");
-}
-
-static void progress_tick(ProgressDlg *pd, gint64 chunk)
-{
-    pd->done_bytes += chunk;
-    double frac = pd->total_bytes > 0
-                  ? (double)pd->done_bytes / pd->total_bytes : 0.0;
-    frac = CLAMP(frac, 0.0, 1.0);
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), frac);
-
-    gchar *pct = g_strdup_printf("%.0f %%", frac * 100.0);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), pct);
-    g_free(pct);
-
-    /* Speed + transferred / total */
-    gchar *s_done  = fmt_size(pd->done_bytes);
-    gchar *s_total = fmt_size(pd->total_bytes);
-    gint64 elapsed = g_get_monotonic_time() - pd->start_time;
-    if (elapsed > 500000) {  /* show speed after 0.5s */
-        double speed = (double)pd->done_bytes / (elapsed / 1e6);
-        gchar *s_speed = fmt_size((goffset)speed);
-        gchar *detail = g_strdup_printf("%s / %s  —  %s/s", s_done, s_total, s_speed);
-        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
-        g_free(detail); g_free(s_speed);
+    GtkWidget *size_lbl;
+    SizeTask *st_task = NULL;
+    GTask    *size_task = NULL;      /* kept alive so st_task stays valid */
+    if (is_dir && !p->ssh_conn) {
+        size_lbl = gtk_label_new("calculating…");
+        st_task = g_new0(SizeTask, 1);
+        st_task->path  = g_strdup(path);
+        st_task->label = g_object_ref(size_lbl);
+        size_task = g_task_new(NULL, NULL, size_done, NULL);
+        g_task_set_task_data(size_task, st_task, size_task_free);
+        g_task_run_in_thread(size_task, size_thread);
+    } else if (is_dir) {
+        size_lbl = gtk_label_new("–");
     } else {
-        gchar *detail = g_strdup_printf("%s / %s", s_done, s_total);
-        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
-        g_free(detail);
+        gchar *h = fmt_size(size);
+        gchar *s = g_strdup_printf("%s (%'" G_GINT64_FORMAT " bytes)", h, size);
+        size_lbl = gtk_label_new(s);
+        g_free(s); g_free(h);
     }
-    g_free(s_done); g_free(s_total);
+    grid_row(grid, row++, "Size:", size_lbl);
 
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-}
+    gchar *ds = fmt_date(mtime);
+    grid_row(grid, row++, "Modified:", gtk_label_new(ds));
+    g_free(ds);
+    grid_row(grid, row++, "Owner:", gtk_label_new(owner ? owner : "?"));
+    gtk_box_append(GTK_BOX(vbox), grid);
 
-static void progress_pulse(ProgressDlg *pd, const char *detail)
-{
-    if (pd->determinate) return;
-    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(pd->bar));
-    if (detail)
-        gtk_label_set_text(GTK_LABEL(pd->detail_lbl), detail);
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-}
-
-static void progress_finish(ProgressDlg *pd)
-{
-    pd->determinate = TRUE;   /* stop auto-pulse from overwriting */
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pd->bar), 1.0);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(pd->bar), "100 %");
-    progress_set_phase(pd, "Done");
-}
-
-static void progress_free(ProgressDlg *pd)
-{
-    if (pd->pulse_id) g_source_remove(pd->pulse_id);
-    gtk_window_destroy(GTK_WINDOW(pd->window));
-    g_free(pd);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Low-level helpers with byte-level progress
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    ProgressDlg *pd;
-    gint64       total_bytes;
-    gint64       done_bytes;
-    const char  *current_name;
-} CopyProgress;
-
-static void cp_tick(CopyProgress *cp, gint64 chunk)
-{
-    if (!cp || !cp->pd) return;
-    cp->done_bytes += chunk;
-    progress_set_file(cp->pd, cp->current_name);
-    progress_tick(cp->pd, chunk);
-}
-
-/* Shared scan counter — pumps GTK events every N files so the pulse
- * timer keeps the progress bar animated during size calculation. */
-static int scan_counter;
-
-static gint64 calc_size_r(const char *path, ProgressDlg *pd)
-{
-    if (pd && pd->cancelled) return 0;
-
-    struct stat st;
-    if (lstat(path, &st) != 0) return 0;
-    if (!S_ISDIR(st.st_mode)) {
-        if (pd && (++scan_counter & 127) == 0)
-            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-        return st.st_size;
-    }
-
-    gint64 total = 0;
-    DIR *dir = opendir(path);
-    if (!dir) return 0;
-    struct dirent *de;
-    char sub[4096];
-    while ((de = readdir(dir)) != NULL) {
-        if (pd && pd->cancelled) break;
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        g_snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-        total += calc_size_r(sub, pd);
-    }
-    closedir(dir);
-    return total;
-}
-
-/* Cancel return code — distinguishable from I/O errors */
-#define ERR_CANCELLED 2
-
-static int copy_file(const char *src, const char *dst, CopyProgress *cp)
-{
-    int fin = open(src, O_RDONLY | O_NOFOLLOW);
-    if (fin < 0) return -1;
-
-    struct stat st;
-    if (fstat(fin, &st) != 0) { close(fin); return -1; }
-
-    int fout = open(dst, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
-    if (fout < 0) { close(fin); return -1; }
-
-    char *buf = g_malloc(COPY_BUF);
-    ssize_t n;
-    int err = 0;
-    while ((n = read(fin, buf, COPY_BUF)) > 0) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        ssize_t w = 0;
-        while (w < n) {
-            ssize_t r = write(fout, buf + w, (size_t)(n - w));
-            if (r < 0) { err = -1; break; }
-            w += r;
+    /* permissions grid: rows owner/group/others, cols r/w/x */
+    PermUi pu;
+    GtkWidget *pgrid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(pgrid), 10);
+    gtk_grid_set_row_spacing(GTK_GRID(pgrid), 2);
+    static const char *who[] = { "Owner", "Group", "Others" };
+    static const char *what[] = { "Read", "Write", "Execute" };
+    for (int c = 0; c < 3; c++)
+        gtk_grid_attach(GTK_GRID(pgrid), gtk_label_new(what[c]), c + 1, 0, 1, 1);
+    for (int r = 0; r < 3; r++) {
+        GtkWidget *wl = gtk_label_new(who[r]);
+        gtk_widget_set_halign(wl, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(pgrid), wl, 0, r + 1, 1, 1);
+        for (int c = 0; c < 3; c++) {
+            int i = r * 3 + c;
+            pu.checks[i] = gtk_check_button_new();
+            gtk_widget_set_halign(pu.checks[i], GTK_ALIGN_CENTER);
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(pu.checks[i]),
+                                        (mode >> (8 - i)) & 1);
+            gtk_widget_set_sensitive(pu.checks[i], !is_link);
+            gtk_grid_attach(GTK_GRID(pgrid), pu.checks[i], c + 1, r + 1, 1, 1);
         }
-        if (err) break;
-        cp_tick(cp, n);
     }
-    if (n < 0 && !err) err = -1;
-    g_free(buf);
-    close(fin);
-    close(fout);
-    if (err == ERR_CANCELLED) unlink(dst);   /* clean up partial file */
-    return err;
-}
+    pu.octal = gtk_label_new(NULL);
+    on_perm_toggled(NULL, &pu);
+    for (int i = 0; i < 9; i++)
+        g_signal_connect(pu.checks[i], "toggled", G_CALLBACK(on_perm_toggled), &pu);
+    gtk_grid_attach(GTK_GRID(pgrid), pu.octal, 4, 1, 1, 1);
 
-static int copy_dir_r(const char *src, const char *dst, CopyProgress *cp)
-{
-    if (mkdir(dst, 0755) != 0 && errno != EEXIST) return -1;
+    GtkWidget *pframe = gtk_frame_new("Permissions");
+    gtk_widget_set_margin_top(pgrid, 6);
+    gtk_widget_set_margin_bottom(pgrid, 6);
+    gtk_widget_set_margin_start(pgrid, 8);
+    gtk_frame_set_child(GTK_FRAME(pframe), pgrid);
+    gtk_box_append(GTK_BOX(vbox), pframe);
 
-    DIR *dir = opendir(src);
-    if (!dir) return -1;
+    GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(bb, GTK_ALIGN_END);
+    GtkWidget *close_btn = gtk_button_new_with_label("Close");
+    GtkWidget *apply_btn = gtk_button_new_with_label("Apply");
+    gtk_widget_add_css_class(apply_btn, "suggested-action");
+    gtk_widget_set_sensitive(apply_btn, !is_link);
+    gtk_box_append(GTK_BOX(bb), close_btn);
+    gtk_box_append(GTK_BOX(bb), apply_btn);
+    gtk_box_append(GTK_BOX(vbox), bb);
+    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
 
-    struct dirent *de;
-    char sp[4096], dp[4096];
-    struct stat st;
-    int err = 0;
+    g_signal_connect(apply_btn, "clicked",       G_CALLBACK(dlg_ctx_ok),     &ctx);
+    g_signal_connect(close_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel), &ctx);
+    g_signal_connect(dlg,       "close-request", G_CALLBACK(dlg_ctx_close),  &ctx);
+    gtk_window_present(GTK_WINDOW(dlg));
 
-    while ((de = readdir(dir)) != NULL && !err) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        g_snprintf(sp, sizeof(sp), "%s/%s", src, de->d_name);
-        g_snprintf(dp, sizeof(dp), "%s/%s", dst, de->d_name);
-        if (lstat(sp, &st) != 0) continue;
-        err = S_ISDIR(st.st_mode) ? copy_dir_r(sp, dp, cp) : copy_file(sp, dp, cp);
-    }
-    closedir(dir);
-    return err;
-}
-
-static int delete_r(const char *path, ProgressDlg *pd, int *del_count)
-{
-    if (pd && pd->cancelled) return ERR_CANCELLED;
-
-    struct stat st;
-    if (lstat(path, &st) != 0) return -1;
-    if (!S_ISDIR(st.st_mode)) {
-        int r = unlink(path);
-        if (pd && del_count) {
-            (*del_count)++;
-            if (*del_count % 50 == 0) {
-                gchar *msg = g_strdup_printf("Deleted: %d files", *del_count);
-                progress_pulse(pd, msg);
-                g_free(msg);
-            }
-        }
-        return r;
-    }
-
-    DIR *dir = opendir(path);
-    if (!dir) return -1;
-
-    struct dirent *de;
-    char sub[4096];
-    int err = 0;
-    while ((de = readdir(dir)) != NULL && !err) {
-        if (pd && pd->cancelled) { err = ERR_CANCELLED; break; }
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        g_snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-        err = delete_r(sub, pd, del_count);
-    }
-    closedir(dir);
-    if (err == ERR_CANCELLED) return err;
-    return rmdir(path);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  SFTP transfer helpers (only compiled with libssh2)
- * ─────────────────────────────────────────────────────────────────── */
-
+    if (dlg_ctx_run(&ctx) == 1) {
+        guint nm = (mode & ~0777u) | perm_bits(&pu);
+        gboolean ok = FALSE;
 #ifdef HAVE_LIBSSH2
-
-static int sftp_upload(SshConn *conn, const char *local_path,
-                        const char *remote_path, CopyProgress *cp)
-{
-    if (!conn || !conn->sftp) return -1;
-
-    int fin = open(local_path, O_RDONLY);
-    if (fin < 0) return -1;
-
-    LIBSSH2_SFTP_HANDLE *fout = libssh2_sftp_open(conn->sftp, remote_path,
-        LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
-        LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
-        LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
-    if (!fout) { close(fin); return -1; }
-
-    char *buf = g_malloc(COPY_BUF);
-    ssize_t n;
-    int err = 0;
-    while ((n = read(fin, buf, COPY_BUF)) > 0) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        ssize_t w = 0;
-        while (w < n) {
-            ssize_t r = libssh2_sftp_write(fout, buf + w, (size_t)(n - w));
-            if (r < 0) { err = -1; break; }
-            w += r;
-        }
-        if (err) break;
-        cp_tick(cp, n);
-    }
-    if (n < 0 && !err) err = -1;
-    g_free(buf);
-    close(fin);
-    libssh2_sftp_close(fout);
-    return err;
-}
-
-static int sftp_download(SshConn *conn, const char *remote_path,
-                          const char *local_path, CopyProgress *cp)
-{
-    if (!conn || !conn->sftp) return -1;
-
-    LIBSSH2_SFTP_HANDLE *fin = libssh2_sftp_open(conn->sftp, remote_path,
-        LIBSSH2_FXF_READ, 0);
-    if (!fin) return -1;
-
-    int fout = open(local_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fout < 0) { libssh2_sftp_close(fin); return -1; }
-
-    char *buf = g_malloc(COPY_BUF);
-    ssize_t n;
-    int err = 0;
-    while ((n = libssh2_sftp_read(fin, buf, COPY_BUF)) > 0) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        ssize_t w = 0;
-        while (w < n) {
-            ssize_t r = write(fout, buf + w, (size_t)(n - w));
-            if (r < 0) { err = -1; break; }
-            w += r;
-        }
-        if (err) break;
-        cp_tick(cp, n);
-    }
-    if (n < 0 && !err) err = -1;
-    g_free(buf);
-    libssh2_sftp_close(fin);
-    close(fout);
-    if (err == ERR_CANCELLED) unlink(local_path);
-    return err;
-}
-
-/* Recursive SFTP size calculation for progress */
-static gint64 sftp_calc_size_r(SshConn *conn, const char *remote_path,
-                                ProgressDlg *pd)
-{
-    if (pd && pd->cancelled) return 0;
-
-    LIBSSH2_SFTP_ATTRIBUTES a;
-    if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return 0;
-    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions)) {
-        if (pd && (++scan_counter & 63) == 0)
-            while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-        return (gint64)a.filesize;
-    }
-
-    gint64 total = 0;
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
-    if (!handle) return 0;
-
-    char name[512];
-    char longentry[512];
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
-                                    longentry, sizeof(longentry), &attrs) > 0) {
-        if (pd && pd->cancelled) break;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-        gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
-        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-            LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
-            total += sftp_calc_size_r(conn, sub, pd);
-        else if (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
-            total += (gint64)attrs.filesize;
-        g_free(sub);
-    }
-    libssh2_sftp_closedir(handle);
-    return total;
-}
-
-/* Recursive SFTP upload (local dir → remote dir) */
-static int sftp_upload_dir_r(SshConn *conn, const char *local_path,
-                              const char *remote_path, CopyProgress *cp)
-{
-    /* Create remote directory (ignore if exists) */
-    libssh2_sftp_mkdir(conn->sftp, remote_path,
-        LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP |
-        LIBSSH2_SFTP_S_IXGRP | LIBSSH2_SFTP_S_IROTH |
-        LIBSSH2_SFTP_S_IXOTH);
-
-    DIR *dir = opendir(local_path);
-    if (!dir) return -1;
-
-    struct dirent *de;
-    struct stat st;
-    int err = 0;
-
-    while ((de = readdir(dir)) != NULL && !err) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-            continue;
-        gchar *lp = g_build_filename(local_path, de->d_name, NULL);
-        gchar *rp = g_strdup_printf("%s/%s", remote_path, de->d_name);
-        if (lstat(lp, &st) == 0) {
-            err = S_ISDIR(st.st_mode)
-                ? sftp_upload_dir_r(conn, lp, rp, cp)
-                : sftp_upload(conn, lp, rp, cp);
-        }
-        g_free(lp); g_free(rp);
-    }
-    closedir(dir);
-    return err;
-}
-
-/* Recursive SFTP download (remote dir → local dir) */
-static int sftp_download_dir_r(SshConn *conn, const char *remote_path,
-                                const char *local_path, CopyProgress *cp)
-{
-    if (mkdir(local_path, 0755) != 0 && errno != EEXIST) return -1;
-
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
-    if (!handle) return -1;
-
-    char name[512];
-    char longentry[512];
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    int err = 0;
-
-    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
-                                    longentry, sizeof(longentry), &attrs) > 0 && !err) {
-        if (cp && cp->pd && cp->pd->cancelled) { err = ERR_CANCELLED; break; }
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-        gchar *rp = g_strdup_printf("%s/%s", remote_path, name);
-        gchar *lp = g_build_filename(local_path, name, NULL);
-        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-            LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
-            err = sftp_download_dir_r(conn, rp, lp, cp);
-        else
-            err = sftp_download(conn, rp, lp, cp);
-        g_free(rp); g_free(lp);
-    }
-    libssh2_sftp_closedir(handle);
-    return err;
-}
-
-/* Recursive SFTP delete */
-static int sftp_delete_r(SshConn *conn, const char *remote_path,
-                          ProgressDlg *pd, int *del_count)
-{
-    if (pd && pd->cancelled) return ERR_CANCELLED;
-
-    LIBSSH2_SFTP_ATTRIBUTES a;
-    if (libssh2_sftp_stat(conn->sftp, remote_path, &a) != 0) return -1;
-
-    if (!LIBSSH2_SFTP_S_ISDIR(a.permissions)) {
-        int r = libssh2_sftp_unlink(conn->sftp, remote_path);
-        if (pd && del_count) {
-            (*del_count)++;
-            if (*del_count % 50 == 0) {
-                gchar *msg = g_strdup_printf("Deleted: %d files", *del_count);
-                progress_pulse(pd, msg);
-                g_free(msg);
+        if (p->ssh_conn) {
+            if (ssh_conn_trylock(p->ssh_conn)) {
+                LIBSSH2_SFTP_ATTRIBUTES a = { 0 };
+                a.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
+                a.permissions = nm;
+                ok = libssh2_sftp_setstat(p->ssh_conn->sftp, path, &a) == 0;
+                ssh_conn_unlock(p->ssh_conn);
             }
-        }
-        return r;
+        } else
+#endif
+        ok = chmod(path, nm & 07777) == 0;
+        if (ok) { fm_status(fm, "Permissions of %s set to %03o", name, nm & 0777); panel_reload(p); }
+        else      fm_status(fm, "Cannot change permissions of %s", name);
     }
-
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, remote_path);
-    if (!handle) return -1;
-
-    char name[512];
-    char longentry[512];
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    int err = 0;
-
-    while (libssh2_sftp_readdir_ex(handle, name, sizeof(name),
-                                    longentry, sizeof(longentry), &attrs) > 0 && !err) {
-        if (pd && pd->cancelled) { err = ERR_CANCELLED; break; }
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-        gchar *sub = g_strdup_printf("%s/%s", remote_path, name);
-        err = sftp_delete_r(conn, sub, pd, del_count);
-        g_free(sub);
+    if (size_task) {
+        fs_cancel(&st_task->ctx);                /* stop the size walk */
+        g_object_unref(size_task);
     }
-    libssh2_sftp_closedir(handle);
-    if (err == ERR_CANCELLED) return err;
-    return libssh2_sftp_rmdir(conn->sftp, remote_path);
+    gtk_window_destroy(GTK_WINDOW(dlg));
+
+    g_free(owner); g_free(link_target);
+    g_free(name); g_free(path);
+    refocus(p);
 }
-
-#endif /* HAVE_LIBSSH2 */
 
 /* ─────────────────────────────────────────────────────────────────── *
- *  Browse-button callback (GtkFileDialog async)
+ *  Browse-button callback (GtkFileDialog async) – shared
  * ─────────────────────────────────────────────────────────────────── */
 
 static void on_browse_done(GObject *source, GAsyncResult *res, gpointer user_data)
@@ -604,7 +983,7 @@ void on_browse_clicked(GtkButton *btn, gpointer user_data)
     gtk_file_dialog_set_title(fd, "Select destination directory");
 
     const char *cur = gtk_editable_get_text(GTK_EDITABLE(entry));
-    if (cur && cur[0]) {
+    if (cur && cur[0] == '/' && g_file_test(cur, G_FILE_TEST_IS_DIR)) {
         GFile *f = g_file_new_for_path(cur);
         gtk_file_dialog_set_initial_folder(fd, f);
         g_object_unref(f);
@@ -614,1232 +993,4 @@ void on_browse_clicked(GtkButton *btn, gpointer user_data)
     gtk_file_dialog_select_folder(fd, GTK_WINDOW(toplevel), NULL,
                                    on_browse_done, entry);
     g_object_unref(fd);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Destination dialog (copy / move)
- * ─────────────────────────────────────────────────────────────────── */
-
-static gchar *ask_destination(FM *fm, const char *title, const char *default_dst,
-                              GList *files)
-{
-    DlgCtx ctx;
-    dlg_ctx_init(&ctx);
-
-    GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), title);
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 460, -1);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(vbox, 12);
-    gtk_widget_set_margin_end(vbox, 12);
-    gtk_widget_set_margin_top(vbox, 12);
-    gtk_widget_set_margin_bottom(vbox, 12);
-
-    /* File list */
-    if (files) {
-        int n = g_list_length(files);
-        gchar *files_hdr = g_strdup_printf("Files (%d):", n);
-        GtkWidget *flbl = gtk_label_new(files_hdr);
-        g_free(files_hdr);
-        gtk_widget_set_halign(flbl, GTK_ALIGN_START);
-        gtk_box_append(GTK_BOX(vbox), flbl);
-
-        GtkWidget *sw = gtk_scrolled_window_new();
-        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
-            GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-        int vis_h = (n <= 6) ? -1 : 120;
-        gtk_widget_set_size_request(sw, -1, vis_h);
-        if (n > 6) gtk_scrolled_window_set_min_content_height(
-            GTK_SCROLLED_WINDOW(sw), 120);
-
-        GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        for (GList *l = files; l; l = l->next) {
-            GtkWidget *row = gtk_label_new((const char *)l->data);
-            gtk_widget_set_halign(row, GTK_ALIGN_START);
-            gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
-            gtk_widget_add_css_class(row, "dim-label");
-            gtk_box_append(GTK_BOX(fbox), row);
-        }
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
-        gtk_box_append(GTK_BOX(vbox), sw);
-    }
-
-    GtkWidget *lbl = gtk_label_new("Destination directory:");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-
-    GtkWidget *entry = gtk_entry_new();
-    if (default_dst) gtk_editable_set_text(GTK_EDITABLE(entry), default_dst);
-    gtk_widget_set_size_request(entry, 380, -1);
-    gtk_widget_set_hexpand(entry, TRUE);
-
-    GtkWidget *browse = gtk_button_new_with_label("...");
-    gtk_widget_set_tooltip_text(browse, "Select directory");
-    g_signal_connect(browse, "clicked", G_CALLBACK(on_browse_clicked), entry);
-
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_append(GTK_BOX(hbox), entry);
-    gtk_box_append(GTK_BOX(hbox), browse);
-
-    /* Buttons */
-    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(btn_box, 8);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    GtkWidget *ok_btn     = gtk_button_new_with_label("OK");
-    gtk_widget_add_css_class(ok_btn, "suggested-action");
-    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
-    gtk_box_append(GTK_BOX(btn_box), ok_btn);
-
-    gtk_box_append(GTK_BOX(vbox), lbl);
-    gtk_box_append(GTK_BOX(vbox), hbox);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
-    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
-
-    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),       &ctx);
-    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel),   &ctx);
-    g_signal_connect(entry,      "activate",      G_CALLBACK(dlg_ctx_entry_ok), &ctx);
-    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),    &ctx);
-
-    gtk_window_present(GTK_WINDOW(dlg));
-
-    gchar *result = NULL;
-    if (dlg_ctx_run(&ctx) == 1) {
-        const gchar *txt = gtk_editable_get_text(GTK_EDITABLE(entry));
-        if (txt && txt[0]) result = g_strdup(txt);
-    }
-    gtk_window_destroy(GTK_WINDOW(dlg));
-    return result;
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Copy
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_copy(FM *fm)
-{
-    Panel *src = active_panel(fm);
-    Panel *dst = other_panel(fm);
-
-    GList *targets = panel_selection(src);
-    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
-
-    const char *default_dst =
-#ifdef HAVE_LIBSSH2
-        (dst->ssh_conn ? dst->ssh_conn->remote_path : dst->cwd);
-#else
-        dst->cwd;
-#endif
-    gchar *dest = ask_destination(fm, "Copy to", default_dst, targets);
-    if (!dest) { g_list_free_full(targets, g_free); return; }
-
-    int ok = 0, fail = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Copying");
-    progress_set_phase(pd, "Calculating size…");
-
-    /* Pre-calculate total bytes for progress */
-    gint64 total_bytes = 0;
-    scan_counter = 0;
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn) {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
-                                        (const char *)l->data);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += sftp_calc_size_r(src->ssh_conn, rp, pd);
-            g_free(rp);
-        }
-        /* Remote→Remote: bytes are transferred twice (download + upload) */
-        if (dst->ssh_conn) total_bytes *= 2;
-    } else if (dst->ssh_conn) {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += calc_size_r(sp, pd);
-            g_free(sp);
-        }
-    } else
-#endif
-    {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += calc_size_r(sp, pd);
-            g_free(sp);
-        }
-    }
-
-    if (pd->cancelled) goto copy_done;
-
-    progress_set_phase(pd, "Copying…");
-    progress_set_total(pd, total_bytes);
-
-    CopyProgress cp = { .pd = pd, .total_bytes = total_bytes, .done_bytes = 0 };
-
-    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-        const char *name = l->data;
-        if (!name_is_safe(name)) { fail++; continue; }
-        cp.current_name = name;
-        progress_set_file(pd, name);
-
-        int r = -1;
-
-#ifdef HAVE_LIBSSH2
-        if (src->ssh_conn && dst->ssh_conn) {
-            /* Remote→Remote: download to temp, then upload */
-            gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
-            if (!tmpdir) { fail++; continue; }
-            gchar *rp_src = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
-            gchar *lp_tmp = g_build_filename(tmpdir, name, NULL);
-            gchar *rp_dst = g_strdup_printf("%s/%s", dest, name);
-            LIBSSH2_SFTP_ATTRIBUTES ra;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp_src, &ra) == 0 &&
-                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
-                r = sftp_download_dir_r(src->ssh_conn, rp_src, lp_tmp, &cp);
-            else
-                r = sftp_download(src->ssh_conn, rp_src, lp_tmp, &cp);
-            if (r == 0) {
-                struct stat tst;
-                if (lstat(lp_tmp, &tst) == 0 && S_ISDIR(tst.st_mode))
-                    r = sftp_upload_dir_r(dst->ssh_conn, lp_tmp, rp_dst, &cp);
-                else
-                    r = sftp_upload(dst->ssh_conn, lp_tmp, rp_dst, &cp);
-            }
-            /* clean up temp – delete contents then directory */
-            delete_r(lp_tmp, NULL, NULL);
-            delete_r(tmpdir, NULL, NULL);
-            g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
-        } else if (src->ssh_conn) {
-            gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
-            gchar *lp = g_build_filename(dest, name, NULL);
-            LIBSSH2_SFTP_ATTRIBUTES ra;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &ra) == 0 &&
-                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
-                r = sftp_download_dir_r(src->ssh_conn, rp, lp, &cp);
-            else
-                r = sftp_download(src->ssh_conn, rp, lp, &cp);
-            g_free(rp); g_free(lp);
-        } else if (dst->ssh_conn) {
-            gchar *lp = g_build_filename(src->cwd, name, NULL);
-            gchar *rp = g_strdup_printf("%s/%s", dest, name);
-            struct stat ust;
-            if (lstat(lp, &ust) == 0 && S_ISDIR(ust.st_mode))
-                r = sftp_upload_dir_r(dst->ssh_conn, lp, rp, &cp);
-            else
-                r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
-            g_free(lp); g_free(rp);
-        } else
-#endif
-        {
-            gchar *sp = g_build_filename(src->cwd, name, NULL);
-            gchar *dp = g_build_filename(dest,     name, NULL);
-            struct stat st;
-            r = (lstat(sp, &st) == 0 && S_ISDIR(st.st_mode))
-                ? copy_dir_r(sp, dp, &cp) : copy_file(sp, dp, &cp);
-            g_free(sp); g_free(dp);
-        }
-
-        if (r == 0) ok++; else if (r != ERR_CANCELLED) fail++;
-    }
-
-copy_done:
-    progress_finish(pd);
-    {   gboolean was_cancelled = pd->cancelled;
-        progress_free(pd);
-        g_list_free_full(targets, g_free);
-        g_free(dest);
-
-        fm_status(fm, was_cancelled ? "Copy cancelled (%d copied, %d errors)"
-                                    : "Copied: %d  errors: %d", ok, fail);
-    }
-    if (src->marks) g_hash_table_remove_all(src->marks);
-
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn && fail > 0) {
-        LIBSSH2_SFTP_ATTRIBUTES a;
-        if (libssh2_sftp_stat(src->ssh_conn->sftp, src->ssh_conn->remote_path, &a) != 0) {
-            ssh_panel_close(src);
-            panel_reload(dst);
-            return;
-        }
-    }
-    if (dst->ssh_conn && fail > 0) {
-        LIBSSH2_SFTP_ATTRIBUTES a;
-        if (libssh2_sftp_stat(dst->ssh_conn->sftp, dst->ssh_conn->remote_path, &a) != 0) {
-            ssh_panel_close(dst);
-            panel_reload(src);
-            return;
-        }
-    }
-#endif
-
-    panel_reload(src);
-    panel_reload(dst);
-
-    /* Restore focus to active panel */
-    src->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(src->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Move
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_move(FM *fm)
-{
-    Panel *src = active_panel(fm);
-    Panel *dst = other_panel(fm);
-
-    GList *targets = panel_selection(src);
-    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
-
-    const char *default_dst =
-#ifdef HAVE_LIBSSH2
-        (dst->ssh_conn ? dst->ssh_conn->remote_path : dst->cwd);
-#else
-        dst->cwd;
-#endif
-    gchar *dest = ask_destination(fm, "Move to", default_dst, targets);
-    if (!dest) { g_list_free_full(targets, g_free); return; }
-
-    int ok = 0, fail = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Moving");
-    progress_set_phase(pd, "Calculating size…");
-
-    /* Pre-calculate total bytes for progress */
-    gint64 total_bytes = 0;
-    scan_counter = 0;
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn) {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path,
-                                        (const char *)l->data);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += sftp_calc_size_r(src->ssh_conn, rp, pd);
-            g_free(rp);
-        }
-        if (dst->ssh_conn) total_bytes *= 2;
-    } else if (dst->ssh_conn) {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += calc_size_r(sp, pd);
-            g_free(sp);
-        }
-    } else
-#endif
-    {
-        for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-            gchar *sp = g_build_filename(src->cwd, (const char *)l->data, NULL);
-            progress_set_file(pd, (const char *)l->data);
-            total_bytes += calc_size_r(sp, pd);
-            g_free(sp);
-        }
-    }
-
-    if (pd->cancelled) goto move_done;
-
-    progress_set_phase(pd, "Moving…");
-    progress_set_total(pd, total_bytes);
-
-    CopyProgress cp = { .pd = pd, .total_bytes = total_bytes, .done_bytes = 0 };
-
-    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-        const char *name = l->data;
-        if (!name_is_safe(name)) { fail++; continue; }
-        cp.current_name = name;
-        progress_set_file(pd, name);
-
-        int r = -1;
-
-#ifdef HAVE_LIBSSH2
-        if (src->ssh_conn && dst->ssh_conn) {
-            /* Remote→Remote: download to temp, upload, delete source */
-            gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
-            if (!tmpdir) { fail++; continue; }
-            gchar *rp_src = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
-            gchar *lp_tmp = g_build_filename(tmpdir, name, NULL);
-            gchar *rp_dst = g_strdup_printf("%s/%s", dest, name);
-            LIBSSH2_SFTP_ATTRIBUTES ra;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp_src, &ra) == 0 &&
-                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
-                r = sftp_download_dir_r(src->ssh_conn, rp_src, lp_tmp, &cp);
-            else
-                r = sftp_download(src->ssh_conn, rp_src, lp_tmp, &cp);
-            if (r == 0) {
-                struct stat tst;
-                if (lstat(lp_tmp, &tst) == 0 && S_ISDIR(tst.st_mode))
-                    r = sftp_upload_dir_r(dst->ssh_conn, lp_tmp, rp_dst, &cp);
-                else
-                    r = sftp_upload(dst->ssh_conn, lp_tmp, rp_dst, &cp);
-            }
-            if (r == 0)
-                sftp_delete_r(src->ssh_conn, rp_src, NULL, NULL);
-            delete_r(lp_tmp, NULL, NULL);
-            delete_r(tmpdir, NULL, NULL);
-            g_free(rp_src); g_free(lp_tmp); g_free(rp_dst); g_free(tmpdir);
-        } else if (src->ssh_conn) {
-            gchar *rp = g_strdup_printf("%s/%s", src->ssh_conn->remote_path, name);
-            gchar *lp = g_build_filename(dest, name, NULL);
-            LIBSSH2_SFTP_ATTRIBUTES ra;
-            if (libssh2_sftp_stat(src->ssh_conn->sftp, rp, &ra) == 0 &&
-                LIBSSH2_SFTP_S_ISDIR(ra.permissions))
-                r = sftp_download_dir_r(src->ssh_conn, rp, lp, &cp);
-            else
-                r = sftp_download(src->ssh_conn, rp, lp, &cp);
-            if (r == 0)
-                sftp_delete_r(src->ssh_conn, rp, NULL, NULL);
-            g_free(rp); g_free(lp);
-        } else if (dst->ssh_conn) {
-            gchar *lp = g_build_filename(src->cwd, name, NULL);
-            gchar *rp = g_strdup_printf("%s/%s", dest, name);
-            struct stat ust;
-            if (lstat(lp, &ust) == 0 && S_ISDIR(ust.st_mode))
-                r = sftp_upload_dir_r(dst->ssh_conn, lp, rp, &cp);
-            else
-                r = sftp_upload(dst->ssh_conn, lp, rp, &cp);
-            if (r == 0) delete_r(lp, NULL, NULL);
-            g_free(lp); g_free(rp);
-        } else
-#endif
-        {
-            gchar *sp = g_build_filename(src->cwd, name, NULL);
-            gchar *dp = g_build_filename(dest,     name, NULL);
-            r = 0;
-            if (rename(sp, dp) != 0) {
-                if (errno == EXDEV) {
-                    struct stat st;
-                    r = (lstat(sp, &st) == 0 && S_ISDIR(st.st_mode))
-                        ? copy_dir_r(sp, dp, &cp) : copy_file(sp, dp, &cp);
-                    if (r == 0) delete_r(sp, NULL, NULL);
-                } else {
-                    r = -1;
-                }
-            }
-            g_free(sp); g_free(dp);
-        }
-
-        if (r == 0) ok++; else if (r != ERR_CANCELLED) fail++;
-    }
-
-move_done:
-    progress_finish(pd);
-    {   gboolean was_cancelled = pd->cancelled;
-        progress_free(pd);
-        g_list_free_full(targets, g_free);
-        g_free(dest);
-
-        fm_status(fm, was_cancelled ? "Move cancelled (%d moved, %d errors)"
-                                    : "Moved: %d  errors: %d", ok, fail);
-    }
-    if (src->marks) g_hash_table_remove_all(src->marks);
-
-#ifdef HAVE_LIBSSH2
-    if (src->ssh_conn && fail > 0) {
-        LIBSSH2_SFTP_ATTRIBUTES a;
-        if (libssh2_sftp_stat(src->ssh_conn->sftp, src->ssh_conn->remote_path, &a) != 0) {
-            ssh_panel_close(src);
-            panel_reload(dst);
-            return;
-        }
-    }
-    if (dst->ssh_conn && fail > 0) {
-        LIBSSH2_SFTP_ATTRIBUTES a;
-        if (libssh2_sftp_stat(dst->ssh_conn->sftp, dst->ssh_conn->remote_path, &a) != 0) {
-            ssh_panel_close(dst);
-            panel_reload(src);
-            return;
-        }
-    }
-#endif
-
-    panel_reload(src);
-    panel_reload(dst);
-
-    /* Restore focus to active panel */
-    src->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(src->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Delete
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_delete(FM *fm)
-{
-    Panel *p = active_panel(fm);
-    GList *targets = panel_selection(p);
-    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
-
-    int n = g_list_length(targets);
-    gchar *question = g_strdup_printf("Delete %d item%s?", n, n == 1 ? "" : "s");
-
-    /* Confirmation dialog */
-    DlgCtx ctx;
-    dlg_ctx_init(&ctx);
-
-    GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "Delete confirmation");
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 400, -1);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_set_margin_start(vbox, 16);
-    gtk_widget_set_margin_end(vbox, 16);
-    gtk_widget_set_margin_top(vbox, 16);
-    gtk_widget_set_margin_bottom(vbox, 16);
-
-    GtkWidget *q_lbl = gtk_label_new(question);
-    gtk_label_set_wrap(GTK_LABEL(q_lbl), TRUE);
-    gtk_widget_set_halign(q_lbl, GTK_ALIGN_START);
-    g_free(question);
-
-    /* File list */
-    GtkWidget *sw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
-        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    int vis_h = (n <= 6) ? -1 : 120;
-    gtk_widget_set_size_request(sw, -1, vis_h);
-    if (n > 6) gtk_scrolled_window_set_min_content_height(
-        GTK_SCROLLED_WINDOW(sw), 120);
-
-    GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    for (GList *l = targets; l; l = l->next) {
-        GtkWidget *row = gtk_label_new((const char *)l->data);
-        gtk_widget_set_halign(row, GTK_ALIGN_START);
-        gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
-        gtk_widget_add_css_class(row, "dim-label");
-        gtk_box_append(GTK_BOX(fbox), row);
-    }
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
-
-    GtkWidget *warn = gtk_label_new("This action is irreversible.");
-    gtk_widget_set_halign(warn, GTK_ALIGN_START);
-
-    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(btn_box, 8);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    GtkWidget *ok_btn     = gtk_button_new_with_label("Delete");
-    gtk_widget_add_css_class(ok_btn, "destructive-action");
-    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
-    gtk_box_append(GTK_BOX(btn_box), ok_btn);
-
-    gtk_box_append(GTK_BOX(vbox), q_lbl);
-    gtk_box_append(GTK_BOX(vbox), sw);
-    gtk_box_append(GTK_BOX(vbox), warn);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
-    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
-
-    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),     &ctx);
-    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel), &ctx);
-    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),  &ctx);
-
-    gtk_window_present(GTK_WINDOW(dlg));
-
-    gboolean go = (dlg_ctx_run(&ctx) == 1);
-    gtk_window_destroy(GTK_WINDOW(dlg));
-
-    if (!go) { g_list_free_full(targets, g_free); return; }
-
-    int ok2 = 0, fail = 0, del_count = 0;
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), "Deleting");
-    progress_set_phase(pd, "Deleting…");
-
-    for (GList *l = targets; l && !pd->cancelled; l = l->next) {
-        const char *name = l->data;
-        if (!name_is_safe(name)) { fail++; continue; }
-
-        progress_set_file(pd, name);
-
-#ifdef HAVE_LIBSSH2
-        if (p->ssh_conn) {
-            gchar *rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
-            (sftp_delete_r(p->ssh_conn, rp, pd, &del_count) == 0) ? ok2++ : fail++;
-            g_free(rp);
-        } else
-#endif
-        {
-            gchar *path = g_build_filename(p->cwd, name, NULL);
-            (delete_r(path, pd, &del_count) == 0) ? ok2++ : fail++;
-            g_free(path);
-        }
-    }
-
-    progress_finish(pd);
-    {   gboolean was_cancelled = pd->cancelled;
-        progress_free(pd);
-        g_list_free_full(targets, g_free);
-
-        fm_status(fm, was_cancelled ? "Delete cancelled (%d deleted, %d errors)"
-                                    : "Deleted: %d  errors: %d", ok2, fail);
-    }
-    if (p->marks) g_hash_table_remove_all(p->marks);
-    panel_reload(&fm->panels[0]);
-    panel_reload(&fm->panels[1]);
-
-    /* Restore focus to active panel */
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Mkdir
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_mkdir(FM *fm)
-{
-    Panel *p = active_panel(fm);
-
-    DlgCtx ctx;
-    dlg_ctx_init(&ctx);
-
-    GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "New directory");
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 380, -1);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(vbox, 12);
-    gtk_widget_set_margin_end(vbox, 12);
-    gtk_widget_set_margin_top(vbox, 12);
-    gtk_widget_set_margin_bottom(vbox, 12);
-
-    GtkWidget *lbl   = gtk_label_new("New directory name:");
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-    GtkWidget *entry = gtk_entry_new();
-    gtk_widget_set_size_request(entry, 320, -1);
-
-    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(btn_box, 8);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    GtkWidget *ok_btn     = gtk_button_new_with_label("Create");
-    gtk_widget_add_css_class(ok_btn, "suggested-action");
-    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
-    gtk_box_append(GTK_BOX(btn_box), ok_btn);
-
-    gtk_box_append(GTK_BOX(vbox), lbl);
-    gtk_box_append(GTK_BOX(vbox), entry);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
-    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
-
-    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),       &ctx);
-    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel),   &ctx);
-    g_signal_connect(entry,      "activate",      G_CALLBACK(dlg_ctx_entry_ok), &ctx);
-    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),    &ctx);
-
-    gtk_window_present(GTK_WINDOW(dlg));
-
-    if (dlg_ctx_run(&ctx) == 1) {
-        const gchar *name = gtk_editable_get_text(GTK_EDITABLE(entry));
-        if (name && name[0] && name_is_safe(name)) {
-#ifdef HAVE_LIBSSH2
-            if (p->ssh_conn) {
-                gchar *rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
-                int r = libssh2_sftp_mkdir(p->ssh_conn->sftp, rp,
-                    LIBSSH2_SFTP_S_IRWXU | LIBSSH2_SFTP_S_IRGRP |
-                    LIBSSH2_SFTP_S_IXGRP | LIBSSH2_SFTP_S_IROTH |
-                    LIBSSH2_SFTP_S_IXOTH);
-                if (r == 0) {
-                    fm_status(fm, "Directory created: %s", name);
-                    panel_load_remote(p, p->ssh_conn->remote_path);
-                    panel_reload(other_panel(fm));
-                } else {
-                    fm_status(fm, "Error creating remote directory");
-                }
-                g_free(rp);
-            } else
-#endif
-            {
-                gchar *path = g_build_filename(p->cwd, name, NULL);
-                if (mkdir(path, 0755) == 0) {
-                    fm_status(fm, "Directory created: %s", name);
-                    panel_reload(&fm->panels[0]);
-                    panel_reload(&fm->panels[1]);
-                } else {
-                    fm_status(fm, "Error creating directory: %s", g_strerror(errno));
-                }
-                g_free(path);
-            }
-        }
-    }
-    gtk_window_destroy(GTK_WINDOW(dlg));
-
-    /* Restore focus to active panel */
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Rename
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_rename(FM *fm)
-{
-    Panel *p = active_panel(fm);
-    gchar *old_name = panel_cursor_name(p);
-    if (!old_name || strcmp(old_name, "..") == 0) {
-        g_free(old_name);
-        fm_status(fm, "No file is selected");
-        return;
-    }
-
-    DlgCtx ctx;
-    dlg_ctx_init(&ctx);
-
-    GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "Rename");
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 420, -1);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(vbox, 12);
-    gtk_widget_set_margin_end(vbox, 12);
-    gtk_widget_set_margin_top(vbox, 12);
-    gtk_widget_set_margin_bottom(vbox, 12);
-
-    gchar *markup = g_strdup_printf("Rename <b>%s</b> to:", old_name);
-    GtkWidget *lbl = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(lbl), markup);
-    g_free(markup);
-    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-
-    GtkWidget *entry = gtk_entry_new();
-    gtk_editable_set_text(GTK_EDITABLE(entry), old_name);
-    gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
-    gtk_widget_set_size_request(entry, 360, -1);
-
-    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(btn_box, 8);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    GtkWidget *ok_btn     = gtk_button_new_with_label("Rename");
-    gtk_widget_add_css_class(ok_btn, "suggested-action");
-    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
-    gtk_box_append(GTK_BOX(btn_box), ok_btn);
-
-    gtk_box_append(GTK_BOX(vbox), lbl);
-    gtk_box_append(GTK_BOX(vbox), entry);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
-    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
-
-    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),       &ctx);
-    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel),   &ctx);
-    g_signal_connect(entry,      "activate",      G_CALLBACK(dlg_ctx_entry_ok), &ctx);
-    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),    &ctx);
-
-    gtk_window_present(GTK_WINDOW(dlg));
-
-    gchar *renamed_to = NULL;
-    if (dlg_ctx_run(&ctx) == 1) {
-        const gchar *new_name = gtk_editable_get_text(GTK_EDITABLE(entry));
-        if (new_name && new_name[0] && strcmp(new_name, old_name) != 0
-            && name_is_safe(new_name)) {
-#ifdef HAVE_LIBSSH2
-            if (p->ssh_conn) {
-                gchar *old_rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, old_name);
-                gchar *new_rp = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, new_name);
-                int r = libssh2_sftp_rename(p->ssh_conn->sftp, old_rp, new_rp);
-                if (r == 0) {
-                    fm_status(fm, "Renamed: %s → %s", old_name, new_name);
-                    renamed_to = g_strdup(new_name);
-                    panel_load_remote(p, p->ssh_conn->remote_path);
-                    panel_reload(other_panel(fm));
-                } else {
-                    fm_status(fm, "Error renaming remote file");
-                }
-                g_free(old_rp); g_free(new_rp);
-            } else
-#endif
-            {
-                gchar *src_path = g_build_filename(p->cwd, old_name, NULL);
-                gchar *dst_path = g_build_filename(p->cwd, new_name, NULL);
-                if (rename(src_path, dst_path) == 0) {
-                    fm_status(fm, "Renamed: %s → %s", old_name, new_name);
-                    renamed_to = g_strdup(new_name);
-                    panel_reload(&fm->panels[0]);
-                    panel_reload(&fm->panels[1]);
-                } else {
-                    fm_status(fm, "Error renaming: %s", g_strerror(errno));
-                }
-                g_free(src_path); g_free(dst_path);
-            }
-        }
-    }
-    gtk_window_destroy(GTK_WINDOW(dlg));
-    g_free(old_name);
-
-    /* Position cursor on the renamed file */
-    if (renamed_to) {
-        p->inhibit_sel = TRUE;
-        guint n2 = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
-        for (guint i = 0; i < n2; i++) {
-            FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
-            if (fi && strcmp(fi->name, renamed_to) == 0) {
-                g_object_unref(fi);
-                p->cursor_pos = i;
-                gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), i,
-                                          NULL, GTK_LIST_SCROLL_SELECT, NULL);
-                break;
-            }
-            if (fi) g_object_unref(fi);
-        }
-        p->inhibit_sel = FALSE;
-        g_free(renamed_to);
-    }
-
-    /* Restore focus to active panel */
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Archive helpers
- * ─────────────────────────────────────────────────────────────────── */
-
-typedef enum {
-    ARC_UNKNOWN,
-    ARC_TAR_GZ,
-    ARC_TAR_BZ2,
-    ARC_TAR_XZ,
-    ARC_TAR_ZST,
-    ARC_TAR,
-    ARC_ZIP,
-    ARC_7Z,
-    ARC_RAR,
-} ArcType;
-
-static ArcType arc_detect(const char *name)
-{
-    if (!name) return ARC_UNKNOWN;
-    const char *d = strrchr(name, '.');
-    if (!d) return ARC_UNKNOWN;
-
-    /* double extensions first */
-    if (g_str_has_suffix(name, ".tar.gz")  || g_str_has_suffix(name, ".tar.GZ"))  return ARC_TAR_GZ;
-    if (g_str_has_suffix(name, ".tar.bz2") || g_str_has_suffix(name, ".tar.BZ2")) return ARC_TAR_BZ2;
-    if (g_str_has_suffix(name, ".tar.xz")  || g_str_has_suffix(name, ".tar.XZ"))  return ARC_TAR_XZ;
-    if (g_str_has_suffix(name, ".tar.zst") || g_str_has_suffix(name, ".tar.ZST")) return ARC_TAR_ZST;
-
-    const char *ext = d + 1;
-    if (!g_ascii_strcasecmp(ext, "tgz"))   return ARC_TAR_GZ;
-    if (!g_ascii_strcasecmp(ext, "tbz2"))  return ARC_TAR_BZ2;
-    if (!g_ascii_strcasecmp(ext, "txz"))   return ARC_TAR_XZ;
-    if (!g_ascii_strcasecmp(ext, "tar"))   return ARC_TAR;
-    if (!g_ascii_strcasecmp(ext, "zip"))   return ARC_ZIP;
-    if (!g_ascii_strcasecmp(ext, "7z"))    return ARC_7Z;
-    if (!g_ascii_strcasecmp(ext, "rar"))   return ARC_RAR;
-    if (!g_ascii_strcasecmp(ext, "gz"))    return ARC_TAR_GZ;  /* might be plain gz */
-    if (!g_ascii_strcasecmp(ext, "bz2"))   return ARC_TAR_BZ2;
-    if (!g_ascii_strcasecmp(ext, "xz"))    return ARC_TAR_XZ;
-    if (!g_ascii_strcasecmp(ext, "zst"))   return ARC_TAR_ZST;
-    return ARC_UNKNOWN;
-}
-
-static gboolean arc_is_archive(const char *name)
-{
-    return arc_detect(name) != ARC_UNKNOWN;
-}
-
-/* Run a command with a progress dialog, return TRUE on success */
-static gboolean run_archive_cmd(FM *fm, const char *title,
-                                 const char *phase, const gchar **argv)
-{
-    ProgressDlg *pd = progress_new(GTK_WINDOW(fm->window), title);
-    progress_set_phase(pd, phase);
-
-    /* Show the command target */
-    progress_set_file(pd, argv[0]);
-
-    GPid pid;
-    GError *err = NULL;
-    gboolean spawned = g_spawn_async(NULL, (gchar **)argv, NULL,
-        G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
-        NULL, NULL, &pid, &err);
-
-    if (!spawned) {
-        fm_status(fm, "%s error: %s", title, err ? err->message : "?");
-        g_clear_error(&err);
-        progress_free(pd);
-        return FALSE;
-    }
-
-    /* Poll child process while keeping UI alive */
-    gboolean done = FALSE;
-    int status = 0;
-    while (!done && !pd->cancelled) {
-        int r = waitpid(pid, &status, WNOHANG);
-        if (r > 0) {
-            done = TRUE;
-        } else {
-            /* Pump events — keeps pulse animation + cancel button working */
-            while (g_main_context_pending(NULL))
-                g_main_context_iteration(NULL, FALSE);
-            g_usleep(50000); /* 50ms */
-        }
-    }
-
-    if (pd->cancelled && !done) {
-        kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
-        progress_free(pd);
-        fm_status(fm, "%s cancelled", title);
-        return FALSE;
-    }
-
-    gboolean ok = done && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    progress_finish(pd);
-    progress_free(pd);
-    return ok;
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Extract archive
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_extract(FM *fm)
-{
-    Panel *p = active_panel(fm);
-    if (p->ssh_conn) {
-        fm_status(fm, "Extract is not supported on SFTP panels");
-        return;
-    }
-
-    gchar *name = panel_cursor_name(p);
-    if (!name || strcmp(name, "..") == 0 || !arc_is_archive(name)) {
-        g_free(name);
-        fm_status(fm, "No archive selected");
-        return;
-    }
-
-    gchar *archive = g_build_filename(p->cwd, name, NULL);
-    ArcType type = arc_detect(name);
-
-    /* Ask destination */
-    Panel *dst = other_panel(fm);
-    gchar *dest = ask_destination(fm, "Extract to", dst->cwd, NULL);
-    if (!dest) { g_free(name); g_free(archive); return; }
-
-    const gchar *argv[10];
-    int a = 0;
-    gboolean ok = FALSE;
-
-    switch (type) {
-    case ARC_TAR_GZ:
-    case ARC_TAR_BZ2:
-    case ARC_TAR_XZ:
-    case ARC_TAR_ZST:
-    case ARC_TAR:
-        argv[a++] = "tar";
-        argv[a++] = "xf";
-        argv[a++] = "-C";
-        argv[a++] = dest;
-        argv[a++] = "--";
-        argv[a++] = archive;
-        argv[a]   = NULL;
-        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
-        break;
-    case ARC_ZIP:
-        argv[a++] = "unzip";
-        argv[a++] = "-o";
-        argv[a++] = "-d";
-        argv[a++] = dest;
-        argv[a++] = "--";
-        argv[a++] = archive;
-        argv[a]   = NULL;
-        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
-        break;
-    case ARC_7Z:
-        argv[a++] = "7z";
-        argv[a++] = "x";
-        argv[a++] = "-y";
-        argv[a++] = "--";
-        argv[a++] = archive;
-        {
-            gchar *outdir = g_strdup_printf("-o%s", dest);
-            argv[a++] = outdir;
-            argv[a]   = NULL;
-            ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
-            g_free(outdir);
-        }
-        break;
-    case ARC_RAR:
-        argv[a++] = "unrar";
-        argv[a++] = "x";
-        argv[a++] = "-y";
-        argv[a++] = "--";
-        argv[a++] = archive;
-        argv[a++] = dest;
-        argv[a]   = NULL;
-        ok = run_archive_cmd(fm, "Extract", "Extracting…", argv);
-        break;
-    default:
-        fm_status(fm, "Unknown archive format");
-        break;
-    }
-
-    if (ok) fm_status(fm, "Extracted: %s", name);
-    else if (type != ARC_UNKNOWN) fm_status(fm, "Extract failed: %s", name);
-
-    g_free(name);
-    g_free(archive);
-    g_free(dest);
-    panel_reload(&fm->panels[0]);
-    panel_reload(&fm->panels[1]);
-
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
-}
-
-/* ─────────────────────────────────────────────────────────────────── *
- *  Pack (create archive)
- * ─────────────────────────────────────────────────────────────────── */
-
-void fo_pack(FM *fm)
-{
-    Panel *p = active_panel(fm);
-    if (p->ssh_conn) {
-        fm_status(fm, "Pack is not supported on SFTP panels");
-        return;
-    }
-
-    GList *targets = panel_selection(p);
-    if (!targets) { fm_status(fm, "Nothing is selected"); return; }
-
-    /* Dialog: archive name + format */
-    DlgCtx ctx;
-    dlg_ctx_init(&ctx);
-
-    GtkWidget *dlg = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(dlg), "Create archive");
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 460, -1);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_margin_start(vbox, 12);
-    gtk_widget_set_margin_end(vbox, 12);
-    gtk_widget_set_margin_top(vbox, 12);
-    gtk_widget_set_margin_bottom(vbox, 12);
-
-    /* File list */
-    {
-        int n = g_list_length(targets);
-        gchar *files_hdr = g_strdup_printf("Files (%d):", n);
-        GtkWidget *flbl = gtk_label_new(files_hdr);
-        g_free(files_hdr);
-        gtk_widget_set_halign(flbl, GTK_ALIGN_START);
-        gtk_box_append(GTK_BOX(vbox), flbl);
-
-        GtkWidget *sw = gtk_scrolled_window_new();
-        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
-            GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-        int vis_h = (n <= 6) ? -1 : 120;
-        gtk_widget_set_size_request(sw, -1, vis_h);
-        if (n > 6) gtk_scrolled_window_set_min_content_height(
-            GTK_SCROLLED_WINDOW(sw), 120);
-
-        GtkWidget *fbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        for (GList *l = targets; l; l = l->next) {
-            GtkWidget *row = gtk_label_new((const char *)l->data);
-            gtk_widget_set_halign(row, GTK_ALIGN_START);
-            gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
-            gtk_widget_add_css_class(row, "dim-label");
-            gtk_box_append(GTK_BOX(fbox), row);
-        }
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), fbox);
-        gtk_box_append(GTK_BOX(vbox), sw);
-    }
-
-    /* Format dropdown */
-    GtkWidget *lbl_fmt = gtk_label_new("Format:");
-    gtk_widget_set_halign(lbl_fmt, GTK_ALIGN_END);
-
-    static const char *fmt_labels[] = {
-        "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "zip", "7z", NULL
-    };
-    GtkStringList *fmt_list = gtk_string_list_new(fmt_labels);
-    GtkWidget *fmt_dd = gtk_drop_down_new(G_LIST_MODEL(fmt_list), NULL);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(fmt_dd), 0);  /* default: tar.gz */
-    gtk_widget_set_hexpand(fmt_dd, TRUE);
-
-    /* Archive name */
-    GtkWidget *lbl_name = gtk_label_new("Archive name:");
-    gtk_widget_set_halign(lbl_name, GTK_ALIGN_END);
-
-    GtkWidget *name_entry = gtk_entry_new();
-    gtk_widget_set_hexpand(name_entry, TRUE);
-
-    /* Default name from first selected item */
-    const char *first = targets->data;
-    gchar *default_name = g_strdup_printf("%s.tar.gz", first);
-    gtk_editable_set_text(GTK_EDITABLE(name_entry), default_name);
-    g_free(default_name);
-
-    /* Destination */
-    GtkWidget *lbl_dst = gtk_label_new("Save in:");
-    gtk_widget_set_halign(lbl_dst, GTK_ALIGN_END);
-
-    GtkWidget *dst_entry = gtk_entry_new();
-    gtk_editable_set_text(GTK_EDITABLE(dst_entry), other_panel(fm)->cwd);
-    gtk_widget_set_hexpand(dst_entry, TRUE);
-
-    GtkWidget *browse = gtk_button_new_with_label("...");
-    g_signal_connect(browse, "clicked", G_CALLBACK(on_browse_clicked), dst_entry);
-
-    GtkWidget *dst_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_append(GTK_BOX(dst_box), dst_entry);
-    gtk_box_append(GTK_BOX(dst_box), browse);
-
-    /* Layout */
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
-    int row = 0;
-    gtk_grid_attach(GTK_GRID(grid), lbl_fmt,    0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), fmt_dd,     1, row++, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), lbl_name,   0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), name_entry, 1, row++, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), lbl_dst,    0, row, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), dst_box,    1, row++, 1, 1);
-
-    /* Update name extension when format changes */
-    /* (done manually after dialog, simpler) */
-
-    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(btn_box, GTK_ALIGN_END);
-    gtk_widget_set_margin_top(btn_box, 8);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
-    GtkWidget *ok_btn = gtk_button_new_with_label("Create");
-    gtk_widget_add_css_class(ok_btn, "suggested-action");
-    gtk_box_append(GTK_BOX(btn_box), cancel_btn);
-    gtk_box_append(GTK_BOX(btn_box), ok_btn);
-
-    gtk_box_append(GTK_BOX(vbox), grid);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
-    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
-
-    g_signal_connect(ok_btn,     "clicked",       G_CALLBACK(dlg_ctx_ok),       &ctx);
-    g_signal_connect(cancel_btn, "clicked",       G_CALLBACK(dlg_ctx_cancel),   &ctx);
-    g_signal_connect(name_entry, "activate",      G_CALLBACK(dlg_ctx_entry_ok), &ctx);
-    g_signal_connect(dlg,        "close-request", G_CALLBACK(dlg_ctx_close),    &ctx);
-
-    gtk_window_present(GTK_WINDOW(dlg));
-
-    if (dlg_ctx_run(&ctx) != 1) {
-        gtk_window_destroy(GTK_WINDOW(dlg));
-        g_list_free_full(targets, g_free);
-        return;
-    }
-
-    const gchar *arc_name = gtk_editable_get_text(GTK_EDITABLE(name_entry));
-    const gchar *dst_dir  = gtk_editable_get_text(GTK_EDITABLE(dst_entry));
-    guint fmt_sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(fmt_dd));
-
-    if (!arc_name || !arc_name[0] || !dst_dir || !dst_dir[0]) {
-        gtk_window_destroy(GTK_WINDOW(dlg));
-        g_list_free_full(targets, g_free);
-        return;
-    }
-
-    gchar *arc_path = g_build_filename(dst_dir, arc_name, NULL);
-    gchar *s_arc_name = g_strdup(arc_name);
-
-    gtk_window_destroy(GTK_WINDOW(dlg));
-
-    /* Build command */
-    gboolean ok = FALSE;
-
-    if (fmt_sel <= 3 || fmt_sel == ARC_TAR) {
-        /* tar-based: tar cf archive.tar.gz -C srcdir file1 file2 ... */
-        static const char *tar_flags[] = {
-            "czf",   /* 0: tar.gz  */
-            "cjf",   /* 1: tar.bz2 */
-            "cJf",   /* 2: tar.xz  */
-            NULL,    /* 3: tar.zst (needs --zstd) */
-        };
-
-        /* argv: tar + flag(s) + archive + -C + srcdir + -- + files... + NULL */
-        int n_targets = g_list_length(targets);
-        const gchar **argv = g_new0(const gchar *, n_targets + 8);
-        int a = 0;
-        argv[a++] = "tar";
-        if (fmt_sel == 3) {
-            argv[a++] = "--zstd";
-            argv[a++] = "-cf";
-        } else {
-            argv[a++] = tar_flags[fmt_sel];
-        }
-        argv[a++] = arc_path;
-        argv[a++] = "-C";
-        argv[a++] = p->cwd;
-        argv[a++] = "--";
-        for (GList *l = targets; l; l = l->next)
-            argv[a++] = (const char *)l->data;
-        argv[a] = NULL;
-
-        ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
-        g_free(argv);
-
-    } else if (fmt_sel == 4) {
-        /* zip -r archive.zip file1 file2 ... (run from srcdir) */
-        int n_targets = g_list_length(targets);
-        const gchar **argv = g_new0(const gchar *, n_targets + 4);
-        int a = 0;
-        argv[a++] = "zip";
-        argv[a++] = "-r";
-        argv[a++] = arc_path;
-        for (GList *l = targets; l; l = l->next)
-            argv[a++] = (const char *)l->data;
-        argv[a] = NULL;
-
-        /* zip needs to run from source directory */
-        gchar *saved_cwd = g_get_current_dir();
-        if (chdir(p->cwd) == 0) {
-            ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
-            if (saved_cwd) chdir(saved_cwd);
-        }
-        g_free(saved_cwd);
-        g_free(argv);
-
-    } else if (fmt_sel == 5) {
-        /* 7z a archive.7z file1 file2 ... */
-        int n_targets = g_list_length(targets);
-        const gchar **argv = g_new0(const gchar *, n_targets + 4);
-        int a = 0;
-        argv[a++] = "7z";
-        argv[a++] = "a";
-        argv[a++] = arc_path;
-        for (GList *l = targets; l; l = l->next) {
-            gchar *full = g_build_filename(p->cwd, (const char *)l->data, NULL);
-            argv[a++] = full;
-        }
-        argv[a] = NULL;
-
-        ok = run_archive_cmd(fm, "Pack", "Packing…", argv);
-
-        /* Free full paths (stored starting at argv[3]) */
-        for (int i = 3; argv[i]; i++)
-            g_free((gchar *)argv[i]);
-        g_free(argv);
-    }
-
-    if (ok) fm_status(fm, "Created: %s", s_arc_name);
-    else    fm_status(fm, "Pack failed: %s", s_arc_name);
-
-    g_free(arc_path);
-    g_free(s_arc_name);
-    g_list_free_full(targets, g_free);
-    if (p->marks) g_hash_table_remove_all(p->marks);
-    panel_reload(&fm->panels[0]);
-    panel_reload(&fm->panels[1]);
-
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
 }

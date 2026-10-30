@@ -1,6 +1,7 @@
 #include "fm.h"
 #include <string.h>
 #include <errno.h>
+#include <stdlib.h>
 #ifdef HAVE_GTKSOURCEVIEW
 #  include <gtksourceview/gtksource.h>
 #endif
@@ -28,6 +29,8 @@ typedef struct {
     SshConn       *ssh_conn;      /* non-NULL when editing a remote file */
     FM            *fm;
     gboolean       modified;
+    gboolean       read_only;     /* binary file (NUL bytes): never saved */
+    gchar         *encoding;      /* original charset, NULL = UTF-8 */
     guint          hl_idle;
     gboolean       word_wrap;
     /* search/replace */
@@ -159,9 +162,13 @@ static void update_status(EditorCtx *ctx)
     GtkTextIter it;
     gtk_text_buffer_get_iter_at_mark(ctx->buffer,
         &it, gtk_text_buffer_get_insert(ctx->buffer));
-    gchar *msg = g_strdup_printf("Line %d, Column %d",
+    gchar *msg = g_strdup_printf("Line %d, Column %d%s%s%s",
                                   gtk_text_iter_get_line(&it) + 1,
-                                  gtk_text_iter_get_line_offset(&it) + 1);
+                                  gtk_text_iter_get_line_offset(&it) + 1,
+                                  ctx->encoding ? "   –   " : "",
+                                  ctx->encoding ? ctx->encoding : "",
+                                  ctx->read_only
+                                      ? "   –   binary file, read-only" : "");
     gtk_label_set_text(GTK_LABEL(ctx->status_lbl), msg);
     g_free(msg);
 }
@@ -179,10 +186,32 @@ static void on_cursor_moved(GtkTextBuffer *buf, GtkTextIter *loc,
 
 static void editor_save(EditorCtx *ctx)
 {
+    if (ctx->read_only) {
+        fm_status(ctx->fm, "Editor: binary file is read-only, not saved");
+        return;
+    }
+
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(ctx->buffer, &start, &end);
     gchar *text = gtk_text_buffer_get_text(ctx->buffer, &start, &end, FALSE);
-    gsize  len  = strlen(text);
+    gsize  len  = strlen(text);         /* buffer text never contains NUL */
+
+    /* write back in the file's original encoding */
+    if (ctx->encoding) {
+        gsize   out_len = 0;
+        GError *cerr    = NULL;
+        gchar  *conv    = g_convert(text, (gssize)len, ctx->encoding, "UTF-8",
+                                    NULL, &out_len, &cerr);
+        g_free(text);
+        if (!conv) {
+            fm_status(ctx->fm, "Not saved: text cannot be encoded as %s (%s)",
+                      ctx->encoding, cerr ? cerr->message : "?");
+            g_clear_error(&cerr);
+            return;
+        }
+        text = conv;
+        len  = out_len;
+    }
 
     gboolean ok = FALSE;
     const gchar *display_path = NULL;
@@ -195,7 +224,14 @@ static void editor_save(EditorCtx *ctx)
     } else if (ctx->filepath) {
         display_path = ctx->filepath;
         GError *err = NULL;
-        ok = g_file_set_contents(ctx->filepath, text, (gssize)len, &err);
+        /* write through symlinks and keep the mode (e.g. +x on scripts) */
+        char *real = realpath(ctx->filepath, NULL);
+        const gchar *target = real ? real : ctx->filepath;
+        struct stat st;
+        int mode = (stat(target, &st) == 0) ? (int)(st.st_mode & 07777) : 0666;
+        ok = g_file_set_contents_full(target, text, (gssize)len,
+                                      G_FILE_SET_CONTENTS_CONSISTENT, mode, &err);
+        free(real);
         if (!ok) {
             fm_status(ctx->fm, "Save error: %s", err ? err->message : "?");
             g_clear_error(&err);
@@ -847,6 +883,7 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
     FM *fm = ctx->fm;
     g_free(ctx->filepath);
     g_free(ctx->remote_path);
+    g_free(ctx->encoding);
     g_free(ctx);
     Panel *ap = active_panel(fm);
     ap->inhibit_sel = TRUE;
@@ -908,11 +945,41 @@ void editor_show(FM *fm)
         }
     }
 
-    /* Only convert if invalid UTF-8 (avoid unnecessary copy) */
-    if (!g_utf8_validate(content, (gssize)content_len, NULL)) {
+    /* NUL bytes: binary file, shown read-only.  Other invalid UTF-8 is
+     * decoded from a legacy charset and encoded back on save. */
+    gboolean read_only = memchr(content, '\0', content_len) != NULL;
+    gchar   *encoding  = NULL;
+    if (read_only) {
         gchar *fixed = g_utf8_make_valid(content, (gssize)content_len);
         g_free(content);
         content = fixed;
+        fm_status(fm, "Editor: binary file opened read-only");
+    } else if (!g_utf8_validate(content, (gssize)content_len, NULL)) {
+        const char *locale_cs = NULL;
+        gboolean    locale_utf8 = g_get_charset(&locale_cs);
+        const char *cands[] = { locale_utf8 ? NULL : locale_cs,
+                                "WINDOWS-1250", "ISO-8859-1" };
+        for (gsize i = 0; i < G_N_ELEMENTS(cands) && !encoding; i++) {
+            if (!cands[i]) continue;
+            gsize  out_len = 0;
+            gchar *conv = g_convert(content, (gssize)content_len, "UTF-8",
+                                    cands[i], NULL, &out_len, NULL);
+            if (conv && g_utf8_validate(conv, (gssize)out_len, NULL)) {
+                g_free(content);
+                content  = conv;
+                encoding = g_strdup(cands[i]);
+            } else {
+                g_free(conv);
+            }
+        }
+        if (!encoding) {                /* cannot happen: ISO-8859-1 maps all */
+            gchar *fixed = g_utf8_make_valid(content, (gssize)content_len);
+            g_free(content);
+            content   = fixed;
+            read_only = TRUE;
+        }
+        fm_status(fm, "Editor: file is not UTF-8, opened as %s",
+                  encoding ? encoding : "binary (read-only)");
     }
 
     EditorCtx *ctx = g_new0(EditorCtx, 1);
@@ -921,6 +988,8 @@ void editor_show(FM *fm)
     ctx->remote_path = remote_path;
     ctx->ssh_conn    = ssh_conn;
     ctx->modified    = FALSE;
+    ctx->read_only   = read_only;
+    ctx->encoding    = encoding;
     ctx->word_wrap   = FALSE;
 
     const gchar *title = ctx->remote_path ? ctx->remote_path : ctx->filepath;
@@ -1103,6 +1172,9 @@ void editor_show(FM *fm)
     gtk_text_buffer_set_text(ctx->buffer, content, -1);
     g_free(content);
     g_signal_handlers_unblock_by_func(ctx->buffer, on_buffer_changed, ctx);
+    if (ctx->read_only)
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(ctx->text_view), FALSE);
+    update_status(ctx);
 #ifdef HAVE_GTKSOURCEVIEW
     {
         GtkSourceLanguage *_lang = source_guess_language(title);

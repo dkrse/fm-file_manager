@@ -37,7 +37,25 @@ static void string_pool_destroy(StringPool *sp)
 
 /* ── Content search helper ───────────────────────────────────────── */
 
-static gchar *file_contains(const char *path, const char *needle_lower)
+/* Case-insensitive strstr for an ASCII needle – no allocation */
+static gboolean ascii_contains(const char *hay, const char *needle_lower, size_t nlen)
+{
+    for (; *hay; hay++) {
+        if (g_ascii_tolower(*hay) != needle_lower[0]) continue;
+        size_t i = 1;
+        while (i < nlen && hay[i] && g_ascii_tolower(hay[i]) == needle_lower[i]) i++;
+        if (i == nlen) return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean str_is_ascii(const char *s)
+{
+    for (; *s; s++) if ((unsigned char)*s >= 0x80) return FALSE;
+    return TRUE;
+}
+
+static gchar *file_contains(const char *path, const char *needle_lower, int *out_line)
 {
     FILE *fp = fopen(path, "r");
     if (!fp) return NULL;
@@ -51,15 +69,27 @@ static gchar *file_contains(const char *path, const char *needle_lower)
 
     char buf[4096];
     gchar *result = NULL;
+    /* ASCII needle (the common case): compare in place instead of
+     * lower-casing a copy of every line */
+    gboolean ascii = str_is_ascii(needle_lower);
+    size_t nlen = strlen(needle_lower);
+    int line = 0;
+    gboolean cont = FALSE;      /* previous fgets() stopped mid-line */
     while (fgets(buf, sizeof(buf), fp)) {
-        gchar *lower = g_utf8_strdown(buf, -1);
-        if (strstr(lower, needle_lower)) {
+        /* a buffer ending without '\n' is a continuation of the same line */
+        gboolean whole = strchr(buf, '\n') != NULL;
+        if (!cont) line++;
+        cont = !whole;
+        gchar *lower = ascii ? NULL : g_utf8_strdown(buf, -1);
+        if (ascii ? ascii_contains(buf, needle_lower, nlen)
+                  : strstr(lower, needle_lower) != NULL) {
             g_strstrip(buf);
             if (g_utf8_strlen(buf, -1) > 200) {
                 gchar *p = g_utf8_offset_to_pointer(buf, 200);
                 *p = '\0';
             }
-            result = g_strdup(buf);
+            result = g_utf8_make_valid(buf, -1);
+            if (out_line) *out_line = line;
             g_free(lower);
             break;
         }
@@ -80,12 +110,15 @@ typedef struct {
     gint64      size;
     gint64      mtime;
     mode_t      mode;
+    char       *snippet; /* owned, content search only */
+    int         line;
 } SearchResult;
 
 static void search_result_free(gpointer p)
 {
     SearchResult *r = p;
     g_free(r->name);
+    g_free(r->snippet);
     g_free(r);
 }
 
@@ -98,32 +131,28 @@ typedef struct {
     const char  *content;
     gint64       size_min;
     gint64       size_max;
-    int          count;         /* matched results */
-    int          scanned;       /* total files visited */
-    gboolean    *cancelled;    /* pointer to cancel flag (set by UI button) */
+    gint         count;         /* matched results   (atomic – read by UI) */
+    gint         scanned;       /* total files visited (atomic)            */
+    gint         cancelled;     /* atomic – set by the Cancel button        */
     dev_t        root_dev;     /* device of search root (for -xdev semantics) */
     GHashTable  *visited;      /* set of visited (dev,ino) pairs — loop detection */
-    GtkWidget   *counter_label;
+    const char  *root;
 } SearchCtx;
 
 static void add_result(SearchCtx *ctx, const char *base_interned,
-                       const char *name, const struct stat *st)
+                       const char *name, const struct stat *st,
+                       gchar *snippet, int line)
 {
     SearchResult *r = g_new(SearchResult, 1);
+    r->snippet = snippet;   /* takes ownership */
+    r->line    = line;
     r->dir   = base_interned;
     r->name  = g_strdup(name);
     r->size  = st->st_size;
     r->mtime = st->st_mtime;
     r->mode  = st->st_mode;
     g_ptr_array_add(ctx->results, r);
-    ctx->count++;
-
-    if ((ctx->count & 0xFFF) == 0) {   /* every 4096 results */
-        gchar msg[64];
-        g_snprintf(msg, sizeof(msg), "Found: %d", ctx->count);
-        gtk_label_set_text(GTK_LABEL(ctx->counter_label), msg);
-        while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-    }
+    g_atomic_int_inc(&ctx->count);
 }
 
 /* Hash/equal for (dev_t, ino_t) pair — used for visited-directory tracking */
@@ -141,7 +170,7 @@ static gboolean devino_equal(gconstpointer a, gconstpointer b)
 
 static void search_dir(SearchCtx *ctx, const char *base, int depth)
 {
-    if (depth > 64 || *ctx->cancelled) return;
+    if (depth > 64 || g_atomic_int_get(&ctx->cancelled)) return;
 
     struct stat base_st;
     if (lstat(base, &base_st) != 0) return;
@@ -170,7 +199,7 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
     struct stat st;
 
     while ((de = readdir(dir)) != NULL) {
-        if (*ctx->cancelled) break;
+        if (g_atomic_int_get(&ctx->cancelled)) break;
 
         if (de->d_name[0] == '.') {
             if (de->d_name[1] == '\0') continue;
@@ -182,15 +211,7 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
         gboolean is_dir  = S_ISDIR(st.st_mode);
         gboolean is_link = S_ISLNK(st.st_mode);
 
-        ctx->scanned++;
-        if ((ctx->scanned & 0x1FFF) == 0) {   /* every 8192 files scanned */
-            gchar msg[80];
-            g_snprintf(msg, sizeof(msg), "Scanning: %d files, %d found",
-                       ctx->scanned, ctx->count);
-            gtk_label_set_text(GTK_LABEL(ctx->counter_label), msg);
-            while (g_main_context_pending(NULL))
-                g_main_context_iteration(NULL, FALSE);
-        }
+        g_atomic_int_inc(&ctx->scanned);
 
         if (!is_dir) {
             gboolean name_match = fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0;
@@ -201,17 +222,15 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
             if (name_match) {
                 if (ctx->content) {
                     gchar *ml = NULL;
+                    int line = 0;
                     if (!is_link) {
                         char full[4096];
                         g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-                        ml = file_contains(full, ctx->content);
+                        ml = file_contains(full, ctx->content, &line);
                     }
-                    if (ml) {
-                        add_result(ctx, base_interned, de->d_name, &st);
-                        g_free(ml);
-                    }
+                    if (ml) add_result(ctx, base_interned, de->d_name, &st, ml, line);
                 } else {
-                    add_result(ctx, base_interned, de->d_name, &st);
+                    add_result(ctx, base_interned, de->d_name, &st, NULL, 0);
                 }
             }
         }
@@ -282,6 +301,9 @@ static GPtrArray *build_grouped_list(GPtrArray *results, FM *fm)
                           FALSE, fg, wt,
                           r->size, r->mtime);
         fi->dir_path = g_strdup(r->dir);
+        fi->snippet  = r->snippet;   /* move ownership */
+        fi->line     = r->line;
+        r->snippet   = NULL;
         g_ptr_array_add(out, fi);
     }
 
@@ -500,13 +522,321 @@ static gboolean show_input_dialog(FM *fm, gchar **out_pattern, gchar **out_conte
 static void on_search_cancel(GtkButton *btn, gpointer data)
 {
     (void)btn;
-    *((gboolean *)data) = TRUE;
+    g_atomic_int_set(&((SearchCtx *)data)->cancelled, TRUE);
+}
+
+/* ── Worker thread: the scan never touches GTK ───────────────────── */
+
+typedef struct {
+    SearchCtx  *ctx;
+    GtkWidget  *label;
+    GMainLoop  *loop;
+    gint        done;           /* atomic */
+} SearchRun;
+
+static gboolean search_finished_idle(gpointer data)
+{
+    g_main_loop_quit(((SearchRun *)data)->loop);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer search_thread(gpointer data)
+{
+    SearchRun *run = data;
+    search_dir(run->ctx, run->ctx->root, 0);
+    g_atomic_int_set(&run->done, TRUE);
+    g_idle_add(search_finished_idle, run);
+    return NULL;
+}
+
+static gboolean search_tick(gpointer data)
+{
+    SearchRun *run = data;
+    gchar msg[96];
+    g_snprintf(msg, sizeof(msg), "Scanning: %d files, %d found",
+               g_atomic_int_get(&run->ctx->scanned),
+               g_atomic_int_get(&run->ctx->count));
+    gtk_label_set_text(GTK_LABEL(run->label), msg);
+    return G_SOURCE_CONTINUE;
+}
+
+/* ── Search history / returning to results ───────────────────────── *
+ * Every finished search becomes a SearchHist (newest first, max 10).
+ * Panels only borrow pointers; the history owns the result stores.   */
+
+#define SEARCH_HISTORY_MAX 10
+
+typedef struct {
+    GListStore *store;      /* FileItem results (grouped)              */
+    gchar      *info;       /* text shown in the path entry            */
+    gchar      *needle;     /* content searched for, or NULL           */
+    gchar      *origin;     /* directory the panel was in before       */
+    int         count;
+    guint       cursor;     /* last cursor position in the results     */
+} SearchHist;
+
+static GQueue search_history = G_QUEUE_INIT;
+
+static void search_hist_free(SearchHist *h)
+{
+    g_object_unref(h->store);
+    g_free(h->info);
+    g_free(h->needle);
+    g_free(h->origin);
+    g_free(h);
+}
+
+static void search_history_push(FM *fm, SearchHist *h)
+{
+    g_queue_push_head(&search_history, h);
+    while (g_queue_get_length(&search_history) > SEARCH_HISTORY_MAX) {
+        SearchHist *old = g_queue_pop_tail(&search_history);
+        for (int i = 0; i < 2; i++) {
+            if (fm->panels[i].last_search == old) fm->panels[i].last_search = NULL;
+            if (fm->panels[i].cur_search == old)  fm->panels[i].cur_search  = NULL;
+        }
+        search_hist_free(old);
+    }
+}
+
+const char *search_needle(Panel *p)
+{
+    SearchHist *h = p->cur_search;
+    return (p->search_mode && h) ? h->needle : NULL;
+}
+
+void search_update_buttons(Panel *p)
+{
+    gtk_widget_set_visible(p->search_btn, p->search_mode);
+    gtk_widget_set_visible(p->results_btn, !p->search_mode && p->last_search);
+}
+
+/* Called by panel_load() when a results panel navigates elsewhere */
+void search_detach(Panel *p)
+{
+    if (!p->search_mode) return;
+    SearchHist *h = p->cur_search;
+    if (h) h->cursor = p->cursor_pos;
+    p->last_search = h;
+    p->cur_search  = NULL;
+    p->search_mode = FALSE;
+    if (p->marks) g_hash_table_remove_all(p->marks);
+}
+
+/* Put a history entry into the panel */
+static void search_show(Panel *p, SearchHist *h)
+{
+    if (!p->search_mode) {
+        if (strlen(p->cwd) >= sizeof(p->search_prev_cwd)) {
+            fm_status(p->fm, "Path too long");
+            return;
+        }
+        g_strlcpy(p->search_prev_cwd, p->cwd, sizeof(p->search_prev_cwd));
+        g_free(p->search_prev_name);
+        p->search_prev_name = panel_cursor_name(p);
+    }
+    panel_monitor_stop(p);
+
+    /* Each panel gets its own copy of the results: marks live on the
+     * items, so sharing h->store would mark rows in the other panel too. */
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(h->store));
+    GPtrArray *items = g_ptr_array_new_full(n, g_object_unref);
+    for (guint i = 0; i < n; i++) {
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(h->store), i);
+        g_ptr_array_add(items, file_item_copy(it));
+        g_object_unref(it);
+    }
+    GListStore *store = g_list_store_new(FILE_ITEM_TYPE);
+    g_list_store_splice(store, 0, 0, (gpointer *)items->pdata, items->len);
+    g_ptr_array_unref(items);
+
+    p->inhibit_sel = TRUE;
+    if (p->marks) g_hash_table_remove_all(p->marks);
+    p->search_mode = TRUE;              /* before the swap: bind reads it */
+    gtk_sort_list_model_set_sorter(p->sort_model, NULL);
+    gtk_sort_list_model_set_model(p->sort_model, G_LIST_MODEL(store));
+    g_object_unref(p->store);
+    p->store = store;
+
+    p->cur_search  = h;
+    p->last_search = NULL;
+    gtk_editable_set_text(GTK_EDITABLE(p->path_entry), h->info);
+    search_update_buttons(p);
+
+    gchar *msg = g_strdup_printf("Found: %d files  (Enter=open, Ctrl+PgDn=go to file, "
+                                 "F3=view, Backspace=leave, Alt+\u2190=back here)", h->count);
+    gtk_label_set_text(GTK_LABEL(p->status_label), msg);
+    g_free(msg);
+
+    guint vis = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    p->cursor_pos = h->cursor < vis ? h->cursor : 0;
+    if (vis > 0)
+        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), p->cursor_pos,
+                                  NULL, GTK_LIST_SCROLL_SELECT, NULL);
+    p->inhibit_sel = FALSE;
+    gtk_widget_grab_focus(p->column_view);
+}
+
+gboolean search_restore(Panel *p)
+{
+    SearchHist *h = p->last_search;
+    if (!h || p->ssh_conn || p->busy) return FALSE;
+    search_show(p, h);
+    return TRUE;
+}
+
+/* Jump to the directory of the result under the cursor, keep results */
+void search_goto_file(Panel *p)
+{
+    if (!p->search_mode) return;
+    FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->filter_model), p->cursor_pos);
+    if (!it) return;
+    gchar *dir  = g_strdup(it->dir_path ? it->dir_path : it->name);  /* header = dir */
+    gchar *name = it->dir_path ? g_strdup(it->name) : NULL;
+    g_object_unref(it);
+
+    panel_load(p, dir);            /* detaches the results (search_detach) */
+    if (name) panel_select_name(p, name);
+    fm_status(p->fm, "Alt+\u2190 returns to the search results");
+    g_free(dir);
+    g_free(name);
+}
+
+/* Shift+F2 – pick one of the previous searches */
+static void on_hist_row_activated(GtkListBox *lb, GtkListBoxRow *row, DlgCtx *ctx)
+{
+    (void)lb;
+    ctx->response = 2 + gtk_list_box_row_get_index(row);
+    g_main_loop_quit(ctx->loop);
+}
+
+static void on_hist_ok(GtkButton *b, GtkListBox *lb)
+{
+    DlgCtx *ctx = g_object_get_data(G_OBJECT(b), "ctx");
+    GtkListBoxRow *row = gtk_list_box_get_selected_row(lb);
+    if (row) on_hist_row_activated(lb, row, ctx);
+}
+
+static gboolean on_hist_key(GtkEventControllerKey *k, guint keyval, guint code,
+                            GdkModifierType st, DlgCtx *ctx)
+{
+    (void)k; (void)code; (void)st;
+    if (keyval != GDK_KEY_Escape) return FALSE;
+    dlg_ctx_cancel(NULL, ctx);
+    return TRUE;
+}
+
+void search_history_dialog(FM *fm)
+{
+    Panel *p = active_panel(fm);
+    if (g_queue_is_empty(&search_history)) {
+        fm_status(fm, "No previous searches");
+        return;
+    }
+    if (p->ssh_conn) {
+        fm_status(fm, "Search results cannot be shown in an SFTP panel");
+        return;
+    }
+
+    DlgCtx ctx;
+    dlg_ctx_init(&ctx);
+    GtkWidget *dlg = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dlg), "Search history");
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(fm->window));
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 560, 320);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(vbox, 12);
+    gtk_widget_set_margin_end(vbox, 12);
+    gtk_widget_set_margin_top(vbox, 12);
+    gtk_widget_set_margin_bottom(vbox, 12);
+
+    GtkWidget *lb = gtk_list_box_new();
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(lb), FALSE);
+    for (GList *l = search_history.head; l; l = l->next) {
+        SearchHist *h = l->data;
+        gchar *t = g_strdup_printf("%s   (%d files)", h->info, h->count);
+        GtkWidget *row = gtk_label_new(t);
+        g_free(t);
+        gtk_label_set_xalign(GTK_LABEL(row), 0.0f);
+        gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_MIDDLE);
+        gtk_widget_set_margin_top(row, 4);
+        gtk_widget_set_margin_bottom(row, 4);
+        gtk_list_box_append(GTK_LIST_BOX(lb), row);
+    }
+    gtk_list_box_select_row(GTK_LIST_BOX(lb), gtk_list_box_get_row_at_index(GTK_LIST_BOX(lb), 0));
+    GtkWidget *sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), lb);
+    gtk_widget_set_vexpand(sw, TRUE);
+
+    GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_set_homogeneous(GTK_BOX(bb), TRUE);
+    gtk_widget_set_halign(bb, GTK_ALIGN_END);
+    GtkWidget *ok = gtk_button_new_with_label("Show");
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    gtk_widget_add_css_class(ok, "suggested-action");
+    gtk_box_append(GTK_BOX(bb), ok);
+    gtk_box_append(GTK_BOX(bb), cancel);
+
+    gtk_box_append(GTK_BOX(vbox), sw);
+    gtk_box_append(GTK_BOX(vbox), bb);
+    gtk_window_set_child(GTK_WINDOW(dlg), vbox);
+
+    g_object_set_data(G_OBJECT(ok), "ctx", &ctx);
+    g_signal_connect(lb, "row-activated", G_CALLBACK(on_hist_row_activated), &ctx);
+    g_signal_connect(ok, "clicked", G_CALLBACK(on_hist_ok), lb);
+    g_signal_connect(cancel, "clicked", G_CALLBACK(dlg_ctx_cancel), &ctx);
+    g_signal_connect(dlg, "close-request", G_CALLBACK(dlg_ctx_close), &ctx);
+    GtkEventController *key = gtk_event_controller_key_new();
+    g_signal_connect(key, "key-pressed", G_CALLBACK(on_hist_key), &ctx);
+    gtk_widget_add_controller(dlg, key);
+
+    gtk_window_present(GTK_WINDOW(dlg));
+    gtk_widget_grab_focus(GTK_WIDGET(gtk_list_box_get_row_at_index(GTK_LIST_BOX(lb), 0)));
+    int r = dlg_ctx_run(&ctx);
+    gtk_window_destroy(GTK_WINDOW(dlg));
+
+    if (r >= 2) {
+        SearchHist *h = g_queue_peek_nth(&search_history, (guint)(r - 2));
+        if (h) {
+            if (p->search_mode) search_detach(p);
+            search_show(p, h);
+            return;
+        }
+    }
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
 }
 
 /* ── Main search entry point ─────────────────────────────────────── */
 
+typedef struct {
+    SearchCtx *ctx;
+    gboolean  *pending;
+} SearchClose;
+
+/* Window closed mid-scan: cancel and close once search_run unwinds */
+static gboolean on_search_win_close(GtkWindow *win, gpointer data)
+{
+    (void)win;
+    SearchClose *sc = data;
+    g_atomic_int_set(&sc->ctx->cancelled, TRUE);
+    *sc->pending = TRUE;
+    return TRUE;
+}
+
+static gboolean search_close_idle(gpointer win)
+{
+    gtk_window_close(GTK_WINDOW(win));
+    return G_SOURCE_REMOVE;
+}
+
 void search_run(FM *fm)
 {
+    static gboolean busy;           /* the UI stays live while scanning */
+    if (busy) { fm_status(fm, "A search is already running"); return; }
+
     if (active_panel(fm)->ssh_conn) {
         fm_status(fm, "Search on remote panel is not supported");
         return;
@@ -520,8 +850,17 @@ void search_run(FM *fm)
 
     Panel *p = active_panel(fm);
 
-    if (!p->search_mode)
+    if (!p->search_mode) {
+        if (strlen(p->cwd) >= sizeof(p->search_prev_cwd)) {
+            fm_status(fm, "Path too long");
+            g_free(pattern); g_free(content); g_free(search_dir_path);
+            return;
+        }
         g_strlcpy(p->search_prev_cwd, p->cwd, sizeof(p->search_prev_cwd));
+        g_free(p->search_prev_name);
+        p->search_prev_name = panel_cursor_name(p);
+    } else
+        search_detach(p);         /* new search from results: keep old in history */
 
     gchar *info_text;
     if (content)
@@ -537,16 +876,6 @@ void search_run(FM *fm)
     p->inhibit_sel = TRUE;
     fm->panels[0].inhibit_sel = TRUE;
     fm->panels[1].inhibit_sel = TRUE;
-
-    /* Show cancel button below status label */
-    gboolean search_cancelled = FALSE;
-    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel search");
-    gtk_widget_add_css_class(cancel_btn, "fm-fkey");
-    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_search_cancel), &search_cancelled);
-    GtkWidget *frame = gtk_widget_get_parent(p->status_label);
-    gtk_box_append(GTK_BOX(frame), cancel_btn);
-
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
 
     /* Phase 1: collect lightweight result records */
     StringPool pool;
@@ -565,21 +894,61 @@ void search_run(FM *fm)
         .content       = content,
         .size_min      = size_min,
         .size_max      = size_max,
-        .count         = 0,
-        .scanned       = 0,
-        .cancelled     = &search_cancelled,
         .root_dev      = root_dev,
         .visited       = g_hash_table_new_full(devino_hash, devino_equal, g_free, NULL),
-        .counter_label = p->status_label,
+        .root          = search_dir_path,
     };
     g_ptr_array_set_free_func(ctx.results, search_result_free);
 
-    search_dir(&ctx, search_dir_path, 0);
+    /* Show cancel button below status label */
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel search");
+    gtk_widget_add_css_class(cancel_btn, "fm-fkey");
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_search_cancel), &ctx);
+    GtkWidget *frame = gtk_widget_get_parent(p->status_label);
+    gtk_box_append(GTK_BOX(frame), cancel_btn);
+
+    /* Scan in a worker; the UI stays live and Cancel reacts at once.
+     * The panel itself is locked so nothing navigates it meanwhile, and
+     * closing the window only cancels – it closes after the loop. */
+    busy = TRUE;
+    p->busy = TRUE;
+    gtk_widget_set_sensitive(p->column_view, FALSE);
+    gtk_widget_set_sensitive(p->path_entry, FALSE);
+    gboolean close_pending = FALSE;
+    SearchClose sc = { .ctx = &ctx, .pending = &close_pending };
+    gulong close_hid = g_signal_connect(fm->window, "close-request",
+                                        G_CALLBACK(on_search_win_close), &sc);
+    SearchRun run = { .ctx = &ctx, .label = p->status_label,
+                      .loop = g_main_loop_new(NULL, FALSE) };
+    guint tick = g_timeout_add(100, search_tick, &run);
+    GThread *th = g_thread_new("fm-search", search_thread, &run);
+    g_main_loop_run(run.loop);
+    g_thread_join(th);
+    g_source_remove(tick);
+    g_main_loop_unref(run.loop);
+    g_signal_handler_disconnect(fm->window, close_hid);
+    busy = FALSE;
+    p->busy = FALSE;
+    gtk_widget_set_sensitive(p->column_view, TRUE);
+    gtk_widget_set_sensitive(p->path_entry, TRUE);
+
+    gboolean search_cancelled = ctx.cancelled;
     int result_count = ctx.count;
     g_hash_table_destroy(ctx.visited);
 
     /* Remove cancel button */
     gtk_box_remove(GTK_BOX(frame), cancel_btn);
+
+    if (close_pending) {            /* window close was deferred: finish it */
+        fm->panels[0].inhibit_sel = FALSE;
+        fm->panels[1].inhibit_sel = FALSE;
+        g_ptr_array_unref(ctx.results);
+        string_pool_destroy(&pool);
+        g_free(info_text);
+        g_free(pattern); g_free(content); g_free(search_dir_path);
+        g_idle_add(search_close_idle, fm->window);
+        return;
+    }
 
     /* Phase 2: sort + build grouped FileItem list */
     gtk_label_set_text(GTK_LABEL(p->status_label), "Building list...");
@@ -601,34 +970,24 @@ void search_run(FM *fm)
     if (p->marks)
         g_hash_table_remove_all(p->marks);
 
-    /* Replace store to avoid expensive remove_all on large lists */
     GListStore *new_store = g_list_store_new(FILE_ITEM_TYPE);
     if (grouped->len > 0)
         g_list_store_splice(new_store, 0, 0,
                             (gpointer *)grouped->pdata, grouped->len);
     g_ptr_array_unref(grouped);
-    gtk_sort_list_model_set_model(p->sort_model, G_LIST_MODEL(new_store));
-    g_object_unref(p->store);
-    p->store = new_store;
 
-    p->search_mode = TRUE;
-    gtk_widget_set_visible(p->search_btn, TRUE);
-    gtk_editable_set_text(GTK_EDITABLE(p->path_entry), info_text);
-
-    const char *suffix = search_cancelled ? " (cancelled)" : "";
-    gchar *done_msg = g_strdup_printf("Found: %d files%s  (Enter=go to file, Backspace=back)",
-                                      result_count, suffix);
-    gtk_label_set_text(GTK_LABEL(p->status_label), done_msg);
-    g_free(done_msg);
+    SearchHist *h = g_new0(SearchHist, 1);
+    h->store  = new_store;
+    h->info   = search_cancelled ? g_strconcat(info_text, " (cancelled)", NULL)
+                                 : g_strdup(info_text);
+    h->needle = g_strdup(content);
+    h->origin = g_strdup(p->search_prev_cwd);
+    h->count  = result_count;
+    search_history_push(fm, h);
     g_free(info_text);
 
-    p->cursor_pos = 0;
-    if (g_list_model_get_n_items(G_LIST_MODEL(p->filter_model)) > 0) {
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), 0,
-                                  NULL, GTK_LIST_SCROLL_SELECT, NULL);
-    }
     p->inhibit_sel = FALSE;
-    gtk_widget_grab_focus(p->column_view);
+    search_show(p, h);
 
     g_free(pattern);
     g_free(content);

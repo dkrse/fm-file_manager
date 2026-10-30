@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libgtk-4-dev libadwaita-1-dev libssh2-1-dev libgtksourceview-5-dev
+
+      - name: Build (-Werror)
+        run: make CFLAGS_EXTRA=-Werror
+
+      - name: Unit tests
+        run: make test
+
+      - name: Unit tests (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make test-asan
+
+      - name: Debug build (sanitizers)
+        run: make debug
+
+  build-minimal:
+    # optional dependencies missing: plain GTK4, no SFTP, no GtkSourceView
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make test

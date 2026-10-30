@@ -1,5 +1,70 @@
 # Changelog
 
+## [2.13.0] — 2026-10-30
+
+**Bug fixes (code review):**
+- Overwrite no longer deletes the source when the destination directory contains it; overwrites write to a temp file and rename over the target only on success (local, SFTP upload/download, editor save, SFTP save, pack)
+- Moves delete the source only if everything was copied (directory read errors are now errors)
+- SFTP: remote symlinks are recreated, never followed locally (remote→remote transfers could upload a local file); case-only rename on case-insensitive servers no longer deletes the file; read errors no longer yield truncated files; long names no longer cut directory listings short
+- Host key of a different type, `@revoked` keys and check failures are refused instead of prompting
+- Editor keeps the file encoding (Windows-1250/Latin-1), opens binary files read-only, writes through symlinks and keeps permissions
+- SSH bookmarks stored one per group (names with `;`/`|` no longer break them; old format migrates)
+- Search results: per-panel copies, marks keyed by full path, panel locked during a scan, window close during a scan is safe
+- Too long paths are refused instead of truncated; relative extract/pack destinations resolve against the panel; cut clipboard kept when the move failed; conflict dialog no longer shows local details for remote files; overlapping SSH connects refused; viewer temp dirs removed on exit
+
+**Performance:**
+- Name sorting uses a precomputed collation key per item (`g_utf8_collate_key_for_filename`) — ~12x faster on 50k files; numbers now sort naturally (`file2` before `file10`)
+- Marking (Space, Shift+arrows, +, -, *, Ctrl+A) re-renders only the affected rows via the FileItem `mark-changed` signal instead of re-sorting the whole panel
+- Directory monitor batches events (150 ms); more than 64 changes trigger a single reload instead of thousands of per-file updates
+- File search (F2) runs in a worker thread — the UI stays responsive and Cancel reacts immediately; content search no longer allocates a lower-cased copy of every line for ASCII needles
+- Directories are read in a worker thread; if reading takes longer than 150 ms a "Reading directory" window with Cancel appears (slow / network mounts)
+- SFTP auto-refresh lists the remote directory in a worker thread; main-thread SFTP access now always takes the connection lock
+- F1 shows a simple keyboard shortcut list
+
+### Background file operations, SSH host key verification, clipboard, marking, tests
+
+**File operations (rewritten):**
+- Copy/move/delete/archive now run in a worker thread (`job.c`) — the UI no longer freezes on slow SFTP links; no more nested `g_main_context_iteration` pumping
+- New GTK-free engine `fsops.c`: overwrite prompt (Overwrite / Overwrite all / Skip / Skip all / Cancel) — previously existing files were silently overwritten
+- Fixed data loss: copying a file onto itself truncated it to 0 bytes
+- Refuses to copy/move a directory into itself (previously infinite recursion)
+- Preserves permissions, timestamps and symlinks; directories are merged; partial files are removed on error/cancel
+- Move into an existing directory merges instead of failing; source is deleted only if everything was moved
+- First error message is shown in the status bar
+- Operations on search results use the real file locations
+- Delete: local files go to the trash by default; Shift+Del / Shift+F8 deletes permanently
+- Rename asks before replacing an existing file; markup in file names is escaped
+- Pack: extension follows the chosen format, asks before replacing, no more process-wide `chdir()`; archive tool errors (stderr) are shown
+
+**Total Commander style dialogs:**
+- F5/F6: "Copy N files/directories to:" with the other panel's path pre-selected — just press Enter; Esc cancels; typing `dir/newname` copies/moves a single item under a new name; relative paths are relative to the source panel
+- F8/Del: "Do you really want to delete …?" Yes/No (Enter = Yes, Esc/N = No)
+- Progress window: From / To paths, current-file bar and total bar, size, speed, time left; deletion shows item progress; Esc cancels
+
+**Search results are kept (TC "feed to listbox" style):**
+- Enter on a result opens the file in its default application — the results stay
+- Ctrl+PgDn / Ctrl+Enter jumps to the file's directory with the cursor on it; Alt+← or the 🔍 button returns to the results (cursor position remembered); leaving with Backspace/navigation also keeps them
+- Shift+F2: history of the last 10 searches
+- Content search shows line number and matching line next to each file; F3 opens the viewer on that line with the searched text highlighted, F3 / Shift+F3 jump between matches
+
+**New features:**
+- System clipboard: Ctrl+C / Ctrl+X / Ctrl+V (gnome/KDE compatible), Ctrl+Shift+C copies paths
+- Marking: `+`/`-` select/unselect group by pattern, `*` invert, Ctrl+A / Ctrl+Shift+A, Shift+arrows; status shows size of marked files
+- Right-click context menu; "Files" submenu in the panel menu
+- Properties dialog (Alt+Enter) with permission editor (local + SFTP)
+- New file (Shift+F4), duplicate in place (Shift+F5), nested mkdir (`a/b/c`)
+- Auto-refresh now handles renames and moves (`MOVED_IN/OUT`, `RENAMED`)
+
+**SSH / SFTP:**
+- Host key verification against `~/.ssh/known_hosts` (SHA256 fingerprint prompt for unknown hosts, hard failure on changed keys)
+- Auth: ssh-agent, `id_ed25519` / `id_ecdsa` / `id_rsa`, passphrase-protected keys, password, keyboard-interactive
+- IPv6 and multi-address hosts; 60 s session timeout; start in the remote home directory
+- Per-connection lock: polling, viewer and editor back off while a job uses the session
+
+**Code quality:**
+- `main.c` and `fileops.c` split into `icons.c`, `monitor.c`, `selection.c`, `clipboard.c`, `dialogs.c`, `job.c`, `archive.c`, `fsops.c`, `util.c`
+- Unit tests (`make test`, `make test-asan`), sanitizer build (`make debug`), GitHub Actions CI
+
 ## [2.12.0] — 2026-04-02
 
 ### Dark / Light theme, image preview, search hardening, Display tab, security & memory fixes
