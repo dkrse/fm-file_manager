@@ -41,6 +41,7 @@ make uninstall    → removes system install
 make test         → build/test_core (GLib tests of util.c + fsops.c)
 make debug        → build-debug/fm with -fsanitize=address,undefined
 make test-asan    → tests under sanitizers
+make test-sftp    → build/test_sftp via tests/sftp_test.sh (temp sshd on 127.0.0.1, own keys; ~/.ssh untouched)
 ```
 
 ## Data flow

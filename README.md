@@ -119,6 +119,7 @@ make uninstall        # remove system install
 make clean            # clean build artifacts
 make test             # unit tests of the file-operation core (no display needed)
 make test-asan        # the same under AddressSanitizer + UBSan
+make test-sftp        # SFTP tests against a private throwaway sshd (skipped without sshd)
 make debug            # debug build with sanitizers (build-debug/fm)
 ```
 

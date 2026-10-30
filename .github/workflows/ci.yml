@@ -14,7 +14,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config \
-            libgtk-4-dev libadwaita-1-dev libssh2-1-dev libgtksourceview-5-dev
+            libgtk-4-dev libadwaita-1-dev libssh2-1-dev libgtksourceview-5-dev \
+            openssh-server
 
       - name: Build (-Werror)
         run: make CFLAGS_EXTRA=-Werror
@@ -27,6 +28,11 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: make test-asan
+
+      - name: SFTP integration tests (private sshd)
+        run: |
+          sudo mkdir -p /run/sshd
+          make test-sftp
 
       - name: Debug build (sanitizers)
         run: make debug

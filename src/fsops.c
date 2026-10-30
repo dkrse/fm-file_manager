@@ -708,9 +708,16 @@ static int upload_link(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
     int r = FS_OK;
     /* OpenSSH swaps the SSH_FXP_SYMLINK arguments; libssh2 sends them as
      * (target, link) which is what OpenSSH expects */
-    if (libssh2_sftp_symlink(sftp, target, tmp ? tmp : (char *)remote) != 0)
-        r = sftp_fail(c, sftp, remote);
-    else if (tmp && !fs_sftp_replace(sftp, tmp, remote)) {
+    const char *link = tmp ? tmp : remote;
+    if (libssh2_sftp_symlink(sftp, target, (char *)link) != 0) {
+        /* some libssh2 versions return a positive value on success –
+         * trust the server: did the link appear with our target? */
+        char buf[4096];
+        int n = libssh2_sftp_readlink(sftp, link, buf, sizeof(buf) - 1);
+        if (n < 0 || (buf[n] = '\0', strcmp(buf, target) != 0))
+            r = sftp_fail(c, sftp, remote);
+    }
+    if (r == FS_OK && tmp && !fs_sftp_replace(sftp, tmp, remote)) {
         r = sftp_fail(c, sftp, remote);
         libssh2_sftp_unlink(sftp, tmp);
     }

@@ -84,7 +84,7 @@ endif
 OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 BIN    := $(BUILDDIR)/$(TARGET)
 
-.PHONY: all clean install user-install uninstall debug test test-asan
+.PHONY: all clean install user-install uninstall debug test test-asan test-sftp
 
 all: $(BIN)
 
@@ -114,6 +114,21 @@ test: $(TEST_BIN)
 
 test-asan:
 	$(MAKE) SAN=1 test
+
+# SFTP integration tests – start a private sshd (skipped without one)
+SFTP_TEST_BIN := $(BUILDDIR)/test_sftp
+
+$(SFTP_TEST_BIN): tests/test_sftp.c $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(CORE_SRCS)) $(HDRS)
+	$(CC) $(CFLAGS) tests/test_sftp.c $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(CORE_SRCS)) \
+	      -o $@ $(TEST_LIBS) $(LDSAN)
+
+test-sftp:
+ifneq ($(findstring HAVE_LIBSSH2,$(CFLAGS)),)
+	$(MAKE) $(SFTP_TEST_BIN)
+	tests/sftp_test.sh $(SFTP_TEST_BIN)
+else
+	@echo "sftp tests skipped: built without libssh2"
+endif
 
 clean:
 	rm -rf build build-debug
