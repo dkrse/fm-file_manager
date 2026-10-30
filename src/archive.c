@@ -107,6 +107,7 @@ static gboolean run_archive(FM *fm, const char *title, const char *phase, ArcJob
 void fo_extract(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     if (p->ssh_conn) {
         fm_status(fm, "Extract is not supported on SFTP panels");
         return;
@@ -176,8 +177,7 @@ void fo_extract(FM *fm)
     g_free(name); g_free(archive); g_free(dest);
     panel_reload(&fm->panels[0]);
     panel_reload(&fm->panels[1]);
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -202,6 +202,7 @@ static void on_pack_fmt_changed(GObject *dd, GParamSpec *ps, GtkWidget *name_ent
 void fo_pack(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     if (p->ssh_conn) {
         fm_status(fm, "Pack is not supported on SFTP panels");
         return;
@@ -397,6 +398,5 @@ out:
     g_free(arc_name);
     g_free(dst_dir);
     g_list_free_full(targets, g_free);
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }

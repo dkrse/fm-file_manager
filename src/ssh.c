@@ -630,6 +630,8 @@ void panel_load_remote(Panel *p, const char *path)
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
 
+    arc_panel_leave(p);                 /* SFTP opened over an archive view */
+
     /* Leaving local search results (SFTP opened in that panel) */
     if (p->search_mode) {
         search_detach(p);
@@ -1002,8 +1004,7 @@ static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_d
 
     /* Restore focus */
     Panel *fp = &ctx->fm->panels[ctx->fm->active];
-    fp->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(fp->column_view);
+    panel_focus(fp);
 
     g_free(ctx->user);
     g_free(ctx);

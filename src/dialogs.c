@@ -383,7 +383,7 @@ int ask_choice(FM *fm, const char *title, const char *markup, GList *files,
 
 static const char *const help_keys[][2] = {
     { "Tab",                 "Switch panel" },
-    { "Enter / Backspace",   "Open / parent directory" },
+    { "Enter / Backspace",   "Open (archives as folders) / parent directory" },
     { "Space, Insert",       "Mark file" },
     { "+  -  *",             "Mark group / unmark group / invert" },
     { "Ctrl+A, Ctrl+Shift+A","Mark all / unmark all" },
@@ -402,8 +402,11 @@ static const char *const help_keys[][2] = {
     { "Ctrl+H",              "Hidden files" },
     { "Ctrl+R",              "Refresh" },
     { "Ctrl+=",              "Same directory in both panels" },
+    { "Ctrl+T / Ctrl+W",     "New tab / close tab" },
+    { "Ctrl+Tab / +Shift",   "Next / previous tab" },
+    { "Ctrl+\u2191",         "Directory under cursor in a new tab" },
     { "Alt+←",          "Back to search results" },
-    { "Ctrl+PgDn",           "Go to found file" },
+    { "Ctrl+PgDn",           "Go to found file / enter archive" },
     { "F10",                 "Quit" },
 };
 

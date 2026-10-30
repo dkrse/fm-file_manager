@@ -626,6 +626,7 @@ void search_detach(Panel *p)
 /* Put a history entry into the panel */
 static void search_show(Panel *p, SearchHist *h)
 {
+    arc_panel_leave(p);         /* results replace an archive view */
     if (!p->search_mode) {
         if (strlen(p->cwd) >= sizeof(p->search_prev_cwd)) {
             fm_status(p->fm, "Path too long");
@@ -674,7 +675,7 @@ static void search_show(Panel *p, SearchHist *h)
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), p->cursor_pos,
                                   NULL, GTK_LIST_SCROLL_SELECT, NULL);
     p->inhibit_sel = FALSE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }
 
 gboolean search_restore(Panel *p)
@@ -805,8 +806,7 @@ void search_history_dialog(FM *fm)
             return;
         }
     }
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }
 
 /* ── Main search entry point ─────────────────────────────────────── */
@@ -841,6 +841,7 @@ void search_run(FM *fm)
         fm_status(fm, "Search on remote panel is not supported");
         return;
     }
+    if (arc_panel_readonly_msg(active_panel(fm))) return;
 
     gchar *pattern = NULL, *content = NULL, *search_dir_path = NULL;
     gint64 size_min, size_max;

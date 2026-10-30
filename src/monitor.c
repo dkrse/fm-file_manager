@@ -346,6 +346,7 @@ void panel_monitor_start(Panel *p)
 
     if (!p->fm->auto_refresh) return;
     if (p->search_mode) return;
+    if (p->arc_file) return;            /* archives are not watched */
 
 #ifdef HAVE_LIBSSH2
     if (p->ssh_conn) {

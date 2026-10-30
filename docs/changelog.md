@@ -2,7 +2,15 @@
 
 ## [2.13.0] — 2026-10-30
 
+**Archives as directories:**
+- Enter / Ctrl+PgDn on a zip, jar, tar.*, 7z, iso, rar or cpio file browses it read-only in the panel (libarchive, optional); F5 extracts the selection with progress and overwrite prompts, Enter / F3 / F4 on a file open a temporary copy, Backspace at the top leaves the archive; writing operations report "Archive is read-only"
+
+**Tabs:**
+- Total Commander style tabs per panel: Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+↑, clickable tab strip (middle-click closes), "New tab" / "Close tab" in the panel menu; tabs and the active tab are saved to `settings.ini` (`[tabs]`) on exit and restored at startup
+
 **Bug fixes (code review):**
+- After a progress window closes the cursor returns to the active panel; arrow keys with no focused panel no longer jump into the other panel's path entry
+- Tab between panels no longer gets stuck after a long job or a reload (the active panel followed the focus "enter" signal, which does not come when the focused row is replaced); all refocusing goes through `panel_focus()`
 - Overwrite no longer deletes the source when the destination directory contains it; overwrites write to a temp file and rename over the target only on success (local, SFTP upload/download, editor save, SFTP save, pack)
 - Moves delete the source only if everything was copied (directory read errors are now errors)
 - SFTP: remote symlinks are recreated, never followed locally (remote→remote transfers could upload a local file); case-only rename on case-insensitive servers no longer deletes the file; read errors no longer yield truncated files; long names no longer cut directory listings short

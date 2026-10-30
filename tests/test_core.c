@@ -487,6 +487,172 @@ static void test_delete(void)
     g_free(outside); g_free(ln); g_free(f); g_free(dd); g_free(d); g_free(root);
 }
 
+/* ── arcfs: archives as directories ──────────────────────────────── */
+
+#ifdef HAVE_LIBARCHIVE
+#include "arcfs.h"
+#include <archive.h>
+#include <archive_entry.h>
+
+/* Build a tar with libarchive – lets the tests craft hostile entries
+ * ("../x", symlinks pointing outside) that tar(1) would refuse. */
+typedef struct { const char *path; const char *data; const char *link; gboolean dir; } TarItem;
+
+static void make_tar(const char *file, const TarItem *items)
+{
+    struct archive *a = archive_write_new();
+    archive_write_set_format_pax_restricted(a);
+    g_assert_cmpint(archive_write_open_filename(a, file), ==, ARCHIVE_OK);
+    for (const TarItem *it = items; it->path; it++) {
+        struct archive_entry *e = archive_entry_new();
+        archive_entry_set_pathname(e, it->path);
+        archive_entry_set_mtime(e, 1000000000, 0);
+        if (it->dir) {
+            archive_entry_set_filetype(e, AE_IFDIR);
+            archive_entry_set_perm(e, 0755);
+        } else if (it->link) {
+            archive_entry_set_filetype(e, AE_IFLNK);
+            archive_entry_set_symlink(e, it->link);
+            archive_entry_set_perm(e, 0777);
+        } else {
+            archive_entry_set_filetype(e, AE_IFREG);
+            archive_entry_set_perm(e, 0640);
+            archive_entry_set_size(e, (la_int64_t)strlen(it->data));
+        }
+        archive_write_header(a, e);
+        if (!it->dir && !it->link) archive_write_data(a, it->data, strlen(it->data));
+        archive_entry_free(e);
+    }
+    archive_write_close(a);
+    archive_write_free(a);
+}
+
+static FsAnswer arc_overwrite(FsCtx *c, const char *s, const char *d)
+{
+    (void)c; (void)s; (void)d;
+    return FS_ANS_OVERWRITE;
+}
+
+static void test_arcfs_list(void)
+{
+    gchar *root = tmp_root(), *tar = J(root, "t.tar");
+    static const TarItem items[] = {
+        { "./top.txt",        "T",  NULL, FALSE },
+        { "a/b/deep.txt",     "DD", NULL, FALSE },   /* a, a/b implied */
+        { "../evil.txt",      "E",  NULL, FALSE },   /* dropped */
+        { "a/ln",             NULL, "b/deep.txt", FALSE },
+        { NULL, NULL, NULL, FALSE }
+    };
+    make_tar(tar, items);
+    g_assert_true(arcfs_supported(tar));
+    g_assert_false(arcfs_supported("x.txt"));
+
+    GError *err = NULL;
+    GPtrArray *e = arcfs_list(tar, &err);
+    g_assert_no_error(err);
+    /* top.txt, a, a/b, a/b/deep.txt, a/ln */
+    g_assert_cmpuint(e->len, ==, 5);
+    for (guint i = 0; i < e->len; i++) {
+        ArcEntry *x = g_ptr_array_index(e, i);
+        g_assert_true(fs_relpath_is_safe(x->path));
+    }
+
+    GPtrArray *rootc = arcfs_children(e, "");
+    g_assert_cmpuint(rootc->len, ==, 2);                    /* a, top.txt */
+    GPtrArray *ac = arcfs_children(e, "a");
+    g_assert_cmpuint(ac->len, ==, 2);                       /* a/b, a/ln */
+    gboolean saw_dir = FALSE, saw_link = FALSE;
+    for (guint i = 0; i < ac->len; i++) {
+        ArcEntry *x = g_ptr_array_index(ac, i);
+        if (strcmp(x->path, "a/b") == 0) saw_dir = x->is_dir;
+        if (strcmp(x->path, "a/ln") == 0) saw_link = g_strcmp0(x->link, "b/deep.txt") == 0;
+    }
+    g_assert_true(saw_dir && saw_link);
+
+    const char *sel[] = { "a" };
+    g_assert_cmpint(arcfs_size(e, sel, 1), ==, 2);
+
+    g_ptr_array_unref(rootc); g_ptr_array_unref(ac); g_ptr_array_unref(e);
+    g_assert_null(arcfs_list(root, &err));                  /* a directory */
+    g_clear_error(&err);
+    rm_rf(root);
+    g_free(tar); g_free(root);
+}
+
+static void test_arcfs_extract(void)
+{
+    gchar *root = tmp_root(), *tar = J(root, "t.tar"), *out = J(root, "out");
+    static const TarItem items[] = {
+        { "a/b/x.txt",  "X",  NULL, FALSE },
+        { "a/b/s/y.txt","Y",  NULL, FALSE },
+        { "a/ln",       NULL, "b/x.txt", FALSE },
+        { "other.txt",  "O",  NULL, FALSE },
+        { NULL, NULL, NULL, FALSE }
+    };
+    make_tar(tar, items);
+
+    /* from inside "a/b": the base is stripped */
+    FsCtx c = { .conflict = arc_overwrite };
+    const char *sel[] = { "a/b/x.txt", "a/b/s" };
+    g_assert_cmpint(arcfs_extract(&c, tar, "a/b", sel, 2, out), ==, FS_OK);
+    gchar *x = J(out, "x.txt"), *y = g_build_filename(out, "s", "y.txt", NULL);
+    gchar *dx = read_file(x), *dy = read_file(y);
+    g_assert_cmpstr(dx, ==, "X");
+    g_assert_cmpstr(dy, ==, "Y");
+    struct stat st;
+    g_assert_cmpint(stat(x, &st), ==, 0);
+    g_assert_cmpint(st.st_mode & 0777, ==, 0640);
+    g_assert_cmpint(st.st_mtime, ==, 1000000000);
+    gchar *other = J(out, "other.txt");
+    g_assert_false(g_file_test(other, G_FILE_TEST_EXISTS));
+    g_free(other);
+
+    /* overwrite keeps working, no temp files left */
+    g_assert_cmpint(arcfs_extract(&c, tar, "a/b", sel, 1, out), ==, FS_OK);
+    GDir *d = g_dir_open(out, 0, NULL);
+    const char *n;
+    while ((n = g_dir_read_name(d))) g_assert_null(strstr(n, ".fm-"));
+    g_dir_close(d);
+
+    /* symlinks are recreated, not followed */
+    const char *sel2[] = { "a/ln" };
+    g_assert_cmpint(arcfs_extract(&c, tar, "a", sel2, 1, out), ==, FS_OK);
+    gchar *ln = J(out, "ln");
+    gchar *t = g_file_read_link(ln, NULL);
+    g_assert_cmpstr(t, ==, "b/x.txt");
+
+    fs_ctx_clear(&c);
+    g_free(t); g_free(ln); g_free(dx); g_free(dy); g_free(x); g_free(y);
+    rm_rf(root);
+    g_free(tar); g_free(out); g_free(root);
+}
+
+/* An archive that plants a symlink to a directory outside and then
+ * writes "through" it must not touch the outside directory. */
+static void test_arcfs_symlink_escape(void)
+{
+    gchar *root = tmp_root(), *tar = J(root, "evil.tar");
+    gchar *out = J(root, "out"), *outside = J(root, "outside");
+    g_mkdir(outside, 0755);
+    TarItem items[] = {
+        { "esc",         NULL, outside, FALSE },
+        { "esc/pwn.txt", "P",  NULL,    FALSE },
+        { NULL, NULL, NULL, FALSE }
+    };
+    make_tar(tar, items);
+
+    FsCtx c = { .conflict = arc_overwrite };
+    const char *sel[] = { "esc" };
+    int r = arcfs_extract(&c, tar, "", sel, 1, out);
+    g_assert_cmpint(r, ==, FS_ERR);
+    gchar *pwn = J(outside, "pwn.txt");
+    g_assert_false(g_file_test(pwn, G_FILE_TEST_EXISTS));
+    fs_ctx_clear(&c);
+    rm_rf(root);
+    g_free(pwn); g_free(tar); g_free(out); g_free(outside); g_free(root);
+}
+#endif /* HAVE_LIBARCHIVE */
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -509,5 +675,10 @@ int main(int argc, char **argv)
     g_test_add_func("/fsops/overwrite-ancestor", test_overwrite_ancestor);
     g_test_add_func("/fsops/overwrite-safe",   test_overwrite_safe);
     g_test_add_func("/fsops/move-unreadable",  test_move_unreadable_keeps_source);
+#ifdef HAVE_LIBARCHIVE
+    g_test_add_func("/arcfs/list",             test_arcfs_list);
+    g_test_add_func("/arcfs/extract",          test_arcfs_extract);
+    g_test_add_func("/arcfs/symlink-escape",   test_arcfs_symlink_escape);
+#endif
     return g_test_run();
 }

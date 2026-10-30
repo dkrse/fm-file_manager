@@ -330,15 +330,22 @@ static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
     gtk_window_destroy(GTK_WINDOW(win));
 
     Panel *ap = active_panel(fm);
-    ap->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(ap->column_view);
+    panel_focus(ap);
 }
 
 void viewer_show(FM *fm)
 {
+    if (active_panel(fm)->arc_file) { arc_panel_open(fm, 1); return; }
+    viewer_show_path(fm, NULL, NULL);
+}
+
+/* path NULL = the item under the cursor; otherwise a local file shown
+ * as `name` (temporary copy extracted from an archive) */
+void viewer_show_path(FM *fm, const char *path, const char *shown_name)
+{
     Panel *p = active_panel(fm);
 
-    gchar *name = panel_cursor_name(p);
+    gchar *name = path ? g_strdup(shown_name) : panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) {
         g_free(name);
         fm_status(fm, "No file is selected");
@@ -346,8 +353,8 @@ void viewer_show(FM *fm)
     }
 
     /* Image preview — local files only, when enabled */
-    if (fm->viewer_image_preview && !p->ssh_conn && is_image_file(name)) {
-        gchar *fullpath = panel_cursor_fullpath(p);
+    if (fm->viewer_image_preview && (path || !p->ssh_conn) && is_image_file(name)) {
+        gchar *fullpath = path ? g_strdup(path) : panel_cursor_fullpath(p);
         if (fullpath) {
             struct stat st;
             if (lstat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -363,7 +370,7 @@ void viewer_show(FM *fm)
     gchar *content = NULL;
     gsize  length  = 0;
 
-    if (p->ssh_conn) {
+    if (!path && p->ssh_conn) {
 #ifdef HAVE_LIBSSH2
         gchar *remote_path = g_strdup_printf("%s/%s",
             p->ssh_conn->remote_path, name);
@@ -380,7 +387,7 @@ void viewer_show(FM *fm)
         return;
 #endif
     } else {
-        gchar *fullpath = panel_cursor_fullpath(p);
+        gchar *fullpath = path ? g_strdup(path) : panel_cursor_fullpath(p);
         struct stat st;
         if (!fullpath || (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode))) {
             fm_status(fm, "Viewer: '%s' is a directory", name);
@@ -592,8 +599,7 @@ void viewer_show(FM *fm)
     gtk_window_destroy(GTK_WINDOW(ctx.window));
 
     Panel *ap = active_panel(fm);
-    ap->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(ap->column_view);
+    panel_focus(ap);
 
     g_free(name);
 }

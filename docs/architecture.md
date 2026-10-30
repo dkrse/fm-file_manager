@@ -21,6 +21,8 @@ Single-window GTK4 application (with optional libadwaita for runtime theme switc
 | `src/fileitem.c` | `FileItem` GObject subclass (model for column list) |
 | `src/fileops.c` | Copy/move (`fo_transfer`), duplicate, delete/trash, mkdir, new file, rename, properties — dialogs on the main thread, work in `Job`s |
 | `src/archive.c` | Extract / pack: child process watched by a `Job` worker, stderr captured |
+| `include/arcfs.h`, `src/arcfs.c` | libarchive core (GLib-only, worker-safe): `arcfs_list` (table of contents incl. implied dirs, unsafe paths dropped), `arcfs_children`, `arcfs_size`, `arcfs_extract` (temp + rename, never through symlinks, conflicts via `FsCtx`) |
+| `src/arcpanel.c` | Archives as directories in a panel: enter/leave, render, temp copies for Enter/F3/F4, F5 extraction `Job`, `arc_panel_readonly_msg` |
 | `src/search.c` | Advanced search: glob + content grep + size filter, string-interned results, MC-style grouped panel display; same-filesystem traversal (`-xdev`), symlink loop protection, visited-inode tracking, cancel support |
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, theme (dark/light), `apply_*_css`, `apply_theme`; theme-aware color helpers (`fm_visible_color`, `fm_link_color`, `fm_exec_color`, `fm_scheme_for_theme`); SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
@@ -203,6 +205,20 @@ reachable via `search_restore()` (Alt+←, results button) or `search_history_di
 (Ctrl+PgDn / Ctrl+Enter / Enter on a directory header) loads the directory. The viewer
 asks `search_needle()` and `FileItem.line` to open on the matching line.
 
+## Tabs
+
+`Panel.tabs` is a `GPtrArray` of `PanelTab { path, cursor_name }` (local directories
+only, always at least one), `Panel.tab_active` the shown one. The widgets are shared:
+switching (`panel_tab_cycle()`) remembers the current dir + cursor name in the old tab
+(`tab_remember()`, search results count as `search_prev_cwd`), then `panel_load()`s the
+new tab's path and `panel_select_name()`s its cursor. `panel_load()` calls `tab_track()`
+on success, so the active tab follows every navigation (one place). The strip
+(`tab_scroll` → `tab_box`, flat buttons, `.fm-tab` / `.fm-tab-active`) is rebuilt by
+`tabs_rebuild()` and hidden with a single tab. SFTP panels refuse tab operations
+(status message); tabs recorded before connecting stay. On `shutdown`
+`settings_save_tabs()` writes `[tabs] left=/a;/b`, `left_active=N` (same for `right`);
+`panel_tabs_restore()` skips missing directories at startup.
+
 ## Archive support
 
 `fo_extract()` and `fo_pack()` in `fileops.c`:
@@ -214,6 +230,22 @@ asks `search_needle()` and `FileItem.line` to open on the matching line.
 **Extract:** Detects format → builds appropriate argv (`tar xf`, `unzip`, `7z x`, `unrar x`) → runs with destination `-C`/`-d`/`-o` flag.
 
 **Pack:** Dialog with format dropdown (6 options), archive name entry, destination entry. Builds argv based on selected format: `tar czf/cjf/cJf/--zstd`, `zip -r`, `7z a`.
+
+### Archives as directories (`arcpanel.c`, needs libarchive)
+
+Enter / Ctrl+PgDn on a file `arcfs_supported()` accepts calls `arc_panel_enter()`: the table of contents is read by `arcfs_list()` through `fm_wait_work()` (worker thread; after 150 ms a modal "Reading…" window with Cancel – the same helper `panel_load` uses for slow directories). If listing fails, the file is opened in its default application as before.
+
+**State:** `Panel.arc_file` (archive path, NULL = not inside), `arc_dir` (inner directory, `""` = root), `arc_entries` (`ArcEntry*`), `arc_stamp` (mtime/size when listed). `p->cwd` stays the directory containing the archive, so tabs, Ctrl+=, the SFTP/other-panel defaults and `panel_load` keep working; the path entry shows `<archive>/<inner dir>`. Directory monitoring is off while inside.
+
+**Render:** `arc_render()` builds `FileItem`s from `arcfs_children()` via `file_item_from_stat()` (fake `struct stat`), ".." first, same sorter; marks are keyed by name and cleared on directory change.
+
+**Navigation:** ".." / Backspace go up inside; at the root they `panel_load()` the containing directory with the cursor on the archive. `panel_load()` / `panel_load_remote()` / `search_show()` call `arc_panel_leave()` (frees the state) – one place for every way of leaving. `panel_reload()` re-lists only when the archive file changed (`arc_stamp`), otherwise re-renders.
+
+**Files:** Enter / F3 / F4 extract the single file into `g_dir_make_tmp("fm-arc-XXXXXX")` (removed on exit, `arc_panel_cleanup`) and open it in the default app, `viewer_show_path()` or `editor_show_path()` (the editor works on the temporary copy; changes are not written back).
+
+**F5:** `arc_panel_copy_out()` asks for a local destination, then runs `arcfs_extract()` in a `Job` (`job_set_total(arcfs_size())`, overwrite prompts through the job's `FsCtx`). An SFTP target panel is refused.
+
+**Read-only:** `arc_panel_readonly_msg(p)` gates every writing entry point (F6, Shift+F6/F9, F7, F8/Del, Shift+F4, Shift+F5, Alt+Enter, Alt+E, Alt+P, F2, Ctrl+C/X/V) and refuses copies/pastes into a panel that shows an archive. `panel_selection_paths()` / `panel_cursor_fullpath()` return `<archive>/<inner>` display paths there.
 
 ## Auto-refresh (directory monitoring)
 
@@ -346,6 +378,9 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `editor_style_scheme` | Color scheme (GtkSourceView) |
 | `theme` | Theme: 0=dark, 1=light (default 1) |
 
+Section `[tabs]`: `left`, `right` (string lists of tab directories), `left_active`,
+`right_active` (index of the shown tab) — written on exit.
+
 ## Dependencies
 
 | Library | Required | Function |
@@ -355,6 +390,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | libadwaita-1 | optional | runtime dark/light theme switching (`#ifdef HAVE_LIBADWAITA`); uses `AdwApplication` + `AdwStyleManager` |
 | libssh2 | optional | SFTP panel (`#ifdef HAVE_LIBSSH2`) |
 | gtksourceview-5 | optional | full syntax highlighting (`#ifdef HAVE_GTKSOURCEVIEW`) |
+| libarchive | optional | archives as directories (`#ifdef HAVE_LIBARCHIVE`, only in `arcfs.c` / `arc_panel_enter`) |
 
 ## Important notes
 

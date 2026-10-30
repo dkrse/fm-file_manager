@@ -97,6 +97,12 @@ struct _SshConn {
 
 typedef struct _FM FM;
 
+/* Panel tab: a remembered local directory; the panel widgets are shared */
+typedef struct {
+    gchar *path;
+    gchar *cursor_name;   /* item under the cursor when the tab was left */
+} PanelTab;
+
 typedef struct {
     GtkWidget          *frame;          /* GtkBox vertical – outer container  */
     GtkWidget          *path_entry;     /* GtkEntry – current path            */
@@ -138,6 +144,16 @@ typedef struct {
     GtkWidget          *results_btn;   /* "back to search results" (Alt+Left)  */
     gpointer            cur_search;    /* SearchHist* shown in the panel        */
     gpointer            last_search;   /* SearchHist* to return to after a jump */
+    /* tabs (Ctrl+T / Ctrl+W / Ctrl+Tab) */
+    GPtrArray          *tabs;          /* PanelTab*, always at least one     */
+    guint               tab_active;    /* index into tabs                    */
+    GtkWidget          *tab_scroll;    /* tab strip – shown with 2+ tabs     */
+    GtkWidget          *tab_box;
+    /* archive browsing (arcpanel.c) – cwd stays the archive's directory */
+    gchar              *arc_file;      /* local archive path, NULL = not in one */
+    gchar              *arc_dir;       /* inner directory, "" = archive root  */
+    GPtrArray          *arc_entries;   /* ArcEntry* table of contents         */
+    gint64              arc_stamp;     /* archive mtime/size when listed      */
 } Panel;
 
 struct _FM {
@@ -243,14 +259,38 @@ void   panel_load(Panel *p, const char *path);
 void   panel_load_remote(Panel *p, const char *path);
 void   panel_reload(Panel *p);
 void   panel_go_up(Panel *p);
+void   panel_tab_new(Panel *p, const char *path); /* NULL = current dir */
+void   panel_tab_close(Panel *p);
+void   panel_tab_cycle(Panel *p, int delta);
+void   panel_tabs_restore(Panel *p, gchar **paths, int active);
+void   panel_tabs_free(Panel *p);
 gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
 gchar *panel_cursor_fullpath(Panel *p);     /* full path (search-aware), caller must g_free() */
 GList *panel_selection(Panel *p);            /* names; g_list_free_full(l, g_free) */
 GList *panel_selection_paths(Panel *p);      /* full local/remote paths, search-aware */
 const char *panel_dir(Panel *p);             /* cwd or remote cwd */
 void   panel_update_status(Panel *p);
+void   fm_refocus_if_lost(FM *fm);                  /* after a modal window closed */
+void   panel_focus(Panel *p);                      /* make active + keyboard cursor */
 void   panel_select_name(Panel *p, const char *name);  /* move cursor to item */
 FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st);
+/* Run fn(arg) in a worker; after 150 ms a modal "Reading <what>…" window
+ * with Cancel appears.  Cancelled → NULL + *cancelled, the worker's result
+ * is then dropped with free_result; arg is freed with free_arg at the end. */
+gpointer fm_wait_work(FM *fm, const char *title, const char *what,
+                      GThreadFunc fn, gpointer arg, GDestroyNotify free_arg,
+                      GDestroyNotify free_result, gboolean *cancelled);
+
+/* ── archives as directories (arcpanel.c, read-only) ──────────────── */
+gboolean arc_panel_enter(Panel *p, const char *archive); /* FALSE = not browsable */
+void     arc_panel_leave(Panel *p);          /* forget archive state (panel_load) */
+void     arc_panel_activate(Panel *p);       /* Enter inside an archive          */
+void     arc_panel_go_up(Panel *p);          /* ".." / Backspace                 */
+void     arc_panel_reload(Panel *p);         /* re-list the archive              */
+gboolean arc_panel_readonly_msg(Panel *p);   /* TRUE (+ status) when in an archive */
+void     arc_panel_copy_out(FM *fm);         /* F5 – extract the selection       */
+void     arc_panel_open(FM *fm, int how);    /* temp copy: 0 default app, 1 F3, 2 F4 */
+void     arc_panel_cleanup(void);            /* exit: remove the temp copies     */
 
 /* ── marking (selection.c) ────────────────────────────────────────── */
 void sel_toggle_cursor(Panel *p, gboolean advance);
@@ -300,13 +340,17 @@ void search_update_buttons(Panel *p);
 
 /* ── viewer ───────────────────────────────────────────────────────── */
 void viewer_show(FM *fm);
+void viewer_show_path(FM *fm, const char *path, const char *name); /* local file */
 
 /* ── editor ───────────────────────────────────────────────────────── */
 void editor_show(FM *fm);
+void editor_show_path(FM *fm, const char *path);   /* local file */
 
 /* ── settings ─────────────────────────────────────────────────────── */
 void   settings_load(FM *fm);
 void   settings_save(FM *fm);
+void   settings_save_tabs(FM *fm);
+gchar **settings_load_tabs(int idx, int *active);   /* g_strfreev() */
 void   settings_dialog(FM *fm);
 void   settings_apply_columns(FM *fm);
 void   apply_editor_css(FM *fm);

@@ -77,6 +77,8 @@ gchar *panel_cursor_fullpath(Panel *p)
     gchar *path;
     if (p->search_mode && item->dir_path)
         path = g_build_filename(item->dir_path, item->name, NULL);
+    else if (p->arc_file)       /* display path only – not on disk */
+        path = g_build_filename(p->arc_file, p->arc_dir, item->name, NULL);
     else
         path = g_build_filename(p->cwd, item->name, NULL);
     g_object_unref(item);
@@ -114,7 +116,8 @@ const char *panel_dir(Panel *p)
 }
 
 /* Full paths of marked items (or cursor item); remote paths for SFTP,
- * the real location for search results. */
+ * the real location for search results, "<archive>/<inner>" inside an
+ * archive (not openable – see arcpanel.c). */
 GList *panel_selection_paths(Panel *p)
 {
     GList *out = NULL;
@@ -141,6 +144,8 @@ GList *panel_selection_paths(Panel *p)
                 path = fs_remote_join(p->ssh_conn->remote_path, it->name);
             else if (p->search_mode)
                 path = g_build_filename(it->dir_path, it->name, NULL);
+            else if (p->arc_file)   /* display path – callers gate archives */
+                path = g_build_filename(p->arc_file, p->arc_dir, it->name, NULL);
             else
                 path = g_build_filename(p->cwd, it->name, NULL);
             out = g_list_prepend(out, path);
@@ -181,72 +186,55 @@ void panel_select_name(Panel *p, const char *name)
  *  callers).  When a slow or network mount takes longer than
  *  DIR_WAIT_MS a small modal "Reading…" window appears; Esc / Cancel
  *  leaves the panel where it was and the worker result is discarded.
+ *  The waiting part is generic (fm_wait_work) – archive listings use it
+ *  too (arcpanel.c).
  * ─────────────────────────────────────────────────────────────────── */
 
 #define DIR_WAIT_MS 150
 
-typedef struct { struct stat st; char name[]; } DirEnt;
-
+/* Generic part: `fn(arg)` runs in a worker, the caller waits (see
+ * fm_wait_work in fm.h).  Shared by the worker and the waiting side. */
 typedef struct {
-    gchar     *path;
-    gboolean   hidden;
-    GPtrArray *ents;          /* DirEnt*, NULL = opendir failed */
-    GMutex     m;
-    GCond      c;
-    gboolean   done;
-    GMainLoop *loop;          /* set when the main thread waits in a loop */
-    gint       refs;
-} DirLoad;
+    GThreadFunc    fn;
+    gpointer       arg;
+    GDestroyNotify free_arg;
+    GDestroyNotify free_result;
+    gpointer       result;
+    GMutex         m;
+    GCond          c;
+    gboolean       done;
+    GMainLoop     *loop;      /* set when the main thread waits in a loop */
+    gint           refs;
+} WaitWork;
 
-static void dir_load_unref(DirLoad *d)
+static void wait_work_unref(WaitWork *w)
 {
-    if (!g_atomic_int_dec_and_test(&d->refs)) return;
-    if (d->ents) g_ptr_array_unref(d->ents);
-    g_mutex_clear(&d->m);
-    g_cond_clear(&d->c);
-    g_free(d->path);
-    g_free(d);
+    if (!g_atomic_int_dec_and_test(&w->refs)) return;
+    if (w->result && w->free_result) w->free_result(w->result);
+    if (w->free_arg) w->free_arg(w->arg);
+    g_mutex_clear(&w->m);
+    g_cond_clear(&w->c);
+    g_free(w);
 }
 
-static gboolean dir_load_quit_idle(gpointer loop)
+static gboolean wait_work_quit_idle(gpointer loop)
 {
     g_main_loop_quit(loop);
     g_main_loop_unref(loop);
     return G_SOURCE_REMOVE;
 }
 
-static gpointer dir_load_thread(gpointer data)
+static gpointer wait_work_thread(gpointer data)
 {
-    DirLoad *d = data;
-    GPtrArray *ents = NULL;
-    DIR *dir = opendir(d->path);
-    if (dir) {
-        ents = g_ptr_array_new_with_free_func(g_free);
-        int dfd = dirfd(dir);
-        struct dirent *de;
-        struct stat st;
-        while ((de = readdir(dir)) != NULL) {
-            if (de->d_name[0] == '.' &&
-                (de->d_name[1] == '\0' ||
-                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
-                continue;
-            if (!d->hidden && de->d_name[0] == '.') continue;
-            if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
-            size_t len = strlen(de->d_name) + 1;
-            DirEnt *e = g_malloc(sizeof(DirEnt) + len);
-            e->st = st;
-            memcpy(e->name, de->d_name, len);
-            g_ptr_array_add(ents, e);
-        }
-        closedir(dir);
-    }
-    g_mutex_lock(&d->m);
-    d->ents = ents;
-    d->done = TRUE;
-    g_cond_signal(&d->c);
-    if (d->loop) g_idle_add(dir_load_quit_idle, g_main_loop_ref(d->loop));
-    g_mutex_unlock(&d->m);
-    dir_load_unref(d);
+    WaitWork *w = data;
+    gpointer r = w->fn(w->arg);
+    g_mutex_lock(&w->m);
+    w->result = r;
+    w->done = TRUE;
+    g_cond_signal(&w->c);
+    if (w->loop) g_idle_add(wait_work_quit_idle, g_main_loop_ref(w->loop));
+    g_mutex_unlock(&w->m);
+    wait_work_unref(w);
     return NULL;
 }
 
@@ -274,18 +262,20 @@ static gboolean dir_wait_close(GtkWindow *win, DirWait *w)
     return TRUE;
 }
 
-/* Returns the entries (caller unrefs; NULL = unreadable) or sets
- * *cancelled when the user gave up waiting. */
-static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
+gpointer fm_wait_work(FM *fm, const char *title, const char *what,
+                      GThreadFunc fn, gpointer arg, GDestroyNotify free_arg,
+                      GDestroyNotify free_result, gboolean *cancelled)
 {
     *cancelled = FALSE;
-    DirLoad *d = g_new0(DirLoad, 1);
-    d->path   = g_strdup(path);
-    d->hidden = fm->show_hidden;
-    d->refs   = 2;
+    WaitWork *d = g_new0(WaitWork, 1);
+    d->fn          = fn;
+    d->arg         = arg;
+    d->free_arg    = free_arg;
+    d->free_result = free_result;
+    d->refs        = 2;
     g_mutex_init(&d->m);
     g_cond_init(&d->c);
-    g_thread_unref(g_thread_new("fm-readdir", dir_load_thread, d));
+    g_thread_unref(g_thread_new("fm-wait", wait_work_thread, d));
 
     gint64 until = g_get_monotonic_time() + DIR_WAIT_MS * G_TIME_SPAN_MILLISECOND;
     g_mutex_lock(&d->m);
@@ -300,7 +290,7 @@ static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
 
     if (w.loop) {
         GtkWidget *win = gtk_window_new();
-        gtk_window_set_title(GTK_WINDOW(win), "Reading directory");
+        gtk_window_set_title(GTK_WINDOW(win), title);
         gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(fm->window));
         gtk_window_set_modal(GTK_WINDOW(win), TRUE);
         gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
@@ -309,7 +299,7 @@ static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
         gtk_widget_set_margin_bottom(box, 16);
         gtk_widget_set_margin_start(box, 20);
         gtk_widget_set_margin_end(box, 20);
-        gchar *msg = g_strdup_printf("Reading %s\u2026", path);
+        gchar *msg = g_strdup_printf("Reading %s…", what);
         GtkWidget *lbl = gtk_label_new(msg);
         g_free(msg);
         gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_MIDDLE);
@@ -334,21 +324,285 @@ static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
 
         g_signal_handlers_disconnect_by_data(win, &w);
         gtk_window_destroy(GTK_WINDOW(win));
+        fm_refocus_if_lost(fm);
         g_mutex_lock(&d->m);
         d->loop = NULL;
         g_mutex_unlock(&d->m);
         g_main_loop_unref(w.loop);
     }
 
-    GPtrArray *ents = NULL;
+    gpointer result = NULL;
     if (w.cancelled) {
         *cancelled = TRUE;              /* worker frees its result */
     } else {
-        ents  = d->ents;
-        d->ents = NULL;
+        result    = d->result;
+        d->result = NULL;
     }
-    dir_load_unref(d);
+    wait_work_unref(d);
+    return result;
+}
+
+/* Directory-specific part */
+typedef struct { struct stat st; char name[]; } DirEnt;
+
+typedef struct {
+    gchar    *path;
+    gboolean  hidden;
+} DirLoad;
+
+static void dir_load_free(gpointer data)
+{
+    DirLoad *d = data;
+    g_free(d->path);
+    g_free(d);
+}
+
+/* → GPtrArray of DirEnt*, NULL = opendir failed */
+static gpointer dir_load_thread(gpointer data)
+{
+    DirLoad *d = data;
+    GPtrArray *ents = NULL;
+    DIR *dir = opendir(d->path);
+    if (dir) {
+        ents = g_ptr_array_new_with_free_func(g_free);
+        int dfd = dirfd(dir);
+        struct dirent *de;
+        struct stat st;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                continue;
+            if (!d->hidden && de->d_name[0] == '.') continue;
+            if (fstatat(dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+            size_t len = strlen(de->d_name) + 1;
+            DirEnt *e = g_malloc(sizeof(DirEnt) + len);
+            e->st = st;
+            memcpy(e->name, de->d_name, len);
+            g_ptr_array_add(ents, e);
+        }
+        closedir(dir);
+    }
     return ents;
+}
+
+/* Returns the entries (caller unrefs; NULL = unreadable) or sets
+ * *cancelled when the user gave up waiting. */
+static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
+{
+    DirLoad *d = g_new0(DirLoad, 1);
+    d->path   = g_strdup(path);
+    d->hidden = fm->show_hidden;
+    return fm_wait_work(fm, "Reading directory", path, dir_load_thread, d,
+                        dir_load_free, (GDestroyNotify)g_ptr_array_unref, cancelled);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Tabs – each tab remembers a local directory and the cursor item;
+ *  the panel's widgets are shared, switching simply reloads the panel.
+ * ─────────────────────────────────────────────────────────────────── */
+
+static void set_active_panel(FM *fm, int idx);
+
+static void tab_free(gpointer data)
+{
+    PanelTab *t = data;
+    g_free(t->path);
+    g_free(t->cursor_name);
+    g_free(t);
+}
+
+static PanelTab *tab_new(const char *path)
+{
+    PanelTab *t = g_new0(PanelTab, 1);
+    t->path = g_strdup(path);
+    return t;
+}
+
+static PanelTab *tab_cur(Panel *p)
+{
+    return g_ptr_array_index(p->tabs, p->tab_active);
+}
+
+/* The directory the panel is "in": search results count as the
+ * directory the search started from (results stay on Alt+Left). */
+static const char *tab_dir(Panel *p)
+{
+    return p->search_mode ? p->search_prev_cwd : p->cwd;
+}
+
+static const char *const tab_remote_msg = "Tabs are not available on an SFTP panel";
+
+static void tabs_rebuild(Panel *p);
+
+static void on_tab_clicked(GtkButton *btn, Panel *p)
+{
+    guint i = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(btn), "fm-tab-idx"));
+    set_active_panel(p->fm, p->idx);
+    panel_tab_cycle(p, (int)i - (int)p->tab_active);
+    panel_focus(p);
+}
+
+static void on_tab_middle(GtkGestureClick *g, int n_press, double x, double y,
+                          Panel *p)
+{
+    (void)n_press; (void)x; (void)y;
+    GtkWidget *btn = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(g));
+    guint i = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(btn), "fm-tab-idx"));
+    set_active_panel(p->fm, p->idx);
+    if (i != p->tab_active) panel_tab_cycle(p, (int)i - (int)p->tab_active);
+    if (i == p->tab_active) panel_tab_close(p);
+}
+
+/* Tabs are written to settings shortly after every change (not only
+ * on exit), so they survive a crash or a killed session too. */
+static guint tabs_save_id;
+
+static gboolean tabs_save_cb(gpointer fm)
+{
+    tabs_save_id = 0;
+    settings_save_tabs(fm);
+    return G_SOURCE_REMOVE;
+}
+
+/* Recreate the tab buttons; the strip is hidden with a single tab */
+static void tabs_rebuild(Panel *p)
+{
+    if (!p->tab_box) return;
+    if (tabs_save_id) g_source_remove(tabs_save_id);
+    tabs_save_id = g_timeout_add_seconds(1, tabs_save_cb, p->fm);
+    GtkWidget *c;
+    while ((c = gtk_widget_get_first_child(p->tab_box)))
+        gtk_box_remove(GTK_BOX(p->tab_box), c);
+
+    for (guint i = 0; i < p->tabs->len; i++) {
+        PanelTab *t = g_ptr_array_index(p->tabs, i);
+        const char *path = t->path ? t->path : "/";
+        gchar *base = g_path_get_basename(path);
+        GtkWidget *b = gtk_button_new_with_label(base);
+        g_free(base);
+        gtk_widget_set_tooltip_text(b, path);
+        gtk_widget_set_focusable(b, FALSE);
+        gtk_widget_add_css_class(b, "flat");
+        gtk_widget_add_css_class(b, "fm-tab");
+        if (i == p->tab_active) gtk_widget_add_css_class(b, "fm-tab-active");
+        g_object_set_data(G_OBJECT(b), "fm-tab-idx", GUINT_TO_POINTER(i));
+        g_signal_connect(b, "clicked", G_CALLBACK(on_tab_clicked), p);
+
+        GtkGesture *mc = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(mc), GDK_BUTTON_MIDDLE);
+        g_signal_connect(mc, "pressed", G_CALLBACK(on_tab_middle), p);
+        gtk_widget_add_controller(b, GTK_EVENT_CONTROLLER(mc));
+
+        gtk_box_append(GTK_BOX(p->tab_box), b);
+    }
+    gtk_widget_set_visible(p->tab_scroll, p->tabs->len > 1);
+}
+
+/* Called by panel_load on success: the active tab follows navigation */
+static void tab_track(Panel *p)
+{
+    PanelTab *t = tab_cur(p);
+    if (g_strcmp0(t->path, p->cwd) == 0) return;
+    g_free(t->path);
+    t->path = g_strdup(p->cwd);
+    g_clear_pointer(&t->cursor_name, g_free);
+    tabs_rebuild(p);
+}
+
+/* Remember the cursor item of the active tab before leaving it */
+static void tab_remember(Panel *p)
+{
+    PanelTab *t = tab_cur(p);
+    g_free(t->cursor_name);
+    t->cursor_name = p->search_mode ? g_strdup(p->search_prev_name)
+                   : p->arc_file    ? g_path_get_basename(p->arc_file)
+                                    : panel_cursor_name(p);
+    g_free(t->path);
+    t->path = g_strdup(tab_dir(p));
+}
+
+/* Show tab i: load its directory and put the cursor back */
+static void tab_show(Panel *p, guint i)
+{
+    p->tab_active = i;
+    PanelTab *t = tab_cur(p);
+    gchar *name = g_strdup(t->cursor_name);
+    gchar *path = g_strdup(t->path ? t->path : g_get_home_dir());
+    panel_load(p, path);
+    if (strcmp(p->cwd, path) != 0 || p->search_mode) {
+        /* directory gone (or load cancelled): the tab takes what is shown */
+        g_free(t->path);
+        t->path = g_strdup(tab_dir(p));
+    } else if (name) {
+        panel_select_name(p, name);
+    }
+    g_free(path);
+    g_free(name);
+    tabs_rebuild(p);
+}
+
+static gboolean tabs_refused(Panel *p)
+{
+    if (p->ssh_conn) { fm_status(p->fm, "%s", tab_remote_msg); return TRUE; }
+    return p->busy;
+}
+
+/* Ctrl+T – new tab after the active one (path NULL = current directory) */
+void panel_tab_new(Panel *p, const char *path)
+{
+    if (tabs_refused(p)) return;
+    gchar *dir = g_strdup(path ? path : tab_dir(p));
+    tab_remember(p);
+    g_ptr_array_insert(p->tabs, (int)p->tab_active + 1, tab_new(dir));
+    tab_show(p, p->tab_active + 1);
+    g_free(dir);
+}
+
+/* Ctrl+W – close the active tab (never the last one) */
+void panel_tab_close(Panel *p)
+{
+    if (tabs_refused(p)) return;
+    if (p->tabs->len < 2) { fm_status(p->fm, "Cannot close the last tab"); return; }
+    g_ptr_array_remove_index(p->tabs, p->tab_active);
+    tab_show(p, MIN(p->tab_active, p->tabs->len - 1));
+}
+
+/* Ctrl+Tab / Ctrl+Shift+Tab – move delta tabs, wrapping around */
+void panel_tab_cycle(Panel *p, int delta)
+{
+    if (p->tabs->len < 2 || delta == 0) return;
+    if (tabs_refused(p)) return;
+    int n = (int)p->tabs->len;
+    int i = (((int)p->tab_active + delta) % n + n) % n;
+    tab_remember(p);
+    tab_show(p, (guint)i);
+}
+
+/* Startup: tabs from settings (missing directories skipped), then the
+ * active one is loaded.  Always leaves at least one tab. */
+void panel_tabs_restore(Panel *p, gchar **paths, int active)
+{
+    g_ptr_array_set_size(p->tabs, 0);
+    int skipped_before = 0;
+    for (int i = 0; paths && paths[i]; i++) {
+        if (paths[i][0] == '/' && g_file_test(paths[i], G_FILE_TEST_IS_DIR))
+            g_ptr_array_add(p->tabs, tab_new(paths[i]));
+        else if (i < active)
+            skipped_before++;
+    }
+    if (p->tabs->len == 0) {
+        g_ptr_array_add(p->tabs, tab_new(g_get_home_dir()));
+        active = 0;
+    }
+    active -= skipped_before;
+    if (active < 0 || active >= (int)p->tabs->len) active = 0;
+    tab_show(p, (guint)active);
+}
+
+void panel_tabs_free(Panel *p)
+{
+    g_clear_pointer(&p->tabs, g_ptr_array_unref);
 }
 
 void panel_load(Panel *p, const char *path)
@@ -375,6 +629,9 @@ void panel_load(Panel *p, const char *path)
         return;
     }
     path = want;
+
+    /* Leaving an archive (any real directory load ends archive mode) */
+    arc_panel_leave(p);
 
     /* Leaving search results: they stay reachable via Alt+Left */
     gboolean was_search = p->search_mode;
@@ -418,6 +675,12 @@ void panel_load(Panel *p, const char *path)
     g_list_store_splice(new_store, 0, 0,
                         (gpointer *)items->pdata, items->len);
     g_ptr_array_unref(items);
+    /* swapping the store destroys the focused row – remember whether the
+     * keyboard cursor was in this panel and put it back afterwards */
+    GtkWidget *foc = gtk_window_get_focus(GTK_WINDOW(p->fm->window));
+    gboolean had_focus = !foc || foc == p->column_view ||
+                         gtk_widget_is_ancestor(foc, p->column_view);
+    had_focus = had_focus && p->fm->active == p->idx;
     gtk_sort_list_model_set_model(p->sort_model, G_LIST_MODEL(new_store));
     g_object_unref(p->store);   /* old store freed (items unreffed) */
     p->store = new_store;
@@ -443,6 +706,8 @@ void panel_load(Panel *p, const char *path)
 
     /* Start directory monitor if auto-refresh is enabled */
     panel_monitor_start(p);
+    tab_track(p);
+    if (had_focus) panel_focus(p);
     g_free(want);
 }
 
@@ -450,6 +715,10 @@ void panel_reload(Panel *p)
 {
     if (p->ssh_conn) {
         panel_load_remote(p, p->ssh_conn->remote_path);
+        return;
+    }
+    if (p->arc_file) {          /* inside an archive: re-list, keep the place */
+        if (!p->busy) arc_panel_reload(p);
         return;
     }
     /* Results are not a directory: reloading p->cwd would drop them */
@@ -508,6 +777,8 @@ void panel_go_up(Panel *p)
         g_free(parent); g_free(basename);
         return;
     }
+
+    if (p->arc_file) { arc_panel_go_up(p); return; }
 
     if (p->search_mode) {
         gchar *name = g_strdup(p->search_prev_name);
@@ -837,6 +1108,12 @@ static void activate_item(Panel *p)
         return;
     }
 
+    if (p->arc_file) {
+        arc_panel_activate(p);
+        g_free(name);
+        return;
+    }
+
     if (p->search_mode) {
         /* Results stay: a file opens in its default application,
          * a directory header jumps there (Alt+Left comes back). */
@@ -846,6 +1123,11 @@ static void activate_item(Panel *p)
         if (si) g_object_unref(si);
         if (is_file) {
             gchar *full = panel_cursor_fullpath(p);
+            if (arc_panel_enter(p, full)) {     /* a found archive: browse it */
+                g_free(full);
+                g_free(name);
+                return;
+            }
             gchar *uri = full ? g_filename_to_uri(full, NULL, NULL) : NULL;
             if (uri) {
                 gtk_show_uri(GTK_WINDOW(p->fm->window), uri, GDK_CURRENT_TIME);
@@ -868,7 +1150,9 @@ static void activate_item(Panel *p)
         g_free(newpath);
     } else {
         gchar *fullpath = g_build_filename(p->cwd, name, NULL);
-        gchar *uri = g_filename_to_uri(fullpath, NULL, NULL);
+        /* archives open as directories; unreadable ones as before */
+        gchar *uri = arc_panel_enter(p, fullpath) ? NULL
+                   : g_filename_to_uri(fullpath, NULL, NULL);
         if (uri) {
             gtk_show_uri(GTK_WINDOW(p->fm->window), uri, GDK_CURRENT_TIME);
             g_free(uri);
@@ -917,6 +1201,16 @@ static gboolean on_tree_key_press(GtkEventControllerKey *ctrl,
         sync_cursor_from_selection(p);
         search_goto_file(p);
         return TRUE;
+    }
+
+    /* Ctrl+PgDn on an archive – browse it (Total Commander) */
+    if (!p->search_mode && !p->arc_file && (state & GDK_CONTROL_MASK) &&
+        keyval == GDK_KEY_Page_Down) {
+        sync_cursor_from_selection(p);
+        gchar *full = p->ssh_conn ? NULL : panel_cursor_fullpath(p);
+        gboolean in = arc_panel_enter(p, full);
+        g_free(full);
+        if (in) return TRUE;
     }
 
     switch (keyval) {
@@ -1016,6 +1310,59 @@ static void set_active_panel(FM *fm, int idx)
     }
 }
 
+/* Make p the active panel and put the keyboard cursor on it.
+ *
+ * Everything that sends the cursor back into a panel (Tab, after a
+ * dialog or a job, after a reload) goes through here.  It does not rely
+ * on the focus "enter" signal: when the focus is already inside the
+ * panel, or was lost because a reload replaced the focused row, that
+ * signal never comes – fm->active then disagreed with the real focus
+ * and inhibit_sel stayed TRUE, so Tab kept jumping into the same panel
+ * and clicks were ignored. */
+void panel_focus(Panel *p)
+{
+    FM *fm = p->fm;
+    Panel *o = &fm->panels[p->idx ^ 1];
+
+    set_active_panel(fm, p->idx);
+
+    o->inhibit_sel = TRUE;                      /* hide the other cursor */
+    gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(o->selection));
+    o->inhibit_sel = FALSE;
+
+    p->inhibit_sel = TRUE;
+    gtk_widget_grab_focus(p->column_view);
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    if (n > 0) {
+        if (p->cursor_pos >= n) p->cursor_pos = n - 1;
+        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), p->cursor_pos,
+                                  NULL, GTK_LIST_SCROLL_SELECT | GTK_LIST_SCROLL_FOCUS,
+                                  NULL);
+    }
+    p->inhibit_sel = FALSE;
+}
+
+/* After a modal window (job progress, "Reading directory") closes the
+ * main window may get no focused widget back.  Checked from an idle
+ * callback, because the focus returns asynchronously. */
+static gboolean refocus_idle(gpointer data)
+{
+    FM *fm = data;
+    if (!fm->window) return G_SOURCE_REMOVE;
+    GtkWidget *f = gtk_window_get_focus(GTK_WINDOW(fm->window));
+    gboolean ok = f && (GTK_IS_EDITABLE(f) || GTK_IS_TEXT_VIEW(f));
+    for (int i = 0; i < 2 && !ok; i++)
+        ok = f && (f == fm->panels[i].column_view ||
+                   gtk_widget_is_ancestor(f, fm->panels[i].column_view));
+    if (!ok) panel_focus(active_panel(fm));
+    return G_SOURCE_REMOVE;
+}
+
+void fm_refocus_if_lost(FM *fm)
+{
+    g_idle_add(refocus_idle, fm);
+}
+
 /* Selection changed: fired on mouse click (and our own scroll_to).
  * When exactly ONE item ends up selected, treat that as the new cursor. */
 static void on_selection_changed(GtkSelectionModel *model, guint position,
@@ -1066,6 +1413,15 @@ static void on_focus_enter(GtkEventControllerFocus *ctrl, Panel *p)
                                   GTK_LIST_SCROLL_SELECT, NULL);
     }
     p->inhibit_sel = FALSE;
+}
+
+/* Put the shown location back into the path entry */
+static void panel_entry_reset(Panel *p)
+{
+    gchar *shown = p->arc_file ? g_build_filename(p->arc_file, p->arc_dir, NULL)
+                               : g_strdup(p->cwd);
+    gtk_editable_set_text(GTK_EDITABLE(p->path_entry), shown);
+    g_free(shown);
 }
 
 static void do_path_activate(Panel *p)
@@ -1131,8 +1487,8 @@ static void do_path_activate(Panel *p)
         struct stat st;
         if (stat(path_to_check, &st) == 0 && S_ISDIR(st.st_mode))
             panel_load(p, path_to_check);
-        else
-            gtk_editable_set_text(GTK_EDITABLE(p->path_entry), p->cwd);
+        else if (!arc_panel_enter(p, path_to_check))
+            panel_entry_reset(p);
 
         g_free(full_path);
     }
@@ -1146,12 +1502,12 @@ static gboolean on_path_key_press(GtkEventControllerKey *ctrl,
     (void)ctrl; (void)keycode; (void)state;
     if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
         do_path_activate(p);
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
         return TRUE;
     }
     if (keyval == GDK_KEY_Escape) {
-        gtk_editable_set_text(GTK_EDITABLE(p->path_entry), p->cwd);
-        gtk_widget_grab_focus(p->column_view);
+        panel_entry_reset(p);
+        panel_focus(p);
         return TRUE;
     }
     return FALSE;
@@ -1177,7 +1533,7 @@ static void on_search_exit_clicked(GtkButton *btn, Panel *p)
     (void)btn;
     if (p->search_mode) {
         panel_load(p, p->search_prev_cwd);
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
     }
 }
 
@@ -1327,14 +1683,14 @@ static gboolean on_filter_key(GtkEventControllerKey *ctrl,
         /* Close search bar, consume key */
         gtk_widget_set_visible(p->filter_bar, FALSE);
         gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
         return TRUE;
     }
     if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
         /* Close search bar and activate the item under cursor */
         gtk_widget_set_visible(p->filter_bar, FALSE);
         gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
         activate_item(p);
         return TRUE;
     }
@@ -1344,7 +1700,7 @@ static gboolean on_filter_key(GtkEventControllerKey *ctrl,
         /* Close search bar, cursor stays */
         gtk_widget_set_visible(p->filter_bar, FALSE);
         gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), "");
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
         return TRUE;
     }
     return FALSE;
@@ -1386,6 +1742,8 @@ PMENU(pmenu_selnone,  sel_mark_all(p, FALSE))
 PMENU(pmenu_selgroup, sel_group_dialog(p->fm, TRUE))
 PMENU(pmenu_unselgrp, sel_group_dialog(p->fm, FALSE))
 PMENU(pmenu_invert,   sel_invert(p))
+PMENU(pmenu_tabnew,   panel_tab_new(p, NULL))
+PMENU(pmenu_tabclose, panel_tab_close(p))
 #undef PMENU
 
 typedef struct { const char *label, *action; } MenuEntry;
@@ -1475,11 +1833,21 @@ void panel_setup(Panel *p, FM *fm, int idx)
     p->fm  = fm;
     p->idx = idx;
     p->marks = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    p->tabs  = g_ptr_array_new_with_free_func(tab_free);
+    g_ptr_array_add(p->tabs, tab_new(NULL));    /* follows the first load */
 
     /* outer vertical box */
     p->frame = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_margin_start(p->frame, 2);
     gtk_widget_set_margin_end(p->frame, 2);
+
+    /* ── tab strip (hidden until a second tab exists) ── */
+    p->tab_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    p->tab_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(p->tab_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(p->tab_scroll), p->tab_box);
+    gtk_widget_set_visible(p->tab_scroll, FALSE);
 
     /* ── path bar ── */
     GtkWidget *path_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1539,6 +1907,8 @@ void panel_setup(Panel *p, FM *fm, int idx)
             { "selgroup", G_CALLBACK(pmenu_selgroup) },
             { "unselgrp", G_CALLBACK(pmenu_unselgrp) },
             { "invert",   G_CALLBACK(pmenu_invert)   },
+            { "tabnew",   G_CALLBACK(pmenu_tabnew)   },
+            { "tabclose", G_CALLBACK(pmenu_tabclose) },
         };
         for (gsize i = 0; i < G_N_ELEMENTS(acts); i++) {
             GSimpleAction *sa = g_simple_action_new(acts[i].name, NULL);
@@ -1561,7 +1931,12 @@ void panel_setup(Panel *p, FM *fm, int idx)
             { "Back to search results    Alt+\u2190", "sresults" },
             { "Search history\u2026    Shift+F2",  "shistory" },
         };
+        static const MenuEntry tabs[] = {
+            { "New tab    Ctrl+T",   "tabnew"   },
+            { "Close tab    Ctrl+W", "tabclose" },
+        };
         GMenu *pmenu = g_menu_new();
+        menu_section(pmenu, grp, tabs, G_N_ELEMENTS(tabs));
         menu_section(pmenu, grp, conn, G_N_ELEMENTS(conn));
         GMenu *files = build_file_menu(grp);
         g_menu_append_submenu(pmenu, "Files", G_MENU_MODEL(files));
@@ -1709,6 +2084,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
     gtk_widget_add_controller(p->filter_entry, filt_key);
 
     /* pack */
+    gtk_box_append(GTK_BOX(p->frame), p->tab_scroll);
     gtk_box_append(GTK_BOX(p->frame), path_box);
     gtk_box_append(GTK_BOX(p->frame), scroll);
     gtk_box_append(GTK_BOX(p->frame), p->filter_bar);
@@ -1819,17 +2195,55 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
                                      guint keyval, guint keycode,
                                      GdkModifierType state, FM *fm)
 {
-    (void)ctrl; (void)keycode;
+    (void)ctrl;
+
+    /* Ctrl+Tab / Ctrl+Shift+Tab – next / previous tab (before plain Tab) */
+    if ((state & GDK_CONTROL_MASK) &&
+        (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab)) {
+        gboolean back = keyval == GDK_KEY_ISO_Left_Tab || (state & GDK_SHIFT_MASK);
+        panel_tab_cycle(active_panel(fm), back ? -1 : 1);
+        return TRUE;
+    }
 
     /* Tab – switch active panel */
     if (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) {
-        int next = fm->active ^ 1;
-        /* Inhibit before grab_focus so GTK's internal row-0 auto-select
-         * (fired before on_focus_enter) does not overwrite cursor_pos. */
-        fm->panels[next].inhibit_sel = TRUE;
-        gtk_widget_grab_focus(fm->panels[next].column_view);
-        /* on_focus_enter resets inhibit_sel after its own scroll_to */
+        /* the panel that really has the focus, not just fm->active */
+        GtkWidget *f = gtk_window_get_focus(GTK_WINDOW(fm->window));
+        int cur = fm->active;
+        for (int i = 0; i < 2; i++)
+            if (f && (f == fm->panels[i].column_view ||
+                      gtk_widget_is_ancestor(f, fm->panels[i].column_view)))
+                cur = i;
+        panel_focus(&fm->panels[cur ^ 1]);
         return TRUE;
+    }
+
+    /* Navigation keys with the keyboard focus nowhere in a panel (e.g. a
+     * modal job window just closed and the focus did not come back):
+     * GTK would move the focus to the next widget – typically the other
+     * panel's path entry.  Put the cursor back into the active panel and
+     * handle the key there instead. */
+    switch (keyval) {
+    case GDK_KEY_Up: case GDK_KEY_Down: case GDK_KEY_Page_Up: case GDK_KEY_Page_Down:
+    case GDK_KEY_Home: case GDK_KEY_End: case GDK_KEY_Return: case GDK_KEY_KP_Enter:
+    case GDK_KEY_space: case GDK_KEY_Insert: case GDK_KEY_BackSpace: {
+        GtkWidget *f = gtk_window_get_focus(GTK_WINDOW(fm->window));
+        gboolean in_text  = f && (GTK_IS_EDITABLE(f) || GTK_IS_TEXT_VIEW(f));
+        gboolean in_panel = FALSE;
+        for (int i = 0; i < 2; i++)
+            if (f && (f == fm->panels[i].column_view ||
+                      gtk_widget_is_ancestor(f, fm->panels[i].column_view)))
+                in_panel = TRUE;
+        if (!in_text && !in_panel) {
+            Panel *a = active_panel(fm);
+            panel_focus(a);
+            on_tree_key_press(NULL, keyval, keycode, state, a);
+            return TRUE;
+        }
+        break;
+    }
+    default:
+        break;
     }
 
     /* F-keys – only when not typing in path entry */
@@ -1908,6 +2322,35 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     case GDK_KEY_p:
     case GDK_KEY_P:
         if (state & GDK_ALT_MASK) { fo_pack(fm); return TRUE; }
+        break;
+
+    /* Tabs: Ctrl+T new, Ctrl+W close, Ctrl+Up directory under cursor */
+    case GDK_KEY_t:
+    case GDK_KEY_T:
+        if (ctl) { panel_tab_new(active_panel(fm), NULL); return TRUE; }
+        break;
+    case GDK_KEY_w:
+    case GDK_KEY_W:
+        if (ctl) { panel_tab_close(active_panel(fm)); return TRUE; }
+        break;
+    case GDK_KEY_Up:
+        if (ctl) {
+            Panel *a = active_panel(fm);
+            if (a->ssh_conn) { fm_status(fm, "%s", tab_remote_msg); return TRUE; }
+            gchar *name = panel_cursor_name(a);
+            gchar *full = panel_cursor_fullpath(a);
+            if (name && strcmp(name, "..") == 0 && !a->search_mode) {
+                g_free(full);
+                full = g_path_get_dirname(a->cwd);
+            }
+            if (full && g_file_test(full, G_FILE_TEST_IS_DIR))
+                panel_tab_new(a, full);
+            else
+                panel_tab_new(a, NULL);
+            g_free(name);
+            g_free(full);
+            return TRUE;
+        }
         break;
 
     /* Ctrl+S – filter panel */
@@ -2067,12 +2510,12 @@ static void menu_mask(GSimpleAction *a, GVariant *v, gpointer d)
     }
     p->inhibit_sel = FALSE;
     panel_update_status(p);
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }
 static void restore_panel_cursor(FM *fm)
 {
     Panel *p = active_panel(fm);
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
     if (g_list_model_get_n_items(G_LIST_MODEL(p->filter_model)) > 0) {
         p->inhibit_sel = TRUE;
         gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
@@ -2088,6 +2531,7 @@ static void on_window_focus_in(GtkEventControllerFocus *ctrl, FM *fm)
 }
 
 /* ─────────────────────────────────────────────────────────────────── */
+
 
 static void on_activate(GtkApplication *app, gpointer data)
 {
@@ -2190,10 +2634,13 @@ static void on_activate(GtkApplication *app, gpointer data)
     g_signal_connect(win_focus, "enter", G_CALLBACK(on_window_focus_in), fm);
     gtk_widget_add_controller(fm->window, win_focus);
 
-    /* load directories */
-    const char *home = g_get_home_dir();
-    panel_load(&fm->panels[0], home);
-    panel_load(&fm->panels[1], home);
+    /* load directories: saved tabs, or the home directory */
+    for (int i = 0; i < 2; i++) {
+        int active = 0;
+        gchar **paths = settings_load_tabs(i, &active);
+        panel_tabs_restore(&fm->panels[i], paths, active);
+        g_strfreev(paths);
+    }
 
     /* set initial active panel – deselect the inactive one */
     set_active_panel(fm, 0);
@@ -2202,9 +2649,24 @@ static void on_activate(GtkApplication *app, gpointer data)
     fm->panels[1].inhibit_sel = FALSE;
 
     gtk_window_present(GTK_WINDOW(fm->window));
-    gtk_widget_grab_focus(fm->panels[0].column_view);
+    panel_focus(&fm->panels[0]);
 
     fm_status(fm, "Welcome to " APP_NAME " – File Manager");
+}
+
+/* Exit: remember the tabs of both panels, then free them */
+static void on_shutdown(GApplication *app, FM *fm)
+{
+    (void)app;
+    if (!fm->window) return;
+    /* widgets may be gone by now – the tab paths are current anyway
+     * (panel_load keeps the active one in sync) */
+    if (tabs_save_id) { g_source_remove(tabs_save_id); tabs_save_id = 0; }
+    settings_save_tabs(fm);
+    arc_panel_leave(&fm->panels[0]);
+    arc_panel_leave(&fm->panels[1]);
+    panel_tabs_free(&fm->panels[0]);
+    panel_tabs_free(&fm->panels[1]);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -2224,11 +2686,13 @@ int main(int argc, char *argv[])
     GtkApplication *app = gtk_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS);
 #endif
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), &g_fm);
+    g_signal_connect(app, "shutdown", G_CALLBACK(on_shutdown), &g_fm);
     /* lets worker-thread prompts (SSH host key) find the main window */
     g_object_set_data(G_OBJECT(app), "fm", &g_fm);
 
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     view_tmpdirs_cleanup();
+    arc_panel_cleanup();
     g_object_unref(app);
     return status;
 }

@@ -886,8 +886,7 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
     g_free(ctx->encoding);
     g_free(ctx);
     Panel *ap = active_panel(fm);
-    ap->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(ap->column_view);
+    panel_focus(ap);
     return FALSE;
 }
 
@@ -895,9 +894,17 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
 
 void editor_show(FM *fm)
 {
+    if (active_panel(fm)->arc_file) { arc_panel_open(fm, 2); return; }
+    editor_show_path(fm, NULL);
+}
+
+/* path NULL = the item under the cursor; otherwise that local file
+ * (temporary copy extracted from an archive) */
+void editor_show_path(FM *fm, const char *path)
+{
     Panel *p = active_panel(fm);
 
-    gchar *name = panel_cursor_name(p);
+    gchar *name = path ? g_path_get_basename(path) : panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) { g_free(name); return; }
 
     gchar  *content     = NULL;
@@ -906,7 +913,7 @@ void editor_show(FM *fm)
     gchar  *remote_path = NULL;
     SshConn *ssh_conn   = NULL;
 
-    if (p->ssh_conn) {
+    if (!path && p->ssh_conn) {
         remote_path = g_build_filename(p->ssh_conn->remote_path, name, NULL);
         g_free(name);
         content = ssh_read_file(p->ssh_conn, remote_path, &content_len);
@@ -917,7 +924,7 @@ void editor_show(FM *fm)
         }
         ssh_conn = p->ssh_conn;
     } else {
-        filepath = panel_cursor_fullpath(p);
+        filepath = path ? g_strdup(path) : panel_cursor_fullpath(p);
         g_free(name);
 
         struct stat st;

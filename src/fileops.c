@@ -18,8 +18,7 @@
 /* Restore keyboard focus to the panel after a dialog / job */
 static void refocus(Panel *p)
 {
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }
 
 static void reload_both(FM *fm)
@@ -295,6 +294,14 @@ static void copy_or_move(FM *fm, gboolean move)
     Panel *src = active_panel(fm);
     Panel *dst = other_panel(fm);
 
+    /* archives: F5 extracts (arcpanel.c), nothing goes into one */
+    if (src->arc_file) {
+        if (move) fm_status(fm, "Archive is read-only – use F5 to copy out");
+        else      arc_panel_copy_out(fm);
+        return;
+    }
+    if (arc_panel_readonly_msg(dst)) return;
+
     GList *paths = panel_selection_paths(src);
     if (!paths) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -358,6 +365,7 @@ void fo_move(FM *fm) { copy_or_move(fm, TRUE);  }
 void fo_copy_here(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     GList *paths = panel_selection_paths(p);
     if (!paths) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -435,6 +443,7 @@ static void delete_worker(Job *job, gpointer d)
 static void delete_impl(FM *fm, gboolean permanent)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     GList *paths = panel_selection_paths(p);
     if (!paths) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -474,6 +483,7 @@ void fo_delete_permanent(FM *fm) { delete_impl(fm, TRUE);  }
 void fo_mkdir(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     if (p->search_mode) { fm_status(fm, "Leave search results first"); return; }
 
     gchar *name = ask_text(fm, "New directory",
@@ -543,6 +553,7 @@ void fo_mkdir(FM *fm)
 void fo_newfile(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     if (p->search_mode) { fm_status(fm, "Leave search results first"); return; }
 
     gchar *name = ask_text(fm, "New file", "New file name:", "new.txt", "Create", TRUE);
@@ -594,6 +605,7 @@ void fo_newfile(FM *fm)
 void fo_rename(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     gchar *old_name = panel_cursor_name(p);
     if (!old_name || strcmp(old_name, "..") == 0) {
         g_free(old_name);
@@ -767,6 +779,7 @@ static GtkWidget *sel_label(const char *text)
 void fo_properties(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
     gchar *name = panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) { g_free(name); return; }
 

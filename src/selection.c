@@ -187,6 +187,5 @@ void sel_group_dialog(FM *fm, gboolean mark)
                   g.count, g.count == 1 ? "" : "s");
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
-    p->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(p->column_view);
+    panel_focus(p);
 }

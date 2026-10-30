@@ -480,7 +480,10 @@ void job_free(Job *job)
 {
     if (!job) return;
     if (job->timer_id) g_source_remove(job->timer_id);
-    if (job->window) gtk_window_destroy(GTK_WINDOW(job->window));
+    if (job->window) {
+        gtk_window_destroy(GTK_WINDOW(job->window));
+        fm_refocus_if_lost(job->fm);
+    }
     fs_ctx_clear(&job->ctx);
     g_free(job->phase);
     g_free(job->file);

@@ -267,6 +267,15 @@ static void apply_gui_css(FM *fm)
         "  padding: 2px 4px;"
         "  min-height: 0;"
         "}"
+        "button.fm-tab {"
+        "  padding: 0 8px;"
+        "  min-height: 0;"
+        "}"
+        "button.fm-tab-active {"
+        "  background-color: %s;"
+        "  color: %s;"
+        "  font-weight: bold;"
+        "}"
         "paned > separator {"
         "  background-color: %s;"
         "  min-width: 3px;"
@@ -282,7 +291,7 @@ static void apply_gui_css(FM *fm)
         "%s"
         "%s",
         gui_fam, gui_sz,
-        active_bg, active_fg, inactive_bg, inactive_fg, sep_color,
+        active_bg, active_fg, inactive_bg, inactive_fg, active_bg, active_fg, sep_color,
         cursor_css,
         fm->show_hover ? "" :
             "columnview listview row:hover:not(:selected) {"
@@ -552,6 +561,63 @@ void settings_save(FM *fm)
     }
     g_key_file_free(kf);
     g_free(path);
+}
+
+/* ── Panel tabs ───────────────────────────────────────────────────── */
+
+#define SETTINGS_GROUP_TABS "tabs"
+static const char *const tab_keys[2]   = { "left",        "right"        };
+static const char *const tab_active[2] = { "left_active", "right_active" };
+
+/* [tabs] left=/a;/b  left_active=1  (same for right) – saved on exit */
+void settings_save_tabs(FM *fm)
+{
+    gchar *path = settings_path();
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
+
+    for (int i = 0; i < 2; i++) {
+        Panel *p = &fm->panels[i];
+        if (!p->tabs || p->tabs->len == 0) continue;
+        const gchar **v = g_new0(const gchar *, p->tabs->len + 1);
+        for (guint t = 0; t < p->tabs->len; t++) {
+            PanelTab *tab = g_ptr_array_index(p->tabs, t);
+            v[t] = tab->path ? tab->path : g_get_home_dir();
+        }
+        g_key_file_set_string_list(kf, SETTINGS_GROUP_TABS, tab_keys[i],
+                                   v, p->tabs->len);
+        g_key_file_set_integer(kf, SETTINGS_GROUP_TABS, tab_active[i],
+                               (int)p->tab_active);
+        g_free(v);
+    }
+
+    GError *err = NULL;
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        g_warning("settings_save_tabs: %s", err ? err->message : "?");
+        g_clear_error(&err);
+    }
+    g_key_file_free(kf);
+    g_free(path);
+}
+
+/* Saved tab paths of panel idx (NULL if none); *active = saved index */
+gchar **settings_load_tabs(int idx, int *active)
+{
+    gchar *path = settings_path();
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
+    g_free(path);
+
+    gchar **v = g_key_file_get_string_list(kf, SETTINGS_GROUP_TABS,
+                                           tab_keys[idx], NULL, NULL);
+    *active = g_key_file_get_integer(kf, SETTINGS_GROUP_TABS,
+                                     tab_active[idx], NULL);
+    g_key_file_free(kf);
+    return v;
 }
 
 /* ── SSH bookmark helpers ─────────────────────────────────────────── */
@@ -1336,6 +1402,5 @@ void settings_dialog(FM *fm)
 
     /* Restore focus to active panel */
     Panel *ap = &fm->panels[fm->active];
-    ap->inhibit_sel = TRUE;
-    gtk_widget_grab_focus(ap->column_view);
+    panel_focus(ap);
 }

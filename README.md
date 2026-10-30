@@ -12,12 +12,13 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F1 — keyboard shortcuts | F2 — search files |
 | ![SSH / SFTP connections](screenshots/04.png) | ![Editor](screenshots/05.png) |
 | SSH / SFTP connections | F4 — editor |
-| ![Viewer](screenshots/06.png) | |
-| F3 — viewer | |
+| ![Viewer](screenshots/06.png) | ![Tabs and archive browsing](screenshots/07.png) |
+| F3 — viewer | Tabs (left) and a zip archive opened as a directory (right) |
 
 ## Features
 
 - **Two panels** — navigation like in Total Commander
+- **Tabs** — Total Commander style tabs per panel: Ctrl+T new, Ctrl+W close, Ctrl+Tab / Ctrl+Shift+Tab switch, Ctrl+↑ opens the directory under the cursor in a new tab; click a tab to switch, middle-click to close; the tab strip appears with 2+ tabs; tabs (local directories) are saved right after every change and restored on the next start
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
 - **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
@@ -28,6 +29,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Properties** — Alt+Enter: size (directories computed in background), owner, dates, symlink target, editable permissions (also over SFTP)
 - **New file / duplicate** — Shift+F4 creates a file and opens the editor; Shift+F5 copies in place under a new name; F7 accepts nested paths (`a/b/c`)
 - **Archive support** — extract and create archives (tar.gz, tar.bz2, tar.xz, tar.zst, zip, 7z, rar)
+- **Archives as directories** — Enter (or Ctrl+PgDn) on a zip/jar/tar.*/7z/iso/rar/cpio browses it read-only like a directory; F5 extracts the selected files (progress, overwrite prompts), Enter/F3/F4 on a file opens a temporary copy, Backspace at the top leaves the archive; needs libarchive (without it Enter opens the archive in its default application)
 - **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel. Results are kept: Enter opens a file in its default app, Ctrl+PgDn / Ctrl+Enter jumps to the file's directory, Alt+← (or the 🔍 button) returns to the results, Shift+F2 lists the last 10 searches. Content search shows `:line  matching text` next to each file; F3 opens the viewer on that match with the text highlighted (F3 / Shift+F3 = next / previous)
@@ -38,7 +40,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
-- **Per-panel hamburger menu** — SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
+- **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Dark / Light theme** — runtime switching via Settings → System (libadwaita); colors auto-adapt (directories, symlinks, marks, editor scheme)
 - **Settings** — tabbed dialog: Panels / Display / Cursor / Viewer / Editor / System
 
@@ -65,6 +67,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F2 | Search files |
 | Shift+F2 | Search history (last 10 searches) |
 | Ctrl+PgDn / Ctrl+Enter | In results: go to the file's directory |
+| Enter / Ctrl+PgDn on an archive | Browse the archive like a directory (read-only; F5 extracts) |
 | Alt+← | Back to the last search results |
 | F3 | View file |
 | F4 | Text editor |
@@ -81,6 +84,9 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Ctrl+H | Hidden files |
 | Ctrl+R | Refresh both panels |
 | Ctrl+= | Synchronize panels |
+| Ctrl+T / Ctrl+W | New tab (current directory) / close tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
+| Ctrl+↑ | Open directory under cursor in a new tab |
 | Alt+E | Extract archive |
 | Alt+P | Create archive (pack) |
 
@@ -101,6 +107,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - libadwaita-1 (optional — for runtime dark/light theme switching)
 - libssh2 (optional — for SFTP panel)
 - gtksourceview-5 (optional — for full syntax highlighting)
+- libarchive (optional — for browsing archives as directories)
 
 ### Archive tools (optional, for extract/pack)
 
@@ -118,7 +125,19 @@ sudo dnf install gtk4-devel
 sudo dnf install libadwaita-devel     # optional, for runtime dark/light theme
 sudo dnf install libssh2-devel        # optional, for SFTP
 sudo dnf install gtksourceview5-devel # optional, for syntax highlighting
+sudo dnf install libarchive-devel     # optional, archives as directories
 sudo dnf install p7zip unrar          # optional, for 7z/rar archives
+```
+
+### Debian / Ubuntu
+
+```bash
+sudo apt install build-essential pkg-config libgtk-4-dev
+sudo apt install libadwaita-1-dev      # optional, for runtime dark/light theme
+sudo apt install libssh2-1-dev         # optional, for SFTP
+sudo apt install libgtksourceview-5-dev  # optional, for syntax highlighting
+sudo apt install libarchive-dev        # optional, archives as directories
+sudo apt install p7zip-full unrar      # optional, for 7z/rar archives
 ```
 
 ### Compilation
@@ -152,6 +171,8 @@ src/util.c          — pure helpers used by the engine and the UI
 src/job.c           — worker thread + modal progress dialog + overwrite prompt
 src/dialogs.c       — shared dialogs (destination, text entry, multi-button choice)
 src/archive.c       — extract / pack via tar, zip, 7z, unrar
+src/arcfs.c         — archive listing / extraction via libarchive (GLib-only)
+src/arcpanel.c      — browsing archives in a panel (read-only)
 src/selection.c     — marking: group select, invert, select all
 src/clipboard.c     — system clipboard copy/cut/paste
 src/monitor.c       — auto-refresh (inotify / SFTP polling)

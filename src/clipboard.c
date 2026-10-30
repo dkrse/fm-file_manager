@@ -17,6 +17,7 @@ static GdkClipboard *clipboard(FM *fm)
 void clip_copy(FM *fm, gboolean cut)
 {
     Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;      /* F5 extracts instead */
     if (p->ssh_conn) {
         fm_status(fm, "Clipboard works with local files only – use F5/F6 for SFTP");
         return;
@@ -119,12 +120,13 @@ static void on_paste_spliced(GObject *src, GAsyncResult *res, gpointer d)
         fm_status(fm, "Clipboard contains no local files");
     } else if (p->search_mode) {
         fm_status(fm, "Leave search results first");
+    } else if (arc_panel_readonly_msg(p)) {
+        /* nothing is pasted into an archive */
     } else {
         int r = fo_transfer(fm, paths, NULL, panel_dir(p), p->ssh_conn, cut);
         /* a cut can be pasted only once – unless something was left behind */
         if (cut && r == FS_OK) gdk_clipboard_set_content(clipboard(fm), NULL);
-        p->inhibit_sel = TRUE;
-        gtk_widget_grab_focus(p->column_view);
+        panel_focus(p);
     }
     g_list_free_full(paths, g_free);
     paste_ctx_free(pc);
@@ -156,6 +158,7 @@ void clip_paste(FM *fm)
     static const char *mimes[] = {
         "x-special/gnome-copied-files", "text/uri-list", NULL
     };
+    if (arc_panel_readonly_msg(active_panel(fm))) return;
     gdk_clipboard_read_async(clipboard(fm), mimes, G_PRIORITY_DEFAULT, NULL,
                              on_clipboard_read, fm);
 }
