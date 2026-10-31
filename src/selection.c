@@ -98,7 +98,6 @@ static void do_invert(Panel *p, FileItem *it, gpointer d)
 void sel_mark_all(Panel *p, gboolean mark)
 {
     for_visible(p, do_mark, GINT_TO_POINTER(mark));
-    if (!mark) g_hash_table_remove_all(p->marks);
     sel_refresh(p);
 }
 

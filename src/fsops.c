@@ -633,10 +633,36 @@ gboolean fs_sftp_replace(LIBSSH2_SFTP *sftp, const char *from, const char *to)
                                LIBSSH2_SFTP_RENAME_ATOMIC |
                                LIBSSH2_SFTP_RENAME_NATIVE) == 0)
         return TRUE;
-    /* SFTP v3 servers refuse to rename over an existing file */
-    libssh2_sftp_unlink(sftp, to);
-    return libssh2_sftp_rename_ex(sftp, from, (unsigned)strlen(from),
-                                  to, (unsigned)strlen(to), 0) == 0;
+    /* SFTP v3 servers refuse to rename over an existing file: move the
+     * target aside first and bring it back if the rename still fails */
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    if (libssh2_sftp_lstat(sftp, from, &a) != 0) return FALSE;   /* source gone */
+    gchar *aside = g_strdup_printf("%s.fm-old-%08x", to, g_random_int());
+    gboolean ok = FALSE;
+    if (libssh2_sftp_rename_ex(sftp, to, (unsigned)strlen(to),
+                               aside, (unsigned)strlen(aside), 0) == 0) {
+        ok = libssh2_sftp_rename_ex(sftp, from, (unsigned)strlen(from),
+                                    to, (unsigned)strlen(to), 0) == 0;
+        if (ok) libssh2_sftp_unlink(sftp, aside);
+        else    libssh2_sftp_rename_ex(sftp, aside, (unsigned)strlen(aside),
+                                       to, (unsigned)strlen(to), 0);
+    }
+    g_free(aside);
+    return ok;
+}
+
+gboolean fs_sftp_has_entry(LIBSSH2_SFTP *sftp, const char *dir, const char *name)
+{
+    LIBSSH2_SFTP_HANDLE *h = libssh2_sftp_opendir(sftp, dir);
+    if (!h) return FALSE;
+    char buf[NAME_BUF], longentry[NAME_BUF];
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+    gboolean found = FALSE;
+    while (!found && libssh2_sftp_readdir_ex(h, buf, sizeof(buf), longentry,
+                                             sizeof(longentry), &attrs) > 0)
+        found = strcmp(buf, name) == 0;
+    libssh2_sftp_closedir(h);
+    return found;
 }
 
 /* ── upload ───────────────────────────────────────────────────────── */

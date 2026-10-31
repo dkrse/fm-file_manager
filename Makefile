@@ -80,7 +80,7 @@ CORE_SRCS := $(SRCDIR)/util.c $(SRCDIR)/fsops.c $(SRCDIR)/arcfs.c
 SRCS   := $(SRCDIR)/main.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
           $(SRCDIR)/archive.c $(SRCDIR)/arcpanel.c $(SRCDIR)/job.c $(SRCDIR)/dialogs.c \
           $(SRCDIR)/selection.c $(SRCDIR)/clipboard.c $(SRCDIR)/monitor.c \
-          $(SRCDIR)/icons.c \
+          $(SRCDIR)/icons.c $(SRCDIR)/multirename.c \
           $(SRCDIR)/search.c $(SRCDIR)/ssh.c $(SRCDIR)/settings.c \
           $(SRCDIR)/viewer.c $(SRCDIR)/editor.c $(SRCDIR)/highlight.c \
           $(CORE_SRCS)

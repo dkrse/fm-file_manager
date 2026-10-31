@@ -30,6 +30,18 @@ gchar *fs_unique_name(const char *dir, const char *name,
                       FsExistsFunc exists, gpointer user);
 gboolean fs_local_exists(const char *dir, const char *name, gpointer user);
 
+/* ── multi-rename (Ctrl+M) ────────────────────────────────────────── */
+typedef enum { MRN_CASE_KEEP, MRN_CASE_LOWER, MRN_CASE_UPPER } MrnCase;
+
+/* New name for `name` from a mask: [N] name without extension, [E]
+ * extension (without the dot; empty for directories), [C] counter padded
+ * to `digits`.  Then every `find` is replaced by `repl` (plain text, case
+ * sensitive) and the case is changed.  A dot left dangling by an empty
+ * [E] is dropped.  Caller frees. */
+gchar *mrn_apply(const char *name, gboolean is_dir, const char *mask,
+                 const char *find, const char *repl, MrnCase cs,
+                 guint counter, guint digits);
+
 /* ── archives ─────────────────────────────────────────────────────── */
 typedef enum {
     ARC_UNKNOWN,

@@ -450,7 +450,9 @@ static SshConn *ssh_conn_new(const char *host, const char *user,
         return NULL;
     }
 
+    static guint next_serial;
     SshConn *conn     = g_new0(SshConn, 1);
+    conn->serial      = ++next_serial;
     g_rec_mutex_init(&conn->lock);
     conn->sock        = sock;
     conn->session     = session;
@@ -629,6 +631,7 @@ void panel_load_remote(Panel *p, const char *path)
 {
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
+    panel_scroll_remember(p);
 
     arc_panel_leave(p);                 /* SFTP opened over an archive view */
 
@@ -637,6 +640,20 @@ void panel_load_remote(Panel *p, const char *path)
         search_detach(p);
         gtk_sort_list_model_set_sorter(p->sort_model, p->default_sorter);
         search_update_buttons(p);
+    }
+
+    /* the background poll may be using the session */
+    ssh_conn_lock(conn);
+    /* open first: an unreadable directory leaves the panel where it was */
+    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, path);
+    if (!handle) {
+        ssh_conn_unlock(conn);
+        fm_status(p->fm, "SFTP: failed to open directory %s", path);
+        if (!conn->remote_path) {       /* nothing to fall back to */
+            g_list_store_remove_all(p->store);
+            panel_update_status(p);
+        }
+        return;
     }
 
     /* Clear marks when entering a different directory */
@@ -655,18 +672,6 @@ void panel_load_remote(Panel *p, const char *path)
                                          conn->user, conn->host, path);
     gtk_editable_set_text(GTK_EDITABLE(p->path_entry), entry_text);
     g_free(entry_text);
-
-    /* the background poll may be using the session */
-    ssh_conn_lock(conn);
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, path);
-    if (!handle) {
-        ssh_conn_unlock(conn);
-        fm_status(p->fm, "SFTP: failed to open directory %s", path);
-        g_list_store_remove_all(p->store);
-        panel_update_status(p);
-        p->inhibit_sel = FALSE;
-        return;
-    }
 
     /* Collect all items into array first, then splice once (O(n) instead of O(n²)) */
     GPtrArray *items = g_ptr_array_new_with_free_func(g_object_unref);
@@ -693,6 +698,15 @@ void panel_load_remote(Panel *p, const char *path)
                             LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
         gboolean is_link = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
                             LIBSSH2_SFTP_S_ISLNK(attrs.permissions);
+        if (is_link) {                  /* a link to a directory opens like one */
+            gchar *lp = fs_remote_join(path, name_buf);
+            LIBSSH2_SFTP_ATTRIBUTES ta;
+            if (libssh2_sftp_stat(conn->sftp, lp, &ta) == 0 &&
+                (ta.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                LIBSSH2_SFTP_S_ISDIR(ta.permissions))
+                is_dir = TRUE;
+            g_free(lp);
+        }
         gboolean is_exec = !is_dir &&
                             (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
                             (attrs.permissions & (S_IXUSR | S_IXGRP | S_IXOTH));

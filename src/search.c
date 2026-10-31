@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <unistd.h>
 #include <stdio.h>
 
 /* ── String interning for directory paths ────────────────────────── */
@@ -55,10 +56,14 @@ static gboolean str_is_ascii(const char *s)
     return TRUE;
 }
 
-static gchar *file_contains(const char *path, const char *needle_lower, int *out_line)
+static gchar *file_contains(const char *path, const char *needle_lower, int *out_line,
+                            gint *cancelled)
 {
-    FILE *fp = fopen(path, "r");
-    if (!fp) return NULL;
+    /* O_NONBLOCK: never hang on a FIFO/device that slipped through */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) { close(fd); return NULL; }
 
     unsigned char probe[512];
     size_t nr = fread(probe, 1, sizeof(probe), fp);
@@ -76,6 +81,7 @@ static gchar *file_contains(const char *path, const char *needle_lower, int *out
     int line = 0;
     gboolean cont = FALSE;      /* previous fgets() stopped mid-line */
     while (fgets(buf, sizeof(buf), fp)) {
+        if ((line & 1023) == 0 && g_atomic_int_get(cancelled)) break;
         /* a buffer ending without '\n' is a continuation of the same line */
         gboolean whole = strchr(buf, '\n') != NULL;
         if (!cont) line++;
@@ -173,7 +179,8 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
     if (depth > 64 || g_atomic_int_get(&ctx->cancelled)) return;
 
     struct stat base_st;
-    if (lstat(base, &base_st) != 0) return;
+    /* the search root itself may be a symlink (~/data -> /mnt/data) */
+    if ((depth == 0 ? stat(base, &base_st) : lstat(base, &base_st)) != 0) return;
 
     /* Skip symlinks to directories — prevents loops (like find -P) */
     if (S_ISLNK(base_st.st_mode)) return;
@@ -223,10 +230,10 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
                 if (ctx->content) {
                     gchar *ml = NULL;
                     int line = 0;
-                    if (!is_link) {
+                    if (!is_link && S_ISREG(st.st_mode)) {
                         char full[4096];
                         g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-                        ml = file_contains(full, ctx->content, &line);
+                        ml = file_contains(full, ctx->content, &line, &ctx->cancelled);
                     }
                     if (ml) add_result(ctx, base_interned, de->d_name, &st, ml, line);
                 } else {
@@ -730,6 +737,10 @@ static gboolean on_hist_key(GtkEventControllerKey *k, guint keyval, guint code,
 void search_history_dialog(FM *fm)
 {
     Panel *p = active_panel(fm);
+    if (p->busy) {
+        fm_status(fm, "A search is running in this panel");
+        return;
+    }
     if (g_queue_is_empty(&search_history)) {
         fm_status(fm, "No previous searches");
         return;
@@ -885,7 +896,7 @@ void search_run(FM *fm)
     /* Get device of search root for -xdev semantics */
     struct stat root_st;
     dev_t root_dev = 0;
-    if (lstat(search_dir_path, &root_st) == 0)
+    if (stat(search_dir_path, &root_st) == 0)
         root_dev = root_st.st_dev;
 
     SearchCtx ctx = {

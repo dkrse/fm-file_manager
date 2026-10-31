@@ -81,6 +81,7 @@ struct _SshConn {
     gchar            *user;
     gchar            *remote_path;   /* current remote cwd */
     int               port;
+    guint             serial;        /* unique per connection (editor checks it) */
 };
 #else
 struct _SshConn {
@@ -91,6 +92,7 @@ struct _SshConn {
     gchar *host;
     gchar *user;
     gchar *remote_path;
+    guint  serial;
     int   port;
 };
 #endif
@@ -120,6 +122,7 @@ typedef struct {
     SshConn            *ssh_conn;       /* NULL = local panel                 */
     guint               cursor_pos;     /* current cursor position            */
     gboolean            inhibit_sel;    /* TRUE while we scroll/unselect programmatically */
+    GHashTable         *scroll_pos;     /* dir → scroll offset, restored on going up */
     GHashTable         *marks;          /* marked names; full paths in search mode (see sel_mark_key) */
     gboolean            busy;           /* a search scans into this panel – no navigation */
     /* filter (Ctrl+S) */
@@ -258,6 +261,7 @@ void   panel_setup(Panel *p, FM *fm, int idx);
 void   panel_load(Panel *p, const char *path);
 void   panel_load_remote(Panel *p, const char *path);
 void   panel_reload(Panel *p);
+void   panel_scroll_remember(Panel *p);       /* before leaving the current dir */
 void   panel_go_up(Panel *p);
 void   panel_tab_new(Panel *p, const char *path); /* NULL = current dir */
 void   panel_tab_close(Panel *p);
@@ -310,6 +314,7 @@ void panel_monitor_stop(Panel *p);
 void fo_copy(FM *fm);
 void fo_copy_here(FM *fm);                   /* Shift+F5 – duplicate in same dir */
 void fo_move(FM *fm);
+void fo_multi_rename(FM *fm);              /* Ctrl+M (multirename.c) */
 void fo_delete(FM *fm);                      /* local: trash (asks), SFTP: delete */
 void fo_delete_permanent(FM *fm);            /* Shift+Del / Shift+F8 */
 void fo_mkdir(FM *fm);

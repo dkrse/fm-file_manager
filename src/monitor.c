@@ -59,6 +59,35 @@ static gint store_find(Panel *p, const char *name)
     return -1;
 }
 
+/* Store changes shift rows: keep the cursor on the same file, or on the
+ * row where it was when that file disappeared */
+static gchar *cursor_name_save(Panel *p)
+{
+    FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), p->cursor_pos);
+    gchar *name = fi ? g_strdup(fi->name) : NULL;
+    if (fi) g_object_unref(fi);
+    return name;
+}
+
+static void cursor_name_restore(Panel *p, gchar *name, guint old_pos)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    gint found = -1;
+    for (guint i = 0; name && i < n && found < 0; i++) {
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
+        if (fi && strcmp(fi->name, name) == 0) found = (gint)i;
+        if (fi) g_object_unref(fi);
+    }
+    g_free(name);
+    if (n == 0) { p->cursor_pos = 0; return; }
+    guint pos = found >= 0 ? (guint)found : MIN(old_pos, n - 1);
+    p->cursor_pos = pos;
+    p->inhibit_sel = TRUE;
+    gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), pos, NULL,
+        p->fm->active == p->idx ? GTK_LIST_SCROLL_SELECT : GTK_LIST_SCROLL_NONE, NULL);
+    p->inhibit_sel = FALSE;
+}
+
 static void monitor_remove(Panel *p, const char *name)
 {
     gint i = store_find(p, name);
@@ -115,6 +144,8 @@ static gboolean monitor_flush(gpointer data)
     if (g_hash_table_size(pending) > MON_RELOAD_LIMIT) {
         panel_reload(p);                       /* keeps cursor and marks */
     } else {
+        guint old_pos = p->cursor_pos;
+        gchar *cur = cursor_name_save(p);
         GHashTableIter it;
         gpointer key;
         g_hash_table_iter_init(&it, pending);
@@ -126,6 +157,7 @@ static gboolean monitor_flush(gpointer data)
             if (exists) monitor_upsert(p, key);
             else        monitor_remove(p, key);
         }
+        cursor_name_restore(p, cur, old_pos);
     }
     g_hash_table_destroy(pending);
     return G_SOURCE_REMOVE;
@@ -213,6 +245,8 @@ static gboolean sftp_poll_apply(gpointer data)
         goto out;
 
     gboolean changed = FALSE;
+    guint old_pos = p->cursor_pos;
+    gchar *cur = cursor_name_save(p);
 
     /* Pass 1: remove items no longer on remote; note the ones we have */
     GHashTable *present = g_hash_table_new(g_str_hash, g_str_equal);
@@ -254,7 +288,12 @@ static gboolean sftp_poll_apply(gpointer data)
     }
 
     g_hash_table_destroy(present);
-    if (changed) panel_update_status(p);
+    if (changed) {
+        panel_update_status(p);
+        cursor_name_restore(p, cur, old_pos);
+    } else {
+        g_free(cur);
+    }
 
 out:
     if (sp->remote) g_hash_table_destroy(sp->remote);

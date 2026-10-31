@@ -653,6 +653,27 @@ static void test_arcfs_symlink_escape(void)
 }
 #endif /* HAVE_LIBARCHIVE */
 
+static void check_mrn(const char *name, gboolean dir, const char *mask, const char *find,
+                      const char *repl, MrnCase cs, guint n, guint dg, const char *want)
+{
+    gchar *r = mrn_apply(name, dir, mask, find, repl, cs, n, dg);
+    g_assert_cmpstr(r, ==, want);
+    g_free(r);
+}
+
+static void test_multi_rename(void)
+{
+    check_mrn("photo.jpg",  FALSE, "[N].[E]",          "", "", MRN_CASE_KEEP, 1, 1, "photo.jpg");
+    check_mrn("photo.jpg",  FALSE, "img_[C].[E]",      "", "", MRN_CASE_KEEP, 7, 3, "img_007.jpg");
+    check_mrn("a.tar.gz",   FALSE, "[N]_x.[E]",        "", "", MRN_CASE_KEEP, 1, 1, "a.tar_x.gz");
+    check_mrn("README",     FALSE, "[N].[E]",          "", "", MRN_CASE_KEEP, 1, 1, "README");
+    check_mrn(".bashrc",    FALSE, "[N].[E]",          "", "", MRN_CASE_KEEP, 1, 1, ".bashrc");
+    check_mrn("my.dir",     TRUE,  "[N]-[C]",          "", "", MRN_CASE_KEEP, 2, 2, "my.dir-02");
+    check_mrn("a b c.txt",  FALSE, "[N].[E]",          " ", "_", MRN_CASE_KEEP, 1, 1, "a_b_c.txt");
+    check_mrn("Foto.JPG",   FALSE, "[N].[E]",          "", "", MRN_CASE_LOWER, 1, 1, "foto.jpg");
+    check_mrn("čaj.txt",    FALSE, "[N].[E]",          "", "", MRN_CASE_UPPER, 1, 1, "ČAJ.TXT");
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -664,6 +685,7 @@ int main(int argc, char **argv)
     g_test_add_func("/util/unique-name",       test_unique_name);
     g_test_add_func("/util/uri-list",          test_uri_list);
     g_test_add_func("/util/patterns",          test_patterns);
+    g_test_add_func("/util/multi-rename",      test_multi_rename);
     g_test_add_func("/fsops/copy-tree",        test_copy_tree);
     g_test_add_func("/fsops/copy-into-itself", test_copy_into_itself);
     g_test_add_func("/fsops/copy-same-file",   test_copy_same_file);

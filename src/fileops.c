@@ -644,9 +644,11 @@ void fo_rename(FM *fm)
             LIBSSH2_SFTP *sftp = p->ssh_conn->sftp;
             gboolean exists_dir = FALSE, go = TRUE, replace = FALSE;
             /* case-only rename: on a case-insensitive server np "exists"
-             * but is the source itself – never replace/unlink it */
-            if (g_ascii_strcasecmp(old_name, new_name) != 0 &&
-                fs_sftp_exists(sftp, np, &exists_dir)) {
+             * but is the source itself – never replace/unlink it; only an
+             * entry with exactly the new name is another file */
+            gboolean case_only = g_ascii_strcasecmp(old_name, new_name) == 0;
+            if (fs_sftp_exists(sftp, np, &exists_dir) &&
+                (!case_only || fs_sftp_has_entry(sftp, dir, new_name))) {
                 gchar *q = g_markup_printf_escaped("<b>%s</b> already exists. Replace it?", new_name);
                 static const char *const b[] = { "Cancel", "Replace", NULL };
                 go = replace = !exists_dir && ask_choice(fm, "Rename", q, NULL, b, 1) == 1;
@@ -667,10 +669,12 @@ void fo_rename(FM *fm)
         {
             gchar *op = g_build_filename(dir, old_name, NULL);
             gchar *np = g_build_filename(dir, new_name, NULL);
-            struct stat st;
+            struct stat st, ost;
             gboolean go = TRUE;
-            /* case-only rename on case-insensitive FS is the same inode – fine */
-            if (lstat(np, &st) == 0 && g_ascii_strcasecmp(old_name, new_name) != 0) {
+            /* case-only rename on case-insensitive FS is the same inode – fine;
+             * on a case-sensitive FS "A.txt" may be a different file */
+            if (lstat(np, &st) == 0 &&
+                !(lstat(op, &ost) == 0 && st.st_dev == ost.st_dev && st.st_ino == ost.st_ino)) {
                 gchar *q = g_markup_printf_escaped("<b>%s</b> already exists. Replace it?", new_name);
                 static const char *const b[] = { "Cancel", "Replace", NULL };
                 go = ask_choice(fm, "Rename", q, NULL, b, 1) == 1;

@@ -155,6 +155,48 @@ GList *panel_selection_paths(Panel *p)
     return g_list_reverse(out);
 }
 
+/* Scroll offset of each visited directory, so that going back up shows
+ * the list as it was (not just the right row somewhere on screen) */
+void panel_scroll_remember(Panel *p)
+{
+    const char *dir = panel_dir(p);
+    if (!dir || !p->column_view || p->search_mode) return;
+    if (!p->scroll_pos)
+        p->scroll_pos = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    if (g_hash_table_size(p->scroll_pos) > 256) g_hash_table_remove_all(p->scroll_pos);
+    GtkAdjustment *va = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(p->column_view));
+    double *v = g_new(double, 1);
+    *v = va ? gtk_adjustment_get_value(va) : 0;
+    g_hash_table_replace(p->scroll_pos, g_strdup(dir), v);
+}
+
+typedef struct { Panel *p; gchar *dir; double value; } ScrollRestore;
+
+static gboolean scroll_restore_idle(gpointer d)
+{
+    ScrollRestore *r = d;
+    const char *dir = panel_dir(r->p);
+    if (dir && strcmp(dir, r->dir) == 0) {   /* still the same directory */
+        GtkAdjustment *va = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(r->p->column_view));
+        if (va) gtk_adjustment_set_value(va, r->value);
+    }
+    g_free(r->dir);
+    g_free(r);
+    return G_SOURCE_REMOVE;
+}
+
+/* Applied after the next layout – the pending scroll_to of the cursor
+ * would override an offset set right away */
+static void panel_scroll_restore(Panel *p)
+{
+    const char *dir = panel_dir(p);
+    double *v = p->scroll_pos && dir ? g_hash_table_lookup(p->scroll_pos, dir) : NULL;
+    if (!v) return;
+    ScrollRestore *r = g_new(ScrollRestore, 1);
+    r->p = p; r->dir = g_strdup(dir); r->value = *v;
+    g_idle_add_full(G_PRIORITY_LOW, scroll_restore_idle, r, NULL);
+}
+
 void panel_select_name(Panel *p, const char *name)
 {
     if (!name) return;
@@ -613,6 +655,7 @@ void panel_load(Panel *p, const char *path)
     if (p->ssh_conn) { panel_load_remote(p, path); return; }
 
     if (p->busy) return;            /* a search is filling this panel */
+    panel_scroll_remember(p);
     struct stat st;
     if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
     if (strlen(path) >= sizeof(p->cwd)) {
@@ -777,6 +820,7 @@ void panel_go_up(Panel *p)
             }
             if (item) g_object_unref(item);
         }
+        panel_scroll_restore(p);
         g_free(parent); g_free(basename);
         return;
     }
@@ -811,6 +855,7 @@ void panel_go_up(Panel *p)
         }
         if (item) g_object_unref(item);
     }
+    panel_scroll_restore(p);
     g_free(parent);
     g_free(basename);
 }
@@ -1064,7 +1109,7 @@ static void activate_item(Panel *p)
         if (strcmp(name, "..") == 0) {
             panel_go_up(p);
         } else if (is_dir) {
-            gchar *np = g_strdup_printf("%s/%s", p->ssh_conn->remote_path, name);
+            gchar *np = fs_remote_join(p->ssh_conn->remote_path, name);
             panel_load_remote(p, np);
             g_free(np);
         } else {
@@ -1072,8 +1117,7 @@ static void activate_item(Panel *p)
             /* No main-loop pump here: re-entering would let the panel
              * change under us while the (blocking) download runs. */
             fm_status(p->fm, "Downloading '%s'...", name);
-            gchar *remote_path = g_strdup_printf("%s/%s",
-                p->ssh_conn->remote_path, name);
+            gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
             gsize len = 0;
             gchar *data = ssh_read_file(p->ssh_conn, remote_path, &len);
             g_free(remote_path);
@@ -1740,6 +1784,7 @@ PMENU(pmenu_paste,    clip_paste(p->fm))
 PMENU(pmenu_copypath, clip_copy_paths(p->fm))
 PMENU(pmenu_dup,      fo_copy_here(p->fm))
 PMENU(pmenu_rename,   fo_rename(p->fm))
+PMENU(pmenu_mrename,  fo_multi_rename(p->fm))
 PMENU(pmenu_delete,   fo_delete(p->fm))
 PMENU(pmenu_mkdir,    fo_mkdir(p->fm))
 PMENU(pmenu_newfile,  fo_newfile(p->fm))
@@ -1817,6 +1862,7 @@ static GMenu *build_file_menu(const char *grp)
     static const MenuEntry file[] = {
         { "Duplicate\u2026    Shift+F5",   "dup"      },
         { "Rename\u2026    Shift+F6",      "rename"   },
+        { "Multi-rename\u2026    Ctrl+M",  "mrename"  },
         { "Delete\u2026    Del",           "delete"   },
         { "New directory\u2026    F7",     "mkdir"    },
         { "New file\u2026    Shift+F4",    "newfile"  },
@@ -2001,6 +2047,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
             { "copypath", G_CALLBACK(pmenu_copypath) },
             { "dup",      G_CALLBACK(pmenu_dup)      },
             { "rename",   G_CALLBACK(pmenu_rename)   },
+            { "mrename",  G_CALLBACK(pmenu_mrename)  },
             { "delete",   G_CALLBACK(pmenu_delete)   },
             { "mkdir",    G_CALLBACK(pmenu_mkdir)    },
             { "newfile",  G_CALLBACK(pmenu_newfile)  },
@@ -2353,7 +2400,7 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
 
     /* F-keys – only when not typing in path entry */
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(fm->window));
-    if (focus && GTK_IS_ENTRY(focus)) return FALSE;
+    if (focus && (GTK_IS_EDITABLE(focus) || GTK_IS_TEXT_VIEW(focus))) return FALSE;
 
     gboolean shift = (state & GDK_SHIFT_MASK) != 0;
     gboolean ctl   = (state & GDK_CONTROL_MASK) != 0;
@@ -2427,6 +2474,12 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     case GDK_KEY_p:
     case GDK_KEY_P:
         if (state & GDK_ALT_MASK) { fo_pack(fm); return TRUE; }
+        break;
+
+    /* Ctrl+M – multi-rename */
+    case GDK_KEY_m:
+    case GDK_KEY_M:
+        if (ctl) { fo_multi_rename(fm); return TRUE; }
         break;
 
     /* Tabs: Ctrl+T new, Ctrl+W close, Ctrl+Up directory under cursor */

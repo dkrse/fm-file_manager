@@ -1,4 +1,5 @@
 #include "fm.h"
+#include "dialogs.h"
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -27,7 +28,9 @@ typedef struct {
     GtkWidget     *scroll;        /* scrolled window */
     gchar         *filepath;      /* local path, or NULL for SSH */
     gchar         *remote_path;   /* full remote path when editing via SFTP */
-    SshConn       *ssh_conn;      /* non-NULL when editing a remote file */
+    SshConn       *ssh_conn;      /* non-NULL when editing a remote file;
+                                   * may be freed – check with editor_conn() */
+    guint          ssh_serial;
     FM            *fm;
     gboolean       modified;
     gboolean       read_only;     /* binary file (NUL bytes): never saved */
@@ -126,7 +129,9 @@ static gboolean hl_idle_cb(gpointer user_data)
 {
     EditorCtx *ctx = user_data;
     ctx->hl_idle = 0;
-    highlight_apply(ctx->buffer, ctx->filepath, ctx->fm->syntax_highlight);
+    highlight_apply(ctx->buffer, ctx->remote_path ? ctx->remote_path : ctx->filepath,
+                    ctx->fm->syntax_highlight &&
+                    gtk_text_buffer_get_char_count(ctx->buffer) <= EDITOR_HL_MAX_BYTES);
     return G_SOURCE_REMOVE;
 }
 
@@ -185,6 +190,16 @@ static void on_cursor_moved(GtkTextBuffer *buf, GtkTextIter *loc,
 
 /* ── save ────────────────────────────────────────────────────────── */
 
+/* The panel's connection the file was opened from, NULL once it closed */
+static SshConn *editor_conn(EditorCtx *ctx)
+{
+    for (int i = 0; i < 2; i++) {
+        SshConn *c = ctx->fm->panels[i].ssh_conn;
+        if (c && c == ctx->ssh_conn && c->serial == ctx->ssh_serial) return c;
+    }
+    return NULL;
+}
+
 static void editor_save(EditorCtx *ctx)
 {
     if (ctx->read_only) {
@@ -219,8 +234,11 @@ static void editor_save(EditorCtx *ctx)
 
     if (ctx->ssh_conn) {
         display_path = ctx->remote_path;
-        ok = ssh_write_file(ctx->ssh_conn, ctx->remote_path, text, len);
-        if (!ok)
+        SshConn *conn = editor_conn(ctx);
+        ok = conn && ssh_write_file(conn, ctx->remote_path, text, len);
+        if (!conn)
+            fm_status(ctx->fm, "Not saved: the SFTP connection was closed");
+        else if (!ok)
             fm_status(ctx->fm, "SFTP save error: %s", ctx->remote_path);
     } else if (ctx->filepath) {
         display_path = ctx->filepath;
@@ -369,7 +387,7 @@ static void search_highlight_all(EditorCtx *ctx, const gchar *needle)
     /* Update match count label */
     if (ctx->match_lbl) {
         if (count > 0) {
-            gchar *txt = g_strdup_printf("%d z %d", ctx->current_match, ctx->total_matches);
+            gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
             gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
             g_free(txt);
         } else {
@@ -405,7 +423,7 @@ static void search_goto_match(EditorCtx *ctx, int index)
             ctx->current_match = index;
 
             if (ctx->match_lbl) {
-                gchar *txt = g_strdup_printf("%d z %d", ctx->current_match, ctx->total_matches);
+                gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
                 gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
                 g_free(txt);
             }
@@ -477,7 +495,10 @@ static void on_replace_clicked(GtkButton *btn, gpointer user_data)
     GtkTextIter sel_start, sel_end;
     if (gtk_text_buffer_get_selection_bounds(ctx->buffer, &sel_start, &sel_end)) {
         gchar *selected = gtk_text_buffer_get_text(ctx->buffer, &sel_start, &sel_end, FALSE);
-        if (g_ascii_strcasecmp(selected, needle) == 0) {
+        gchar *fs = g_utf8_casefold(selected, -1), *fn = g_utf8_casefold(needle, -1);
+        gboolean same = strcmp(fs, fn) == 0;
+        g_free(fs); g_free(fn);
+        if (same && !ctx->read_only) {
             gtk_text_buffer_delete(ctx->buffer, &sel_start, &sel_end);
             gtk_text_buffer_insert(ctx->buffer, &sel_start, replacement, -1);
         }
@@ -503,16 +524,19 @@ static void on_replace_all_clicked(GtkButton *btn, gpointer user_data)
     GtkTextIter start, match_start, match_end;
     gtk_text_buffer_get_start_iter(ctx->buffer, &start);
 
+    if (ctx->read_only) {
+        fm_status(ctx->fm, "Editor: binary file is read-only");
+        return;
+    }
     int replaced = 0;
-    gsize repl_len = strlen(replacement);
 
     gtk_text_buffer_begin_user_action(ctx->buffer);
     while (gtk_text_iter_forward_search(&start, needle,
                 GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         gtk_text_buffer_delete(ctx->buffer, &match_start, &match_end);
+        /* insert leaves the iter after the inserted text */
         gtk_text_buffer_insert(ctx->buffer, &match_start, replacement, -1);
         start = match_start;
-        gtk_text_iter_forward_chars(&start, repl_len);
         replaced++;
     }
     gtk_text_buffer_end_user_action(ctx->buffer);
@@ -569,6 +593,7 @@ static void match_map_draw(GtkDrawingArea *da, cairo_t *cr,
     cairo_line_to(cr, 0, height);
     cairo_stroke(cr);
 
+    ctx->total_lines = gtk_text_buffer_get_line_count(ctx->buffer);  /* follows edits */
     if (!ctx->match_lines || ctx->match_lines->len == 0 || ctx->total_lines <= 0)
         return;
 
@@ -902,6 +927,19 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
 {
     (void)win;
     EditorCtx *ctx = user_data;
+    if (ctx->modified && !ctx->read_only) {
+        const gchar *dp = ctx->remote_path ? ctx->remote_path
+                        : ctx->filepath   ? ctx->filepath : "untitled";
+        gchar *base = g_path_get_basename(dp);
+        gchar *q = g_markup_printf_escaped("Save changes to <b>%s</b>?", base);
+        g_free(base);
+        static const char *const b[] = { "Cancel", "Discard", "Save", NULL };
+        int r = ask_choice(ctx->fm, "Close editor", q, NULL, b, 1);
+        g_free(q);
+        if (r == 2) editor_save(ctx);
+        if (r <= 0 || (ctx->modified && r == 2))
+            return TRUE;                /* cancelled or save failed: keep open */
+    }
     if (ctx->hl_idle) g_source_remove(ctx->hl_idle);
     if (ctx->match_lines) g_array_free(ctx->match_lines, TRUE);
     FM *fm = ctx->fm;
@@ -1018,6 +1056,7 @@ void editor_show_path(FM *fm, const char *path)
     ctx->filepath    = filepath;
     ctx->remote_path = remote_path;
     ctx->ssh_conn    = ssh_conn;
+    ctx->ssh_serial  = ssh_conn ? ssh_conn->serial : 0;
     ctx->modified    = FALSE;
     ctx->read_only   = read_only;
     ctx->encoding    = encoding;
@@ -1201,14 +1240,10 @@ void editor_show_path(FM *fm, const char *path)
     /* load content – suppress modified flag */
     g_signal_handlers_block_by_func(ctx->buffer, on_buffer_changed, ctx);
     gsize loaded_len = strlen(content);
-#ifdef HAVE_GTKSOURCEVIEW
     /* initial load is not undoable – avoids a copy of the whole text */
     gtk_text_buffer_begin_irreversible_action(ctx->buffer);
-#endif
     gtk_text_buffer_set_text(ctx->buffer, content, (gint)loaded_len);
-#ifdef HAVE_GTKSOURCEVIEW
     gtk_text_buffer_end_irreversible_action(ctx->buffer);
-#endif
     g_free(content);
     g_signal_handlers_unblock_by_func(ctx->buffer, on_buffer_changed, ctx);
     if (ctx->read_only)

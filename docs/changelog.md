@@ -3,7 +3,25 @@
 ## [3.3.0] — 2026-10-31
 
 **New features:**
+- Multi-rename (Ctrl+M, also in the right-click menu): name mask with `[N]` name, `[E]` extension and `[C]` counter (start / step / digits), find & replace, lower / upper case, live preview; duplicate or existing target names block the rename, swaps and chains (a→b, b→c) are handled
 - "Open with" submenu in the right-click menu for local files: the default application first, then all applications registered for the file type, plus "Other application…" (system app chooser)
+
+**Fixes:**
+- Typing in the path entry or the Ctrl+S field no longer triggers panel actions (Del opened the delete dialog, Ctrl+A/C/V worked on files instead of text)
+- Editor asks Save / Discard / Cancel when closing with unsaved changes (Esc used to throw them away)
+- Editor: saving a remote file after its SFTP panel disconnected no longer touches freed memory – it reports that the connection is closed
+- Editor: "Replace all" with non-ASCII replacement text no longer skips matches; single Replace works for non-ASCII case differences; read-only (binary) files cannot be changed by replace; the 2 MB highlighting limit also holds after edits; match map follows added/removed lines
+- Shift+F6: renaming `a.txt` to `A.txt` no longer silently overwrites a different `A.txt` on case-sensitive filesystems (local and SFTP)
+- SFTP overwrite on servers that refuse rename-over: the target is moved aside and restored on failure instead of being deleted first
+- SFTP: an unreadable directory leaves the panel where it was (it used to empty it, with no ".."); symlinks to directories open as directories; no more `//` in paths at the server root
+- Archives: a symbolic link inside an archive is not opened (F4 could have edited the real file it points to)
+- Search (F2): content search no longer hangs on FIFOs/devices, Cancel works inside large files, a symlinked search directory is searched
+- Auto-refresh keeps the cursor on the same file when other files appear or disappear
+- Unselect all no longer drops marks of items hidden by the file mask; Shift+F2 refused while a search is running
+- Dark theme keeps a chosen dark editor scheme (solarized-dark, cobalt, …)
+- Multi-rename: a directory selected together with an item inside it is refused; case-only renames work on case-insensitive filesystems; the "left as" recovery message is reported
+- F1 help / README: F9, Ctrl+Enter and Ctrl+S described correctly; SSH bookmark storage format updated
+- Going back up (Backspace / "..") restores the list's scroll position, so the directory you came from stays where it was on screen instead of jumping to the top
 
 **Performance:**
 - Viewer reads at most 50 MB instead of loading the whole file and truncating it (multi-GB files open instantly)

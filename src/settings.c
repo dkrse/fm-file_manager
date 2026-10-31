@@ -136,6 +136,14 @@ const char *fm_scheme_for_theme(FM *fm)
         /* Try <base>-dark first */
         GtkSourceStyleSchemeManager *sm =
             gtk_source_style_scheme_manager_get_default();
+        /* the chosen scheme is already dark (solarized-dark, cobalt, …) */
+        GtkSourceStyleScheme *own = gtk_source_style_scheme_manager_get_scheme(sm, base);
+        if (own) {
+            const char *var = gtk_source_style_scheme_get_metadata(own, "variant");
+            if (g_str_has_suffix(base, "-dark") || !g_strcmp0(var, "dark") ||
+                !strcmp(base, "oblivion") || !strcmp(base, "cobalt"))
+                return gtk_source_style_scheme_get_id(own);
+        }
         gchar *try_dark = g_strdup_printf("%s-dark", base);
         GtkSourceStyleScheme *sc =
             gtk_source_style_scheme_manager_get_scheme(sm, try_dark);

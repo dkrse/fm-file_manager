@@ -231,3 +231,46 @@ gboolean fs_match_patterns(const char *patterns, const char *name)
     g_strfreev(pats);
     return hit;
 }
+
+/* ── multi-rename ─────────────────────────────────────────────────── */
+
+gchar *mrn_apply(const char *name, gboolean is_dir, const char *mask,
+                 const char *find, const char *repl, MrnCase cs,
+                 guint counter, guint digits)
+{
+    const char *dot = is_dir ? NULL : strrchr(name, '.');
+    if (dot == name) dot = NULL;                  /* ".bashrc" has no extension */
+    gchar *stem = dot ? g_strndup(name, dot - name) : g_strdup(name);
+    const char *ext = dot ? dot + 1 : "";
+
+    GString *out = g_string_new(NULL);
+    for (const char *m = mask; *m; ) {
+        if (g_str_has_prefix(m, "[N]")) { g_string_append(out, stem); m += 3; }
+        else if (g_str_has_prefix(m, "[E]")) {
+            if (!ext[0] && out->len && out->str[out->len - 1] == '.')
+                g_string_truncate(out, out->len - 1);
+            g_string_append(out, ext);
+            m += 3;
+        }
+        else if (g_str_has_prefix(m, "[C]")) {
+            g_string_append_printf(out, "%0*u", (int)MIN(digits, 10), counter);
+            m += 3;
+        }
+        else g_string_append_c(out, *m++);
+    }
+    g_free(stem);
+
+    gchar *r = g_string_free(out, FALSE);
+    if (find && find[0]) {
+        gchar **parts = g_strsplit(r, find, -1);
+        g_free(r);
+        r = g_strjoinv(repl ? repl : "", parts);
+        g_strfreev(parts);
+    }
+    if (cs != MRN_CASE_KEEP) {
+        gchar *c = cs == MRN_CASE_LOWER ? g_utf8_strdown(r, -1) : g_utf8_strup(r, -1);
+        g_free(r);
+        r = c;
+    }
+    return r;
+}

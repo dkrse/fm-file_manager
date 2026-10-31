@@ -23,6 +23,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
 - **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
 - **Copy, move, delete** — Total Commander style: F5 → path of the other panel is pre-selected, Enter starts copying (type `dir/newname` to rename a single item); F8 → Yes/No confirmation; operations run in a background thread with a From/To progress window (current file + total bar, speed, time left, Esc = cancel); overwrite prompt (Overwrite / Overwrite all / Skip / Skip all / Cancel); permissions, timestamps and symlinks preserved; directories merged; copying a directory into itself is refused; full recursive SFTP support incl. remote-to-remote
+- **Multi-rename** — Ctrl+M on marked files: name mask with `[N]` name, `[E]` extension, `[C]` counter (start, step, digits), find/replace, lower/upper case, live preview of old → new names; conflicts are detected before anything is renamed and swaps (a↔b) work (local files)
 - **Trash** — F8/Del moves local files to the trash (freedesktop), Shift+Del / Shift+F8 deletes permanently
 - **Clipboard** — Ctrl+C / Ctrl+X / Ctrl+V interoperable with other file managers (Nautilus, Dolphin, …); paste into an SFTP panel uploads
 - **Context menu** — right click on a file: **Open with** (default application, other registered applications, or "Other application…" from the system chooser), copy, cut, paste, duplicate, rename, delete, new folder/file, properties, selection
@@ -33,7 +34,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel. Results are kept: Enter opens a file in its default app, Ctrl+PgDn / Ctrl+Enter jumps to the file's directory, Alt+← (or the 🔍 button) returns to the results, Shift+F2 lists the last 10 searches. Content search shows `:line  matching text` next to each file; F3 opens the viewer on that match with the text highlighted (F3 / Shift+F3 = next / previous)
-- **File viewer** — F3, displays text (only the first 50 MB of larger files are read, so even multi-GB files open instantly) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
+- **File viewer** — F3, displays text (only the first 50 MB of larger local files are read, so even multi-GB files open instantly) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too; files up to 100 MB
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS); switched off automatically for files over 2 MB to keep large files fast
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
@@ -75,7 +76,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F5 | Copy |
 | Shift+F5 | Duplicate in the same directory |
 | F6 | Move |
-| Shift+F6 | Rename |
+| Shift+F6 / F9 | Rename |
+| Ctrl+M | Multi-rename marked files |
 | F7 | New directory (nested `a/b/c` allowed) |
 | F8 / Del | Delete (local: move to trash) |
 | Shift+F8 / Shift+Del | Delete permanently |
@@ -173,6 +175,7 @@ src/dialogs.c       — shared dialogs (destination, text entry, multi-button ch
 src/archive.c       — extract / pack via tar, zip, 7z, unrar
 src/arcfs.c         — archive listing / extraction via libarchive (GLib-only)
 src/arcpanel.c      — browsing archives in a panel (read-only)
+src/multirename.c   — multi-rename dialog (Ctrl+M)
 src/selection.c     — marking: group select, invert, select all
 src/clipboard.c     — system clipboard copy/cut/paste
 src/monitor.c       — auto-refresh (inotify / SFTP polling)
@@ -210,7 +213,7 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 ## SSH connections
 
-Stored in `~/.config/fm/settings.ini`, section `[ssh]`, key `connections`. Format: `name|user|host|port|key_path` separated by `;`.
+Stored in `~/.config/fm/settings.ini`, one group per connection: `[ssh-bookmark-N]` with keys `name`, `user`, `host`, `port`, `key` (the old single-line `[ssh] connections` format is migrated automatically).
 
 The dialog (panel hamburger menu → SSH/SFTP) allows:
 - **Select** a saved connection from the dropdown → fills the form

@@ -74,6 +74,8 @@ int    fs_sftp_delete   (FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path);
 gboolean fs_sftp_exists (LIBSSH2_SFTP *sftp, const char *path, gboolean *is_dir);
 /* rename over an existing file (atomic if the server allows it) */
 gboolean fs_sftp_replace(LIBSSH2_SFTP *sftp, const char *from, const char *to);
+/* exact (case-sensitive) name lookup in a remote directory listing */
+gboolean fs_sftp_has_entry(LIBSSH2_SFTP *sftp, const char *dir, const char *name);
 #endif
 
 #endif /* FM_FSOPS_H */

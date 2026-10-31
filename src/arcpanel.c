@@ -354,10 +354,18 @@ static void arc_open(Panel *p, int how)
     gchar *err = fm_wait_work(fm, "Extracting", name, arc_pick_thread, a,
                               arc_pick_free, g_free, arc_pick_cancel, &cancelled);
     gchar *path = g_build_filename(tmpdir, name, NULL);
+    struct stat lst;
+    gboolean have = lstat(path, &lst) == 0;
     if (cancelled) {
         fm_status(fm, "Extraction cancelled");
-    } else if (err || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+    } else if (err || !have) {
         fm_status(fm, "Cannot extract '%s': %s", name, err ? err : "not found");
+        have = FALSE;
+    } else if (S_ISLNK(lst.st_mode)) {
+        /* the link points outside the archive copy – opening (and saving
+         * in the editor) would touch a real file on this computer */
+        fm_status(fm, "'%s' is a symbolic link in the archive – not opened", name);
+        have = FALSE;
     } else if (how == 1) {
         viewer_show_path(fm, path, name);
     } else if (how == 2) {
@@ -371,7 +379,7 @@ static void arc_open(Panel *p, int how)
     }
     /* Nothing uses the copy any more after an error or once the (modal)
      * viewer has closed; a cancelled worker may still be writing to it. */
-    if (!cancelled && (err || how == 1 || !g_file_test(path, G_FILE_TEST_EXISTS))) {
+    if (!cancelled && (err || how == 1 || !have)) {
         fs_delete(NULL, tmpdir);
         arc_tmpdirs = g_slist_remove(arc_tmpdirs, tmpdir);
         g_free(tmpdir);
