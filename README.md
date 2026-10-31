@@ -14,6 +14,10 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | SSH / SFTP connections | F4 — editor |
 | ![Viewer](screenshots/06.png) | ![Tabs and archive browsing](screenshots/07.png) |
 | F3 — viewer | Tabs (left) and a zip archive opened as a directory (right) |
+| ![Dark theme with tabs](screenshots/08.png) | ![Search dialog](screenshots/09.png) |
+| Dark theme with tabs in both panels | F2 — search by name, content and size |
+| ![Settings](screenshots/10.png) | |
+| Settings — theme and terminal | |
 
 ## Features
 
@@ -42,7 +46,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
 - **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
-- **Dark / Light theme** — runtime switching via Settings → System (libadwaita); colors auto-adapt (directories, symlinks, marks, editor scheme)
+- **Dark / Light / System theme** — runtime switching via Settings → System (libadwaita); "System" follows the desktop light/dark setting and switches live when it changes; colors auto-adapt (directories, symlinks, marks, editor scheme)
 - **Settings** — tabbed dialog: Panels / Display / Cursor / Viewer / Editor / System
 
 ## Keyboard shortcuts
@@ -209,7 +213,7 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 **Editor** — text font, editor GUI font, line number font size, line numbers, syntax highlighting, color scheme
 
-**System** — theme (dark / light), terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
+**System** — theme (dark / light / follow system), terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
 
 ## SSH connections
 

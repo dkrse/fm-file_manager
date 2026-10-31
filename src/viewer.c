@@ -558,8 +558,8 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
 
     /* Create match tag for search highlighting */
     ctx.match_tag = gtk_text_buffer_create_tag(ctx.buffer, "search-match",
-                        "background", fm->theme == 0 ? "#665500" : "#FFFF00",
-                        "foreground", fm->theme == 0 ? "#FFFF00" : "#000000",
+                        "background", fm_dark(fm) ? "#665500" : "#FFFF00",
+                        "foreground", fm_dark(fm) ? "#FFFF00" : "#000000",
                         NULL);
 
     GtkWidget *scroll = gtk_scrolled_window_new();

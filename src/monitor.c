@@ -22,12 +22,12 @@ FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st)
     const gchar *fg = NULL;
     gint wt = PANGO_WEIGHT_NORMAL;
     if (is_dir) {
-        if (vdc_theme != fm->theme || g_strcmp0(vdc_src, fm->dir_color) != 0) {
+        if (vdc_theme != fm_dark(fm) || g_strcmp0(vdc_src, fm->dir_color) != 0) {
             g_free(vdc);
             g_free(vdc_src);
             vdc       = fm_visible_color(fm, fm->dir_color);
             vdc_src   = g_strdup(fm->dir_color);
-            vdc_theme = fm->theme;
+            vdc_theme = fm_dark(fm);
         }
         fg = vdc;
         wt = fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL;

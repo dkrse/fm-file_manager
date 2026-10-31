@@ -3,6 +3,7 @@
 ## [3.3.0] — 2026-10-31
 
 **New features:**
+- Theme "System" (Settings → System, the default for new installs): follows the desktop light/dark preference and recolors the panels live when it changes (libadwaita; without it the GTK theme name decides)
 - Multi-rename (Ctrl+M, also in the right-click menu): name mask with `[N]` name, `[E]` extension and `[C]` counter (start / step / digits), find & replace, lower / upper case, live preview; duplicate or existing target names block the rename, swaps and chains (a→b, b→c) are handled
 - "Open with" submenu in the right-click menu for local files: the default application first, then all applications registered for the file type, plus "Other application…" (system app chooser)
 

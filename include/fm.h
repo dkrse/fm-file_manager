@@ -211,7 +211,7 @@ struct _FM {
     gchar          *mark_color;               /* hex color for marked items     */
     /* auto-refresh */
     gboolean        auto_refresh;             /* watch directories for changes  */
-    /* theme: 0 = dark, 1 = light */
+    /* theme: 0 = dark, 1 = light, 2 = follow the system (see fm_dark) */
     int             theme;
     /* viewer: show images as pictures instead of raw bytes */
     gboolean        viewer_image_preview;
@@ -365,6 +365,7 @@ void   apply_viewer_css(FM *fm);
 const char *fm_link_color(FM *fm);
 const char *fm_exec_color(FM *fm);
 const char *fm_scheme_for_theme(FM *fm);
+gboolean    fm_dark(FM *fm);                 /* effective appearance is dark */
 gchar      *fm_visible_color(FM *fm, const char *hex);  /* caller frees */
 void   highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled);
 #ifdef HAVE_GTKSOURCEVIEW

@@ -48,7 +48,7 @@
 #define KEY_AUTO_REFRESH         "auto_refresh"
 #define KEY_VIEWER_IMAGE_PREVIEW "viewer_image_preview"
 #define KEY_THEME                "theme"
-#define DEFAULT_THEME            1   /* 0=dark, 1=light */
+#define DEFAULT_THEME            2   /* 0=dark, 1=light, 2=system */
 
 #define DEFAULT_TERMINAL       "gnome-terminal"
 #define DEFAULT_CURSOR_COLOR   "#1A73E8"
@@ -77,30 +77,73 @@ static gboolean color_is_light(const char *hex)
     return (0.299 * r + 0.587 * g + 0.114 * b) > 128.0;
 }
 
-/* Apply dark/light theme via AdwStyleManager (reliable runtime switching)
- * or fall back to gtk-application-prefer-dark-theme (startup only). */
+/* Is the effective appearance dark?  Theme 2 follows the system. */
+gboolean fm_dark(FM *fm)
+{
+    if (fm->theme == 0) return TRUE;
+    if (fm->theme == 1) return FALSE;
+#ifdef HAVE_LIBADWAITA
+    return adw_style_manager_get_dark(adw_style_manager_get_default());
+#else
+    gchar *name = NULL;
+    g_object_get(gtk_settings_get_default(), "gtk-theme-name", &name, NULL);
+    gchar *low = name ? g_ascii_strdown(name, -1) : NULL;
+    gboolean dark = low && strstr(low, "dark");
+    g_free(low);
+    g_free(name);
+    return dark;
+#endif
+}
+
+#ifdef HAVE_LIBADWAITA
+static void apply_gui_css(FM *fm);
+
+/* The system switched light/dark while fm follows it: recolor everything */
+static void on_system_dark_changed(AdwStyleManager *sm, GParamSpec *ps, FM *fm)
+{
+    (void)sm; (void)ps;
+    if (fm->theme != 2 || !fm->panels[0].column_view) return;   /* not up yet */
+    g_free(fm->vis_mark_color);
+    fm->vis_mark_color = fm_visible_color(fm,
+        fm->mark_color ? fm->mark_color : DEFAULT_MARK_COLOR);
+    apply_gui_css(fm);
+    apply_editor_css(fm);
+    apply_viewer_css(fm);
+    panel_reload(&fm->panels[0]);
+    panel_reload(&fm->panels[1]);
+}
+#endif
+
+/* Apply dark/light/system theme via AdwStyleManager (reliable runtime
+ * switching) or fall back to gtk-application-prefer-dark-theme. */
 static void apply_theme(FM *fm)
 {
 #ifdef HAVE_LIBADWAITA
     AdwStyleManager *sm = adw_style_manager_get_default();
+    static gboolean watching;
+    if (!watching) {
+        g_signal_connect(sm, "notify::dark", G_CALLBACK(on_system_dark_changed), fm);
+        watching = TRUE;
+    }
     adw_style_manager_set_color_scheme(sm,
-        fm->theme == 0 ? ADW_COLOR_SCHEME_FORCE_DARK
-                       : ADW_COLOR_SCHEME_FORCE_LIGHT);
+        fm->theme == 0 ? ADW_COLOR_SCHEME_FORCE_DARK :
+        fm->theme == 1 ? ADW_COLOR_SCHEME_FORCE_LIGHT : ADW_COLOR_SCHEME_DEFAULT);
 #else
-    g_object_set(gtk_settings_get_default(),
-                 "gtk-application-prefer-dark-theme", fm->theme == 0, NULL);
+    if (fm->theme != 2)
+        g_object_set(gtk_settings_get_default(),
+                     "gtk-application-prefer-dark-theme", fm->theme == 0, NULL);
 #endif
 }
 
 /* Theme-aware symlink / executable colors (Material Design pairs) */
 const char *fm_link_color(FM *fm)
 {
-    return fm->theme == 0 ? "#CE93D8" : "#7B1FA2";
+    return fm_dark(fm) ? "#CE93D8" : "#7B1FA2";
 }
 
 const char *fm_exec_color(FM *fm)
 {
-    return fm->theme == 0 ? "#81C784" : "#2E7D32";
+    return fm_dark(fm) ? "#81C784" : "#2E7D32";
 }
 
 /* Invert a hex color: useful for making dark colors visible on dark bg */
@@ -119,8 +162,8 @@ gchar *fm_visible_color(FM *fm, const char *hex)
 {
     if (!hex || hex[0] != '#' || strlen(hex) < 7) return g_strdup(hex ? hex : "");
     gboolean light = color_is_light(hex);
-    if (fm->theme == 0 && !light) return invert_color(hex); /* dark-on-dark → invert */
-    if (fm->theme == 1 && light)  return invert_color(hex); /* light-on-light → invert */
+    if (fm_dark(fm) && !light) return invert_color(hex); /* dark-on-dark → invert */
+    if (!fm_dark(fm) && light)  return invert_color(hex); /* light-on-light → invert */
     return g_strdup(hex);
 }
 
@@ -132,7 +175,7 @@ const char *fm_scheme_for_theme(FM *fm)
 #ifdef HAVE_GTKSOURCEVIEW
     const char *base = fm->editor_style_scheme ? fm->editor_style_scheme
                                                : DEFAULT_STYLE_SCHEME;
-    if (fm->theme == 0) {
+    if (fm_dark(fm)) {
         /* Try <base>-dark first */
         GtkSourceStyleSchemeManager *sm =
             gtk_source_style_scheme_manager_get_default();
@@ -246,7 +289,7 @@ static void apply_gui_css(FM *fm)
 
     /* Theme-dependent colors */
     const char *active_bg, *active_fg, *inactive_bg, *inactive_fg, *sep_color;
-    if (fm->theme == 0) { /* dark */
+    if (fm_dark(fm)) { /* dark */
         active_bg   = "#1A3A5C";
         active_fg   = "#90CAF9";
         inactive_bg = "#2A2A2A";
@@ -483,7 +526,7 @@ void settings_load(FM *fm)
     GError *therr = NULL;
     fm->theme = g_key_file_get_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, &therr);
     if (therr) { g_clear_error(&therr); fm->theme = DEFAULT_THEME; }
-    if (fm->theme < 0 || fm->theme > 1) fm->theme = DEFAULT_THEME;
+    if (fm->theme < 0 || fm->theme > 2) fm->theme = DEFAULT_THEME;
 
     g_key_file_free(kf);
 
@@ -1175,11 +1218,11 @@ void settings_dialog(FM *fm)
 
     GtkWidget *lbl_theme = gtk_label_new("Appearance:");
     gtk_widget_set_halign(lbl_theme, GTK_ALIGN_END);
-    const char *themes[] = { "Dark", "Light", NULL };
+    const char *themes[] = { "Dark", "Light", "System", NULL };
     GtkStringList *theme_list = gtk_string_list_new(themes);
     GtkWidget *combo_theme = gtk_drop_down_new(G_LIST_MODEL(theme_list), NULL);
     gtk_drop_down_set_selected(GTK_DROP_DOWN(combo_theme),
-        (fm->theme >= 0 && fm->theme <= 1) ? (guint)fm->theme : DEFAULT_THEME);
+        (fm->theme >= 0 && fm->theme <= 2) ? (guint)fm->theme : DEFAULT_THEME);
     gtk_widget_set_hexpand(combo_theme, TRUE);
     gtk_grid_attach(GTK_GRID(g4), lbl_theme,   0, row, 1, 1);
     gtk_grid_attach(GTK_GRID(g4), combo_theme, 1, row++, 1, 1);
