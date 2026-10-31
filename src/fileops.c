@@ -987,6 +987,7 @@ static void on_browse_done(GObject *source, GAsyncResult *res, gpointer user_dat
         }
         g_object_unref(file);
     }
+    g_object_unref(entry);   /* ref taken when the dialog was opened */
 }
 
 void on_browse_clicked(GtkButton *btn, gpointer user_data)
@@ -1004,6 +1005,6 @@ void on_browse_clicked(GtkButton *btn, gpointer user_data)
 
     GtkWidget *toplevel = GTK_WIDGET(gtk_widget_get_root(GTK_WIDGET(btn)));
     gtk_file_dialog_select_folder(fd, GTK_WINDOW(toplevel), NULL,
-                                   on_browse_done, entry);
+                                   on_browse_done, g_object_ref(entry));
     g_object_unref(fd);
 }

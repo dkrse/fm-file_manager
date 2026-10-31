@@ -1,6 +1,25 @@
 # Changelog
 
-## [2.13.0] — 2026-10-30
+## [3.3.0] — 2026-10-31
+
+**New features:**
+- "Open with" submenu in the right-click menu for local files: the default application first, then all applications registered for the file type, plus "Other application…" (system app chooser)
+
+**Performance:**
+- Viewer reads at most 50 MB instead of loading the whole file and truncating it (multi-GB files open instantly)
+- Syntax highlighting is switched off for files over 2 MB in the viewer and editor
+- Editor: loading a file is no longer recorded in the undo history (no second copy of the whole text)
+
+**Memory / resource leaks:**
+- Panel columns were released twice at startup (possible crash on a header click or at exit)
+- Editor menu bar and its 14 actions leaked with every editor window
+- Terminals opened from the panel were left as zombie processes until fm exited
+- Remote (SFTP) files opened in their application now share one temp directory per session; reopening a file replaces its copy instead of piling up new ones
+- Archive previews: the temp copy is removed right after the viewer closes or when extraction fails
+- Cancel while opening a file from an archive now really stops the extraction and removes the partial file (it used to run to the end in the background)
+- Folder / key browse dialogs no longer write into an already closed dialog
+
+## [3.2.0] — 2026-10-30
 
 **Archives as directories:**
 - Enter / Ctrl+PgDn on a zip, jar, tar.*, 7z, iso, rar or cpio file browses it read-only in the panel (libarchive, optional); F5 extracts the selection with progress and overwrite prompts, Enter / F3 / F4 on a file open a temporary copy, Backspace at the top leaves the archive; writing operations report "Archive is read-only"
@@ -8,9 +27,22 @@
 **Tabs:**
 - Total Commander style tabs per panel: Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+↑, clickable tab strip (middle-click closes), "New tab" / "Close tab" in the panel menu; tabs and the active tab are saved to `settings.ini` (`[tabs]`) on exit and restored at startup
 
-**Bug fixes (code review):**
+**Bug fixes:**
 - After a progress window closes the cursor returns to the active panel; arrow keys with no focused panel no longer jump into the other panel's path entry
 - Tab between panels no longer gets stuck after a long job or a reload (the active panel followed the focus "enter" signal, which does not come when the focused row is replaced); all refocusing goes through `panel_focus()`
+
+## [3.1.1] — 2026-10-30
+
+- README: screenshots
+
+## [3.1.0] — 2026-10-30
+
+- SFTP integration tests against a private throwaway sshd (`make test-sftp`, also in CI)
+- SFTP: symlink upload no longer reports an error with libssh2 versions that return a positive value on success
+
+## [3.0.0] — 2026-10-30
+
+**Bug fixes (code review):**
 - Overwrite no longer deletes the source when the destination directory contains it; overwrites write to a temp file and rename over the target only on success (local, SFTP upload/download, editor save, SFTP save, pack)
 - Moves delete the source only if everything was copied (directory read errors are now errors)
 - SFTP: remote symlinks are recreated, never followed locally (remote→remote transfers could upload a local file); case-only rename on case-insensitive servers no longer deletes the file; read errors no longer yield truncated files; long names no longer cut directory listings short

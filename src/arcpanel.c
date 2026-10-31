@@ -85,7 +85,7 @@ static GPtrArray *arc_read(FM *fm, const char *archive, gchar **error,
 {
     *error = NULL;
     ArcList *l = fm_wait_work(fm, "Reading archive", archive, arc_list_thread,
-                              g_strdup(archive), g_free, arc_list_free, cancelled);
+                              g_strdup(archive), g_free, arc_list_free, NULL, cancelled);
     if (!l) return NULL;
     GPtrArray *entries = l->entries;
     l->entries = NULL;
@@ -288,26 +288,33 @@ void arc_panel_reload(Panel *p)
 
 typedef struct {
     gchar *archive, *base, *inner, *dest;
+    FsCtx  ctx;               /* lets Cancel stop the extraction */
 } ArcPick;
 
 static void arc_pick_free(gpointer d)
 {
     ArcPick *a = d;
     g_free(a->archive); g_free(a->base); g_free(a->inner); g_free(a->dest);
+    fs_ctx_clear(&a->ctx);
     g_free(a);
+}
+
+static void arc_pick_cancel(gpointer d)
+{
+    fs_cancel(&((ArcPick *)d)->ctx);
 }
 
 /* → error message, or NULL on success */
 static gpointer arc_pick_thread(gpointer d)
 {
     ArcPick *a = d;
-    FsCtx ctx = { .policy = FS_OVERWRITE_ALL };
     const char *inner[] = { a->inner };
-    int r = arcfs_extract(&ctx, a->archive, a->base, inner, 1, a->dest);
-    gchar *err = r == FS_OK ? NULL
-               : g_strdup(ctx.error ? ctx.error : "extraction failed");
-    fs_ctx_clear(&ctx);
-    return err;
+    int r = arcfs_extract(&a->ctx, a->archive, a->base, inner, 1, a->dest);
+    /* cancelled: nobody waits for the copy, drop the partial file */
+    if (fs_cancelled(&a->ctx))
+        fs_delete(NULL, a->dest);
+    return r == FS_OK ? NULL
+         : g_strdup(a->ctx.error ? a->ctx.error : "extraction failed");
 }
 
 /* how: 0 = default application, 1 = viewer, 2 = editor */
@@ -342,9 +349,10 @@ static void arc_open(Panel *p, int how)
     a->base    = g_strdup(p->arc_dir);
     a->inner   = arc_inner(p, name);
     a->dest    = g_strdup(tmpdir);
+    a->ctx.policy = FS_OVERWRITE_ALL;
     gboolean cancelled;
     gchar *err = fm_wait_work(fm, "Extracting", name, arc_pick_thread, a,
-                              arc_pick_free, g_free, &cancelled);
+                              arc_pick_free, g_free, arc_pick_cancel, &cancelled);
     gchar *path = g_build_filename(tmpdir, name, NULL);
     if (cancelled) {
         fm_status(fm, "Extraction cancelled");
@@ -360,6 +368,13 @@ static void arc_open(Panel *p, int how)
         if (uri) gtk_show_uri(GTK_WINDOW(fm->window), uri, GDK_CURRENT_TIME);
         g_free(uri);
         fm_status(fm, "Opened a temporary copy: %s", name);
+    }
+    /* Nothing uses the copy any more after an error or once the (modal)
+     * viewer has closed; a cancelled worker may still be writing to it. */
+    if (!cancelled && (err || how == 1 || !g_file_test(path, G_FILE_TEST_EXISTS))) {
+        fs_delete(NULL, tmpdir);
+        arc_tmpdirs = g_slist_remove(arc_tmpdirs, tmpdir);
+        g_free(tmpdir);
     }
     g_free(err);
     g_free(path);

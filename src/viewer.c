@@ -1,5 +1,6 @@
 #include "fm.h"
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #ifdef HAVE_GTKSOURCEVIEW
@@ -7,6 +8,7 @@
 #endif
 
 #define VIEWER_MAX_BYTES (50 * 1024 * 1024)  /* 50 MB - reasonable for text viewing */
+#define VIEWER_HL_MAX_BYTES (2 * 1024 * 1024) /* no syntax highlighting above this */
 
 /* ─────────────────────────────────────────────────────────────────── *
  *  File viewer – F3 (local + SSH)
@@ -396,14 +398,31 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
             return;
         }
 
-        GError *err = NULL;
-        if (!g_file_get_contents(fullpath, &content, &length, &err)) {
-            fm_status(fm, "Viewer: read error – %s", err ? err->message : "?");
-            g_clear_error(&err);
+        /* Read at most one byte past the limit, so huge files are not
+         * loaded whole just to be truncated */
+        FILE *fp = fopen(fullpath, "rb");
+        if (!fp) {
+            fm_status(fm, "Viewer: read error – %s", g_strerror(errno));
             g_free(name);
             g_free(fullpath);
             return;
         }
+        struct stat fst;
+        gsize want = (fstat(fileno(fp), &fst) == 0 && S_ISREG(fst.st_mode)
+                      && (guint64)fst.st_size <= VIEWER_MAX_BYTES)
+                     ? (gsize)fst.st_size + 1 : VIEWER_MAX_BYTES + 1;
+        content = g_malloc(want + 1);
+        length  = fread(content, 1, want, fp);
+        gboolean rerr = ferror(fp);
+        fclose(fp);
+        if (rerr) {
+            fm_status(fm, "Viewer: read error – %s", g_strerror(errno));
+            g_free(content);
+            g_free(name);
+            g_free(fullpath);
+            return;
+        }
+        content[length] = '\0';
         g_free(fullpath);
     }
 
@@ -521,7 +540,8 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     {
         GtkSourceLanguage *_lang = source_guess_language(name);
         gtk_source_buffer_set_language(_vsbuf, _lang);
-        gtk_source_buffer_set_highlight_syntax(_vsbuf, fm->viewer_syntax_highlight);
+        gtk_source_buffer_set_highlight_syntax(_vsbuf, fm->viewer_syntax_highlight
+                                               && display_len <= VIEWER_HL_MAX_BYTES);
     }
 #else
     ctx.text_view = gtk_text_view_new();
@@ -532,7 +552,8 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ctx.text_view), TRUE);
     ctx.buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx.text_view));
     gtk_text_buffer_set_text(ctx.buffer, display_text, (gint)display_len);
-    highlight_apply(ctx.buffer, name, fm->viewer_syntax_highlight);
+    highlight_apply(ctx.buffer, name, fm->viewer_syntax_highlight
+                                      && display_len <= VIEWER_HL_MAX_BYTES);
 #endif
     g_free(display_text);
 

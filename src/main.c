@@ -264,7 +264,8 @@ static gboolean dir_wait_close(GtkWindow *win, DirWait *w)
 
 gpointer fm_wait_work(FM *fm, const char *title, const char *what,
                       GThreadFunc fn, gpointer arg, GDestroyNotify free_arg,
-                      GDestroyNotify free_result, gboolean *cancelled)
+                      GDestroyNotify free_result, void (*cancel)(gpointer arg),
+                      gboolean *cancelled)
 {
     *cancelled = FALSE;
     WaitWork *d = g_new0(WaitWork, 1);
@@ -334,6 +335,7 @@ gpointer fm_wait_work(FM *fm, const char *title, const char *what,
     gpointer result = NULL;
     if (w.cancelled) {
         *cancelled = TRUE;              /* worker frees its result */
+        if (cancel) cancel(d->arg);     /* arg lives until the worker ends */
     } else {
         result    = d->result;
         d->result = NULL;
@@ -394,7 +396,8 @@ static GPtrArray *dir_read(FM *fm, const char *path, gboolean *cancelled)
     d->path   = g_strdup(path);
     d->hidden = fm->show_hidden;
     return fm_wait_work(fm, "Reading directory", path, dir_load_thread, d,
-                        dir_load_free, (GDestroyNotify)g_ptr_array_unref, cancelled);
+                        dir_load_free, (GDestroyNotify)g_ptr_array_unref, NULL,
+                        cancelled);
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
@@ -1075,8 +1078,13 @@ static void activate_item(Panel *p)
             gchar *data = ssh_read_file(p->ssh_conn, remote_path, &len);
             g_free(remote_path);
             if (data && len > 0) {
-                /* Create unique temp dir to prevent symlink attacks */
-                gchar *tmpdir = g_dir_make_tmp("fm-view-XXXXXX", NULL);
+                /* One private temp dir per session (prevents symlink
+                 * attacks); reopening a file replaces its earlier copy */
+                if (!view_tmpdirs) {
+                    gchar *d = g_dir_make_tmp("fm-view-XXXXXX", NULL);
+                    if (d) view_tmpdirs = g_slist_prepend(NULL, d);
+                }
+                const gchar *tmpdir = view_tmpdirs ? view_tmpdirs->data : NULL;
                 if (tmpdir) {
                     gchar *tmp = g_build_filename(tmpdir, name, NULL);
                     if (g_file_set_contents(tmp, data, (gssize)len, NULL)) {
@@ -1092,7 +1100,6 @@ static void activate_item(Panel *p)
                         fm_status(p->fm, "Error writing to temp directory");
                     }
                     g_free(tmp);
-                    view_tmpdirs = g_slist_prepend(view_tmpdirs, tmpdir);
                 } else {
                     fm_status(p->fm, "Error creating temp directory");
                 }
@@ -1580,7 +1587,7 @@ static void on_terminal_clicked(GtkButton *btn, Panel *p)
 
         GError *err = NULL;
         if (!g_spawn_async(NULL, (gchar **)argv, NULL,
-                           G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                           G_SPAWN_SEARCH_PATH,
                            NULL, NULL, NULL, &err)) {
             fm_status(p->fm, "Failed to open terminal: %s",
                       err ? err->message : "?");
@@ -1613,7 +1620,7 @@ static void on_terminal_clicked(GtkButton *btn, Panel *p)
 
         GError *err = NULL;
         if (!g_spawn_async(p->cwd, (gchar **)argv, NULL,
-                           G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                           G_SPAWN_SEARCH_PATH,
                            NULL, NULL, NULL, &err)) {
             fm_status(p->fm, "Failed to open terminal: %s",
                       err ? err->message : "?");
@@ -1746,6 +1753,44 @@ PMENU(pmenu_tabnew,   panel_tab_new(p, NULL))
 PMENU(pmenu_tabclose, panel_tab_close(p))
 #undef PMENU
 
+/* "Open with": target is a desktop app id, "" asks via the system chooser */
+static void pmenu_openwith(GSimpleAction *a, GVariant *v, gpointer d)
+{
+    (void)a;
+    Panel *p = d;
+    set_active_panel(p->fm, p->idx);
+    gchar *path = panel_cursor_fullpath(p);
+    if (!path) return;
+    GFile *file = g_file_new_for_path(path);
+    const char *id = g_variant_get_string(v, NULL);
+    if (id[0]) {
+        GAppInfo *app = NULL;
+        GList *all = g_app_info_get_all();
+        for (GList *l = all; l && !app; l = l->next)
+            if (g_strcmp0(g_app_info_get_id(l->data), id) == 0)
+                app = g_object_ref(l->data);
+        g_list_free_full(all, g_object_unref);
+        GError *err = NULL;
+        GList *files = g_list_append(NULL, file);
+        GdkAppLaunchContext *lc = gdk_display_get_app_launch_context(
+            gtk_widget_get_display(p->fm->window));
+        if (!app || !g_app_info_launch(G_APP_INFO(app), files,
+                                       G_APP_LAUNCH_CONTEXT(lc), &err))
+            fm_status(p->fm, "Open with: %s", err ? err->message : "application not found");
+        g_clear_error(&err);
+        g_list_free(files);
+        g_object_unref(lc);
+        if (app) g_object_unref(app);
+    } else {
+        GtkFileLauncher *fl = gtk_file_launcher_new(file);
+        gtk_file_launcher_set_always_ask(fl, TRUE);
+        gtk_file_launcher_launch(fl, GTK_WINDOW(p->fm->window), NULL, NULL, NULL);
+        g_object_unref(fl);
+    }
+    g_object_unref(file);
+    g_free(path);
+}
+
 typedef struct { const char *label, *action; } MenuEntry;
 
 /* Section of `menu` built from entries, actions prefixed with the group */
@@ -1791,6 +1836,48 @@ static GMenu *build_file_menu(const char *grp)
     return m;
 }
 
+/* "Open with" submenu for a local regular file, NULL otherwise */
+static GMenu *build_openwith_menu(Panel *p, const char *grp)
+{
+    if (p->ssh_conn || p->arc_file) return NULL;
+    gchar *path = panel_cursor_fullpath(p);
+    if (!path || !g_file_test(path, G_FILE_TEST_IS_REGULAR)) { g_free(path); return NULL; }
+
+    gchar *ctype = g_content_type_guess(path, NULL, 0, NULL);
+    g_free(path);
+    GMenu *m = g_menu_new();
+    GAppInfo *def = g_app_info_get_default_for_type(ctype, FALSE);
+    GList *apps = g_app_info_get_all_for_type(ctype);
+    g_free(ctype);
+    gchar *act = g_strdup_printf("%s.openwith", grp);
+    /* default application first, then the rest */
+    if (def) apps = g_list_prepend(apps, def);
+    GHashTable *seen = g_hash_table_new(g_str_hash, g_str_equal);
+    for (GList *l = apps; l; l = l->next) {
+        const char *id = g_app_info_get_id(l->data);
+        if (!id || g_hash_table_contains(seen, id)) continue;
+        g_hash_table_add(seen, (gpointer)id);
+        GMenuItem *mi = g_menu_item_new(g_app_info_get_display_name(l->data), NULL);
+        g_menu_item_set_action_and_target_value(mi, act, g_variant_new_string(id));
+        GIcon *ic = g_app_info_get_icon(l->data);
+        if (ic) g_menu_item_set_icon(mi, ic);
+        g_menu_append_item(m, mi);
+        g_object_unref(mi);
+    }
+    g_hash_table_destroy(seen);
+    g_list_free_full(apps, g_object_unref);
+
+    GMenu *other = g_menu_new();
+    GMenuItem *mi = g_menu_item_new("Other application\u2026", NULL);
+    g_menu_item_set_action_and_target_value(mi, act, g_variant_new_string(""));
+    g_menu_append_item(other, mi);
+    g_object_unref(mi);
+    g_menu_append_section(m, NULL, G_MENU_MODEL(other));
+    g_object_unref(other);
+    g_free(act);
+    return m;
+}
+
 /* Right click: move cursor to the clicked row, then show the file menu */
 static void on_cv_right_click(GtkGestureClick *g, int n_press, double x, double y, Panel *p)
 {
@@ -1818,6 +1905,22 @@ static void on_cv_right_click(GtkGestureClick *g, int n_press, double x, double 
     }
 
     GtkWidget *pop = g_object_get_data(G_OBJECT(p->column_view), "fm-ctx-menu");
+    {
+        /* rebuilt each time: the "Open with" list depends on the file type */
+        gchar *grp = g_strdup_printf("p%d", p->idx);
+        GMenu *cm = build_file_menu(grp);
+        GMenu *ow = hit ? build_openwith_menu(p, grp) : NULL;
+        if (ow) {
+            GMenu *sec = g_menu_new();
+            g_menu_append_submenu(sec, "Open with", G_MENU_MODEL(ow));
+            g_menu_prepend_section(cm, NULL, G_MENU_MODEL(sec));
+            g_object_unref(sec);
+            g_object_unref(ow);
+        }
+        gtk_popover_menu_set_menu_model(GTK_POPOVER_MENU(pop), G_MENU_MODEL(cm));
+        g_object_unref(cm);
+        g_free(grp);
+    }
     GdkRectangle r = { (int)x, (int)y, 1, 1 };
     gtk_popover_set_pointing_to(GTK_POPOVER(pop), &r);
     gtk_popover_popup(GTK_POPOVER(pop));
@@ -1913,6 +2016,12 @@ void panel_setup(Panel *p, FM *fm, int idx)
         for (gsize i = 0; i < G_N_ELEMENTS(acts); i++) {
             GSimpleAction *sa = g_simple_action_new(acts[i].name, NULL);
             g_signal_connect(sa, "activate", acts[i].cb, p);
+            g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(sa));
+            g_object_unref(sa);
+        }
+        {
+            GSimpleAction *sa = g_simple_action_new("openwith", G_VARIANT_TYPE_STRING);
+            g_signal_connect(sa, "activate", G_CALLBACK(pmenu_openwith), p);
             g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(sa));
             g_object_unref(sa);
         }
@@ -2047,10 +2156,6 @@ void panel_setup(Panel *p, FM *fm, int idx)
     /* Default sort by name ascending */
     gtk_column_view_sort_by_column(GTK_COLUMN_VIEW(p->column_view),
                                    col_name, GTK_SORT_ASCENDING);
-
-    g_object_unref(col_name);
-    g_object_unref(col_size);
-    g_object_unref(col_date);
 
     /* Scrolled window */
     GtkWidget *scroll = gtk_scrolled_window_new();

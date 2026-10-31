@@ -275,11 +275,13 @@ void   panel_focus(Panel *p);                      /* make active + keyboard cur
 void   panel_select_name(Panel *p, const char *name);  /* move cursor to item */
 FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st);
 /* Run fn(arg) in a worker; after 150 ms a modal "Reading <what>…" window
- * with Cancel appears.  Cancelled → NULL + *cancelled, the worker's result
- * is then dropped with free_result; arg is freed with free_arg at the end. */
+ * with Cancel appears.  Cancelled → NULL + *cancelled, cancel(arg) (if set)
+ * asks the worker to stop, its result is then dropped with free_result;
+ * arg is freed with free_arg at the end. */
 gpointer fm_wait_work(FM *fm, const char *title, const char *what,
                       GThreadFunc fn, gpointer arg, GDestroyNotify free_arg,
-                      GDestroyNotify free_result, gboolean *cancelled);
+                      GDestroyNotify free_result, void (*cancel)(gpointer arg),
+                      gboolean *cancelled);
 
 /* ── archives as directories (arcpanel.c, read-only) ──────────────── */
 gboolean arc_panel_enter(Panel *p, const char *archive); /* FALSE = not browsable */

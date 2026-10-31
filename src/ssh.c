@@ -765,6 +765,7 @@ static void on_file_browse_done(GObject *source, GAsyncResult *res, gpointer use
         }
         g_object_unref(file);
     }
+    g_object_unref(entry);   /* ref taken when the dialog was opened */
 }
 
 static void on_key_browse_clicked(GtkButton *btn, gpointer user_data)
@@ -782,7 +783,7 @@ static void on_key_browse_clicked(GtkButton *btn, gpointer user_data)
 
     GtkWidget *toplevel = GTK_WIDGET(gtk_widget_get_root(GTK_WIDGET(btn)));
     gtk_file_dialog_open(fd, GTK_WINDOW(toplevel), NULL,
-                          on_file_browse_done, entry);
+                          on_file_browse_done, g_object_ref(entry));
     g_object_unref(fd);
 }
 

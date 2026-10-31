@@ -7,6 +7,7 @@
 #endif
 
 #define EDITOR_MAX_BYTES (100 * 1024 * 1024)  /* 100 MB max for editing */
+#define EDITOR_HL_MAX_BYTES (2 * 1024 * 1024) /* no syntax highlighting above this */
 
 /* ─────────────────────────────────────────────────────────────────── *
  *  Simple text editor (F4)
@@ -692,64 +693,79 @@ static GtkWidget *create_editor_menubar(EditorCtx *ctx)
     GSimpleAction *a_save = g_simple_action_new("save", NULL);
     g_signal_connect(a_save, "activate", G_CALLBACK(action_save), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_save));
+    g_object_unref(a_save);
 
     GSimpleAction *a_close = g_simple_action_new("close", NULL);
     g_signal_connect(a_close, "activate", G_CALLBACK(action_close), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_close));
+    g_object_unref(a_close);
 
     /* Edit actions */
     GSimpleAction *a_undo = g_simple_action_new("undo", NULL);
     g_signal_connect(a_undo, "activate", G_CALLBACK(action_undo), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_undo));
+    g_object_unref(a_undo);
 
     GSimpleAction *a_redo = g_simple_action_new("redo", NULL);
     g_signal_connect(a_redo, "activate", G_CALLBACK(action_redo), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_redo));
+    g_object_unref(a_redo);
 
     GSimpleAction *a_cut = g_simple_action_new("cut", NULL);
     g_signal_connect(a_cut, "activate", G_CALLBACK(action_cut), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_cut));
+    g_object_unref(a_cut);
 
     GSimpleAction *a_copy = g_simple_action_new("copy", NULL);
     g_signal_connect(a_copy, "activate", G_CALLBACK(action_copy), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_copy));
+    g_object_unref(a_copy);
 
     GSimpleAction *a_paste = g_simple_action_new("paste", NULL);
     g_signal_connect(a_paste, "activate", G_CALLBACK(action_paste), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_paste));
+    g_object_unref(a_paste);
 
     GSimpleAction *a_selall = g_simple_action_new("select-all", NULL);
     g_signal_connect(a_selall, "activate", G_CALLBACK(action_select_all), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_selall));
+    g_object_unref(a_selall);
 
     GSimpleAction *a_goto = g_simple_action_new("goto-line", NULL);
     g_signal_connect(a_goto, "activate", G_CALLBACK(action_goto_line), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_goto));
+    g_object_unref(a_goto);
 
     /* Search actions */
     GSimpleAction *a_find = g_simple_action_new("find", NULL);
     g_signal_connect(a_find, "activate", G_CALLBACK(action_find), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_find));
+    g_object_unref(a_find);
 
     GSimpleAction *a_replace = g_simple_action_new("replace", NULL);
     g_signal_connect(a_replace, "activate", G_CALLBACK(action_replace), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_replace));
+    g_object_unref(a_replace);
 
     GSimpleAction *a_find_next = g_simple_action_new("find-next", NULL);
     g_signal_connect(a_find_next, "activate", G_CALLBACK(action_find_next), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_find_next));
+    g_object_unref(a_find_next);
 
     GSimpleAction *a_find_prev = g_simple_action_new("find-prev", NULL);
     g_signal_connect(a_find_prev, "activate", G_CALLBACK(action_find_prev), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_find_prev));
+    g_object_unref(a_find_prev);
 
     /* View actions (toggle) */
     GSimpleAction *a_wrap = g_simple_action_new_stateful("word-wrap", NULL,
                                 g_variant_new_boolean(ctx->word_wrap));
     g_signal_connect(a_wrap, "activate", G_CALLBACK(action_word_wrap), ctx);
     g_action_map_add_action(G_ACTION_MAP(actions), G_ACTION(a_wrap));
+    g_object_unref(a_wrap);
 
     gtk_widget_insert_action_group(ctx->window, "editor", G_ACTION_GROUP(actions));
+    g_object_unref(actions);
 
     /* Build menu model */
     GMenu *menubar = g_menu_new();
@@ -762,6 +778,7 @@ static GtkWidget *create_editor_menubar(EditorCtx *ctx)
     g_menu_append_item(file_menu, mi); g_object_unref(mi);
     g_menu_append(file_menu, "Close", "editor.close");
     g_menu_append_submenu(menubar, "File", G_MENU_MODEL(file_menu));
+    g_object_unref(file_menu);
 
     /* Edit */
     GMenu *edit_menu = g_menu_new();
@@ -783,6 +800,7 @@ static GtkWidget *create_editor_menubar(EditorCtx *ctx)
     g_menu_item_set_attribute(mi, "accel", "s", "<Ctrl>V");
     g_menu_append_item(edit_section2, mi); g_object_unref(mi);
     g_menu_append_section(edit_menu, NULL, G_MENU_MODEL(edit_section2));
+    g_object_unref(edit_section2);
 
     GMenu *edit_section3 = g_menu_new();
     mi = g_menu_item_new("Select all", "editor.select-all");
@@ -792,8 +810,10 @@ static GtkWidget *create_editor_menubar(EditorCtx *ctx)
     g_menu_item_set_attribute(mi, "accel", "s", "<Ctrl>G");
     g_menu_append_item(edit_section3, mi); g_object_unref(mi);
     g_menu_append_section(edit_menu, NULL, G_MENU_MODEL(edit_section3));
+    g_object_unref(edit_section3);
 
     g_menu_append_submenu(menubar, "Edit", G_MENU_MODEL(edit_menu));
+    g_object_unref(edit_menu);
 
     /* Find */
     GMenu *search_menu = g_menu_new();
@@ -812,15 +832,19 @@ static GtkWidget *create_editor_menubar(EditorCtx *ctx)
     g_menu_item_set_attribute(mi, "accel", "s", "<Shift>F3");
     g_menu_append_item(search_section2, mi); g_object_unref(mi);
     g_menu_append_section(search_menu, NULL, G_MENU_MODEL(search_section2));
+    g_object_unref(search_section2);
 
     g_menu_append_submenu(menubar, "Find", G_MENU_MODEL(search_menu));
+    g_object_unref(search_menu);
 
     /* View */
     GMenu *view_menu = g_menu_new();
     g_menu_append(view_menu, "Word wrap", "editor.word-wrap");
     g_menu_append_submenu(menubar, "View", G_MENU_MODEL(view_menu));
+    g_object_unref(view_menu);
 
     GtkWidget *menubar_widget = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(menubar));
+    g_object_unref(menubar);
     return menubar_widget;
 }
 
@@ -1176,7 +1200,15 @@ void editor_show_path(FM *fm, const char *path)
 
     /* load content – suppress modified flag */
     g_signal_handlers_block_by_func(ctx->buffer, on_buffer_changed, ctx);
-    gtk_text_buffer_set_text(ctx->buffer, content, -1);
+    gsize loaded_len = strlen(content);
+#ifdef HAVE_GTKSOURCEVIEW
+    /* initial load is not undoable – avoids a copy of the whole text */
+    gtk_text_buffer_begin_irreversible_action(ctx->buffer);
+#endif
+    gtk_text_buffer_set_text(ctx->buffer, content, (gint)loaded_len);
+#ifdef HAVE_GTKSOURCEVIEW
+    gtk_text_buffer_end_irreversible_action(ctx->buffer);
+#endif
     g_free(content);
     g_signal_handlers_unblock_by_func(ctx->buffer, on_buffer_changed, ctx);
     if (ctx->read_only)
@@ -1187,7 +1219,8 @@ void editor_show_path(FM *fm, const char *path)
         GtkSourceLanguage *_lang = source_guess_language(title);
         gtk_source_buffer_set_language(GTK_SOURCE_BUFFER(ctx->buffer), _lang);
         gtk_source_buffer_set_highlight_syntax(
-            GTK_SOURCE_BUFFER(ctx->buffer), fm->syntax_highlight);
+            GTK_SOURCE_BUFFER(ctx->buffer),
+            fm->syntax_highlight && loaded_len <= EDITOR_HL_MAX_BYTES);
     }
 #endif
 
