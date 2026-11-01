@@ -83,6 +83,7 @@ SRCS   := $(SRCDIR)/main.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
           $(SRCDIR)/icons.c $(SRCDIR)/multirename.c \
           $(SRCDIR)/search.c $(SRCDIR)/ssh.c $(SRCDIR)/settings.c \
           $(SRCDIR)/viewer.c $(SRCDIR)/editor.c $(SRCDIR)/highlight.c \
+          $(SRCDIR)/devices.c \
           $(CORE_SRCS)
 HDRS   := $(wildcard $(INCDIR)/*.h)
 TARGET := fm
@@ -98,7 +99,7 @@ endif
 OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 BIN    := $(BUILDDIR)/$(TARGET)
 
-.PHONY: all clean install user-install uninstall debug test test-asan test-sftp
+.PHONY: all clean install user-install uninstall debug test test-asan test-sftp test-gui
 
 all: $(BIN)
 
@@ -143,6 +144,17 @@ ifneq ($(findstring HAVE_LIBSSH2,$(CFLAGS)),)
 else
 	@echo "sftp tests skipped: built without libssh2"
 endif
+
+# GUI integration tests (tabs, SFTP tabs, devices) – headless on broadway,
+# against the throwaway sshd when available.  `make test-gui SAN=1` = ASan.
+GUI_TEST_BIN := $(BUILDDIR)/test_gui
+GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/devices.o,$(OBJS))
+
+$(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(GUI_TEST_OBJS) $(HDRS)
+	$(CC) $(CFLAGS) tests/test_gui.c $(GUI_TEST_OBJS) -o $@ $(LIBS) $(LDSAN)
+
+test-gui: $(GUI_TEST_BIN)
+	tests/gui_test.sh $(GUI_TEST_BIN)
 
 clean:
 	rm -rf build build-debug

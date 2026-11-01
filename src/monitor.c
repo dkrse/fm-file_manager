@@ -389,8 +389,9 @@ void panel_monitor_start(Panel *p)
 
 #ifdef HAVE_LIBSSH2
     if (p->ssh_conn) {
-        /* SFTP: poll every 5 seconds */
-        p->poll_id = g_timeout_add_seconds(5, sftp_poll_tick, p);
+        /* SFTP: poll every sftp_poll_interval seconds */
+        int sec = p->fm->sftp_poll_interval > 0 ? p->fm->sftp_poll_interval : 5;
+        p->poll_id = g_timeout_add_seconds((guint)sec, sftp_poll_tick, p);
         return;
     }
 #endif

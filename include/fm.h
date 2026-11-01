@@ -82,6 +82,7 @@ struct _SshConn {
     gchar            *remote_path;   /* current remote cwd */
     int               port;
     guint             serial;        /* unique per connection (editor checks it) */
+    int               refs;          /* tabs sharing this connection */
 };
 #else
 struct _SshConn {
@@ -94,6 +95,7 @@ struct _SshConn {
     gchar *remote_path;
     guint  serial;
     int   port;
+    int   refs;
 };
 #endif
 
@@ -101,8 +103,10 @@ typedef struct _FM FM;
 
 /* Panel tab: a remembered local directory; the panel widgets are shared */
 typedef struct {
-    gchar *path;
-    gchar *cursor_name;   /* item under the cursor when the tab was left */
+    gchar   *path;        /* local directory (fallback after a disconnect) */
+    gchar   *cursor_name; /* item under the cursor when the tab was left */
+    SshConn *conn;        /* SFTP connection of this tab (ref), NULL = local */
+    gchar   *rpath;       /* remote directory when conn is set */
 } PanelTab;
 
 typedef struct {
@@ -157,6 +161,8 @@ typedef struct {
     gchar              *arc_dir;       /* inner directory, "" = archive root  */
     GPtrArray          *arc_entries;   /* ArcEntry* table of contents         */
     gint64              arc_stamp;     /* archive mtime/size when listed      */
+    GtkWidget          *dev_btn;       /* device picker (Alt+F1 / Alt+F2)     */
+    GtkWidget          *dev_list;
 } Panel;
 
 struct _FM {
@@ -211,6 +217,7 @@ struct _FM {
     gchar          *mark_color;               /* hex color for marked items     */
     /* auto-refresh */
     gboolean        auto_refresh;             /* watch directories for changes  */
+    int             sftp_poll_interval;       /* SFTP auto-refresh, seconds     */
     /* theme: 0 = dark, 1 = light, 2 = follow the system (see fm_dark) */
     int             theme;
     /* viewer: show images as pictures instead of raw bytes */
@@ -268,6 +275,9 @@ void   panel_tab_close(Panel *p);
 void   panel_tab_cycle(Panel *p, int delta);
 void   panel_tabs_restore(Panel *p, gchar **paths, int active);
 void   panel_tabs_free(Panel *p);
+void   panel_tab_track(Panel *p);                 /* after a load */
+void   panel_tab_set_conn(Panel *p, SshConn *conn); /* active tab only */
+void   panel_tabs_drop_conn(Panel *p, SshConn *conn); /* every tab using it */
 gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
 gchar *panel_cursor_fullpath(Panel *p);     /* full path (search-aware), caller must g_free() */
 GList *panel_selection(Panel *p);            /* names; g_list_free_full(l, g_free) */
@@ -378,7 +388,15 @@ void   settings_save_ssh_bookmarks  (FM *fm, GList *list);
 
 /* ── ssh ──────────────────────────────────────────────────────────── */
 void ssh_connect_dialog(FM *fm);
+
+/* devices.c – drive / device picker */
+void       devices_init(FM *fm);
+GtkWidget *devices_button_new(Panel *p);
+void       devices_popup(Panel *p);
 void ssh_panel_close(Panel *p);
+SshConn  *ssh_conn_ref  (SshConn *conn);
+void      ssh_conn_unref(SshConn *conn);
+void      ssh_connect_cancel(Panel *p);      /* drop a connect in flight */
 gboolean  ssh_conn_trylock(SshConn *conn);   /* main thread: FALSE = job busy */
 void      ssh_conn_lock   (SshConn *conn);
 void      ssh_conn_unlock (SshConn *conn);

@@ -22,7 +22,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 ## Features
 
 - **Two panels** — navigation like in Total Commander
-- **Tabs** — Total Commander style tabs per panel: Ctrl+T new, Ctrl+W close, Ctrl+Tab / Ctrl+Shift+Tab switch, Ctrl+↑ opens the directory under the cursor in a new tab; click a tab to switch, middle-click to close; the tab strip appears with 2+ tabs; tabs (local directories) are saved right after every change and restored on the next start
+- **Tabs** — Total Commander style tabs per panel: Ctrl+T new, Ctrl+W close, Ctrl+Tab / Ctrl+Shift+Tab switch, Ctrl+↑ opens the directory under the cursor in a new tab; click a tab to switch, middle-click to close; the tab strip appears with 2+ tabs; tabs work on SFTP panels too — a new tab shares the connection (tab label `host:dir`), each tab keeps its own remote directory, Disconnect returns every tab of that connection to its local directory; tabs are saved right after every change and restored on the next start (SFTP tabs as their local directory)
+- **Devices** — drive button left of the path bar (Alt+F1 left panel, Alt+F2 right panel), like Double / Total Commander: File System, Home, mounted devices and not-yet-mounted volumes (USB sticks, partitions, encrypted disks, phones); Enter / click mounts (asks for a passphrase when needed) and opens it, ⏏ or Del unmounts / ejects; newly plugged devices are announced in the status bar, panels on a removed device move to Home
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
 - **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
@@ -44,7 +45,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
-- **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP); incremental updates (add/remove/update individual files, no full reload)
+- **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates (add/remove/update individual files, no full reload)
 - **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Dark / Light / System theme** — runtime switching via Settings → System (libadwaita); "System" follows the desktop light/dark setting and switches live when it changes; colors auto-adapt (directories, symlinks, marks, editor scheme)
 - **Settings** — tabbed dialog: Panels / Display / Cursor / Viewer / Editor / System
@@ -92,7 +93,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Ctrl+= | Synchronize panels |
 | Ctrl+T / Ctrl+W | New tab (current directory) / close tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Ctrl+↑ | Open directory under cursor in a new tab |
+| Ctrl+↑ | Open directory under cursor in a new tab (also on SFTP) |
+| Alt+F1 / Alt+F2 | Devices for the left / right panel |
 | Alt+E | Extract archive |
 | Alt+P | Create archive (pack) |
 
@@ -158,6 +160,7 @@ make clean            # clean build artifacts
 make test             # unit tests of the file-operation core (no display needed)
 make test-asan        # the same under AddressSanitizer + UBSan
 make test-sftp        # SFTP tests against a private throwaway sshd (skipped without sshd)
+make test-gui         # GUI tests (tabs, SFTP tabs, devices) headless on broadway; SAN=1 for ASan
 make debug            # debug build with sanitizers (build-debug/fm)
 ```
 
@@ -187,6 +190,7 @@ src/icons.c         — content-type icons
 tests/test_core.c   — unit tests (GLib test framework)
 src/search.c        — file search
 src/ssh.c           — SSH/SFTP connection and browsing
+src/devices.c       — device picker (mount / unmount / eject, hot-plug)
 src/settings.c      — settings (font, cursor, editor, viewer, terminal, icon size, theme)
 src/viewer.c        — file viewer (F3)
 src/editor.c        — text editor (F4)
@@ -205,7 +209,7 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 
 **Panels** — panel font, GUI font, column widths (name/size/date)
 
-**Display** — hidden files, row hover highlight, auto-refresh panels, directory color and bold, mark color, icon size (8–64 px)
+**Display** — hidden files, row hover highlight, auto-refresh panels, SFTP refresh interval, directory color and bold, mark color, icon size (8–64 px)
 
 **Cursor** — style (filled color or outline only), cursor color
 

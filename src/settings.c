@@ -46,6 +46,7 @@
 #define KEY_ICON_SIZE            "icon_size"
 #define DEFAULT_ICON_SIZE        16
 #define KEY_AUTO_REFRESH         "auto_refresh"
+#define KEY_SFTP_POLL            "sftp_poll_interval"
 #define KEY_VIEWER_IMAGE_PREVIEW "viewer_image_preview"
 #define KEY_THEME                "theme"
 #define DEFAULT_THEME            2   /* 0=dark, 1=light, 2=system */
@@ -518,6 +519,9 @@ void settings_load(FM *fm)
     GError *arerr = NULL;
     fm->auto_refresh = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, &arerr);
     if (arerr) { g_clear_error(&arerr); fm->auto_refresh = FALSE; }
+    fm->sftp_poll_interval = load_int(kf, KEY_SFTP_POLL, 5);
+    if (fm->sftp_poll_interval < 1)   fm->sftp_poll_interval = 1;
+    if (fm->sftp_poll_interval > 300) fm->sftp_poll_interval = 300;
 
     GError *vierr = NULL;
     fm->viewer_image_preview = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_IMAGE_PREVIEW, &vierr);
@@ -602,6 +606,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_ICON_SIZE,
                            fm->icon_size > 0 ? fm->icon_size : DEFAULT_ICON_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_AUTO_REFRESH, fm->auto_refresh);
+    g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_SFTP_POLL, fm->sftp_poll_interval);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_VIEWER_IMAGE_PREVIEW, fm->viewer_image_preview);
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, fm->theme);
 
@@ -953,6 +958,15 @@ void settings_dialog(FM *fm)
     GtkWidget *chk_auto_refresh = gtk_check_button_new_with_label("Auto-refresh panels (watch for file changes)");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(chk_auto_refresh), fm->auto_refresh);
     gtk_grid_attach(GTK_GRID(g_disp), chk_auto_refresh, 0, row++, 2, 1);
+
+    GtkWidget *lbl_poll = gtk_label_new("SFTP refresh interval (seconds):");
+    gtk_widget_set_halign(lbl_poll, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(lbl_poll, 24);
+    GtkWidget *spin_poll = gtk_spin_button_new_with_range(1, 300, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_poll), fm->sftp_poll_interval);
+    gtk_widget_set_halign(spin_poll, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(g_disp), lbl_poll, 0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g_disp), spin_poll, 1, row++, 1, 1);
 
     /* ── Directory appearance ── */
     GtkWidget *hdr_dir = gtk_label_new(NULL);
@@ -1314,8 +1328,10 @@ void settings_dialog(FM *fm)
 
         /* auto-refresh */
         gboolean new_ar = gtk_check_button_get_active(GTK_CHECK_BUTTON(chk_auto_refresh));
-        if (new_ar != fm->auto_refresh) {
+        int new_poll = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin_poll));
+        if (new_ar != fm->auto_refresh || new_poll != fm->sftp_poll_interval) {
             fm->auto_refresh = new_ar;
+            fm->sftp_poll_interval = new_poll;
             for (int i = 0; i < 2; i++) {
                 if (fm->auto_refresh)
                     panel_monitor_start(&fm->panels[i]);

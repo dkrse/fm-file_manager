@@ -454,6 +454,8 @@ static void tab_free(gpointer data)
     PanelTab *t = data;
     g_free(t->path);
     g_free(t->cursor_name);
+    g_free(t->rpath);
+    ssh_conn_unref(t->conn);
     g_free(t);
 }
 
@@ -475,8 +477,6 @@ static const char *tab_dir(Panel *p)
 {
     return p->search_mode ? p->search_prev_cwd : p->cwd;
 }
-
-static const char *const tab_remote_msg = "Tabs are not available on an SFTP panel";
 
 static void tabs_rebuild(Panel *p);
 
@@ -523,10 +523,22 @@ static void tabs_rebuild(Panel *p)
     for (guint i = 0; i < p->tabs->len; i++) {
         PanelTab *t = g_ptr_array_index(p->tabs, i);
         const char *path = t->path ? t->path : "/";
-        gchar *base = g_path_get_basename(path);
-        GtkWidget *b = gtk_button_new_with_label(base);
-        g_free(base);
-        gtk_widget_set_tooltip_text(b, path);
+        GtkWidget *b;
+        if (t->conn) {
+            const char *rp = t->rpath ? t->rpath : "/";
+            gchar *base = g_path_get_basename(rp);
+            gchar *lbl = g_strdup_printf("%s:%s", t->conn->host, base);
+            gchar *tip = g_strdup_printf("sftp://%s@%s%s",
+                                         t->conn->user, t->conn->host, rp);
+            b = gtk_button_new_with_label(lbl);
+            gtk_widget_set_tooltip_text(b, tip);
+            g_free(base); g_free(lbl); g_free(tip);
+        } else {
+            gchar *base = g_path_get_basename(path);
+            b = gtk_button_new_with_label(base);
+            g_free(base);
+            gtk_widget_set_tooltip_text(b, path);
+        }
         gtk_widget_set_focusable(b, FALSE);
         gtk_widget_add_css_class(b, "flat");
         gtk_widget_add_css_class(b, "fm-tab");
@@ -548,6 +560,14 @@ static void tabs_rebuild(Panel *p)
 static void tab_track(Panel *p)
 {
     PanelTab *t = tab_cur(p);
+    if (p->ssh_conn) {
+        if (g_strcmp0(t->rpath, p->ssh_conn->remote_path) == 0) return;
+        g_free(t->rpath);
+        t->rpath = g_strdup(p->ssh_conn->remote_path);
+        g_clear_pointer(&t->cursor_name, g_free);
+        tabs_rebuild(p);
+        return;
+    }
     if (g_strcmp0(t->path, p->cwd) == 0) return;
     g_free(t->path);
     t->path = g_strdup(p->cwd);
@@ -563,8 +583,58 @@ static void tab_remember(Panel *p)
     t->cursor_name = p->search_mode ? g_strdup(p->search_prev_name)
                    : p->arc_file    ? g_path_get_basename(p->arc_file)
                                     : panel_cursor_name(p);
+    if (p->ssh_conn) {
+        g_free(t->rpath);
+        t->rpath = g_strdup(p->ssh_conn->remote_path);
+        return;                 /* t->path keeps the local fallback */
+    }
     g_free(t->path);
     t->path = g_strdup(tab_dir(p));
+}
+
+void panel_tab_track(Panel *p)
+{
+    if (p->tabs && p->tabs->len) tab_track(p);
+}
+
+/* Make conn (may be NULL) the connection of the active tab; the panel
+ * follows.  NULL puts the tab back on its local directory. */
+void panel_tab_set_conn(Panel *p, SshConn *conn)
+{
+    PanelTab *t = tab_cur(p);
+    panel_monitor_stop(p);
+    SshConn *old = t->conn;
+    t->conn = ssh_conn_ref(conn);
+    p->ssh_conn = conn;
+    ssh_conn_unref(old);
+    g_clear_pointer(&t->rpath, g_free);
+    gtk_widget_set_visible(p->disconnect_btn, conn != NULL);
+    if (!conn) panel_load(p, t->path ? t->path : g_get_home_dir());
+    tabs_rebuild(p);
+}
+
+/* Disconnect: all tabs using conn become local again */
+void panel_tabs_drop_conn(Panel *p, SshConn *conn)
+{
+    panel_monitor_stop(p);
+    gboolean active = (p->ssh_conn == conn);
+    if (active) p->ssh_conn = NULL;
+    ssh_conn_ref(conn);             /* keep it alive while unhooking */
+    for (guint i = 0; i < p->tabs->len; i++) {
+        PanelTab *t = g_ptr_array_index(p->tabs, i);
+        if (t->conn != conn) continue;
+        ssh_conn_unref(t->conn);
+        t->conn = NULL;
+        g_clear_pointer(&t->rpath, g_free);
+        g_clear_pointer(&t->cursor_name, g_free);
+    }
+    ssh_conn_unref(conn);           /* closes the connection */
+    if (active) {
+        gtk_widget_set_visible(p->disconnect_btn, FALSE);
+        PanelTab *t = tab_cur(p);
+        panel_load(p, t->path ? t->path : g_get_home_dir());
+    }
+    tabs_rebuild(p);
 }
 
 /* Show tab i: load its directory and put the cursor back */
@@ -573,6 +643,36 @@ static void tab_show(Panel *p, guint i)
     p->tab_active = i;
     PanelTab *t = tab_cur(p);
     gchar *name = g_strdup(t->cursor_name);
+
+    /* the panel takes the connection of the tab (or none) */
+    ssh_connect_cancel(p);
+    panel_monitor_stop(p);
+    if (p->ssh_conn != t->conn && p->marks)
+        g_hash_table_remove_all(p->marks);
+    p->ssh_conn = t->conn;
+    gtk_widget_set_visible(p->disconnect_btn, t->conn != NULL);
+
+    if (t->conn) {
+        gchar *rpath = g_strdup(t->rpath ? t->rpath : "/");
+        g_clear_pointer(&t->conn->remote_path, g_free);
+        panel_load_remote(p, rpath);
+        if (!t->conn->remote_path) {
+            /* connection gone or directory unreadable */
+            fm_status(p->fm, "SFTP: %s is not reachable – tab disconnected",
+                      t->conn->host);
+            g_free(rpath);
+            g_free(name);
+            panel_tabs_drop_conn(p, t->conn);
+            return;
+        }
+        if (name && strcmp(t->conn->remote_path, rpath) == 0)
+            panel_select_name(p, name);
+        g_free(rpath);
+        g_free(name);
+        tabs_rebuild(p);
+        return;
+    }
+
     gchar *path = g_strdup(t->path ? t->path : g_get_home_dir());
     panel_load(p, path);
     if (strcmp(p->cwd, path) != 0 || p->search_mode) {
@@ -589,19 +689,28 @@ static void tab_show(Panel *p, guint i)
 
 static gboolean tabs_refused(Panel *p)
 {
-    if (p->ssh_conn) { fm_status(p->fm, "%s", tab_remote_msg); return TRUE; }
     return p->busy;
 }
 
-/* Ctrl+T – new tab after the active one (path NULL = current directory) */
+/* Ctrl+T – new tab after the active one (path NULL = current directory).
+ * On an SFTP panel the new tab shares the connection and path is remote. */
 void panel_tab_new(Panel *p, const char *path)
 {
     if (tabs_refused(p)) return;
-    gchar *dir = g_strdup(path ? path : tab_dir(p));
-    tab_remember(p);
-    g_ptr_array_insert(p->tabs, (int)p->tab_active + 1, tab_new(dir));
+    PanelTab *nt;
+    if (p->ssh_conn) {
+        nt = tab_new(tab_cur(p)->path ? tab_cur(p)->path : g_get_home_dir());
+        nt->conn  = ssh_conn_ref(p->ssh_conn);
+        nt->rpath = g_strdup(path ? path : p->ssh_conn->remote_path);
+        tab_remember(p);
+    } else {
+        gchar *dir = g_strdup(path ? path : tab_dir(p));
+        tab_remember(p);
+        nt = tab_new(dir);
+        g_free(dir);
+    }
+    g_ptr_array_insert(p->tabs, (int)p->tab_active + 1, nt);
     tab_show(p, p->tab_active + 1);
-    g_free(dir);
 }
 
 /* Ctrl+W – close the active tab (never the last one) */
@@ -609,6 +718,9 @@ void panel_tab_close(Panel *p)
 {
     if (tabs_refused(p)) return;
     if (p->tabs->len < 2) { fm_status(p->fm, "Cannot close the last tab"); return; }
+    /* the panel must not keep using a connection the tab may close */
+    panel_monitor_stop(p);
+    p->ssh_conn = NULL;
     g_ptr_array_remove_index(p->tabs, p->tab_active);
     tab_show(p, MIN(p->tab_active, p->tabs->len - 1));
 }
@@ -647,6 +759,8 @@ void panel_tabs_restore(Panel *p, gchar **paths, int active)
 
 void panel_tabs_free(Panel *p)
 {
+    panel_monitor_stop(p);
+    p->ssh_conn = NULL;
     g_clear_pointer(&p->tabs, g_ptr_array_unref);
 }
 
@@ -932,9 +1046,14 @@ static void name_bind(GtkSignalListItemFactory *f, GtkListItem *li, gpointer d)
     /* lets the context-menu gesture find the row under the pointer */
     g_object_set_data(G_OBJECT(box), "fm-item", item);
 
-    gtk_image_set_from_icon_name(GTK_IMAGE(image), item->icon_name);
-    gtk_image_set_pixel_size(GTK_IMAGE(image),
-        p->fm->icon_size > 0 ? p->fm->icon_size : 16);
+    int isz = p->fm->icon_size > 0 ? p->fm->icon_size : 16;
+    /* ".." is just the name – no icon, but the space stays for alignment */
+    if (strcmp(item->name, "..") == 0)
+        gtk_image_clear(GTK_IMAGE(image));
+    else
+        gtk_image_set_from_icon_name(GTK_IMAGE(image), item->icon_name);
+    gtk_image_set_pixel_size(GTK_IMAGE(image), isz);
+    gtk_widget_set_size_request(image, isz, isz);
 
     const gchar *fg = item->marked ? p->fm->vis_mark_color : item->fg_color;
     gint wt = item->marked ? PANGO_WEIGHT_BOLD : item->weight;
@@ -1576,7 +1695,6 @@ static void on_disconnect_clicked(GtkButton *btn, Panel *p)
 {
     (void)btn;
     ssh_panel_close(p);
-    gtk_widget_set_visible(p->disconnect_btn, FALSE);
 }
 
 static void on_search_exit_clicked(GtkButton *btn, Panel *p)
@@ -2107,6 +2225,7 @@ void panel_setup(Panel *p, FM *fm, int idx)
         gtk_widget_set_focusable(hbtn, FALSE);
         g_object_unref(pmenu);
 
+        gtk_box_append(GTK_BOX(path_box), devices_button_new(p));
         gtk_box_append(GTK_BOX(path_box), p->path_entry);
         gtk_box_append(GTK_BOX(path_box), hbtn);
         gtk_box_append(GTK_BOX(path_box), p->terminal_btn);
@@ -2421,6 +2540,7 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
         return TRUE;
     case GDK_KEY_F9:  fo_rename(fm);          return TRUE;
     case GDK_KEY_F2:
+        if (alt) { devices_popup(&fm->panels[1]); return TRUE; }
         if (shift) search_history_dialog(fm); else search_run(fm);
         return TRUE;
 
@@ -2436,7 +2556,10 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     case GDK_KEY_F4:
         if (shift) fo_newfile(fm); else editor_show(fm);
         return TRUE;
-    case GDK_KEY_F1:  help_show(fm);         return TRUE;
+    case GDK_KEY_F1:
+        if (alt) { devices_popup(&fm->panels[0]); return TRUE; }
+        help_show(fm);
+        return TRUE;
     case GDK_KEY_F10: g_application_quit(G_APPLICATION(fm->app)); return TRUE;
 
     /* Alt+Enter – properties */
@@ -2494,7 +2617,22 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
     case GDK_KEY_Up:
         if (ctl) {
             Panel *a = active_panel(fm);
-            if (a->ssh_conn) { fm_status(fm, "%s", tab_remote_msg); return TRUE; }
+            if (a->ssh_conn) {
+                gchar *rdir = NULL;
+                guint n = g_list_model_get_n_items(G_LIST_MODEL(a->filter_model));
+                FileItem *it = a->cursor_pos < n
+                    ? g_list_model_get_item(G_LIST_MODEL(a->filter_model), a->cursor_pos)
+                    : NULL;
+                if (it && it->is_dir) {
+                    const char *rp = a->ssh_conn->remote_path;
+                    rdir = strcmp(it->name, "..") == 0 ? g_path_get_dirname(rp)
+                         : g_build_filename(rp, it->name, NULL);
+                }
+                if (it) g_object_unref(it);
+                panel_tab_new(a, rdir);
+                g_free(rdir);
+                return TRUE;
+            }
             gchar *name = panel_cursor_name(a);
             gchar *full = panel_cursor_fullpath(a);
             if (name && strcmp(name, "..") == 0 && !a->search_mode) {
@@ -2791,6 +2929,8 @@ static void on_activate(GtkApplication *app, gpointer data)
     GtkEventController *win_focus = gtk_event_controller_focus_new();
     g_signal_connect(win_focus, "enter", G_CALLBACK(on_window_focus_in), fm);
     gtk_widget_add_controller(fm->window, win_focus);
+
+    devices_init(fm);
 
     /* load directories: saved tabs, or the home directory */
     for (int i = 0; i < 2; i++) {

@@ -27,6 +27,7 @@ Single-window GTK4 application (with optional libadwaita for runtime theme switc
 | `src/ssh.c` | Full libssh2 SFTP implementation (guarded `#ifdef HAVE_LIBSSH2`); `ssh_read_file`, `ssh_write_file`; async connect via `GTask`; connect dialog with GtkDropDown, `SshDlgData` helpers |
 | `src/settings.c` | Persistent settings, font/column/cursor/editor/viewer config, theme (dark/light), `apply_*_css`, `apply_theme`; theme-aware color helpers (`fm_visible_color`, `fm_link_color`, `fm_exec_color`, `fm_scheme_for_theme`); SSH bookmark API (`SshBookmark`, `settings_load/save_ssh_bookmarks`, `ssh_bookmark_free`) |
 | `src/viewer.c` | File viewer (F3), local + SSH, max 50 MB; search (Ctrl+F) with highlighting and scrollbar indicators; image preview via `GtkPicture` for image files (configurable) |
+| `src/devices.c` | Device picker (Alt+F1/F2, drive button per panel): `GVolumeMonitor` mounts + unmounted volumes in a popover `GtkListBox`, mount via `g_volume_mount` + `GtkMountOperation`, unmount/eject, hot-plug notifications (`devices_init`, `devices_button_new`, `devices_popup`) |
 | `src/editor.c` | Text editor (F4) with menu bar, find/replace (Ctrl+F/H), Ctrl+S saves, line numbers, syntax highlight; local and SFTP (`EditorCtx.ssh_conn + remote_path`) |
 | `src/highlight.c` | Syntax highlighting: GtkSourceView wrapper or custom regex highlighter |
 | `data/sk.km.fm.desktop` | Desktop entry for application launchers |
@@ -95,7 +96,7 @@ Each `Panel` has:
 
 ## Key handling hierarchy
 
-1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (incl. Shift+F4/F5/F8), Del/Shift+Del, Alt+Enter (properties), Ctrl+C/X/V, Ctrl+Shift+C, Ctrl+A/Ctrl+Shift+A, Ctrl+S (filter), Alt+E (extract), Alt+P (pack) (skipped if `GtkEntry` has focus)
+1. `on_window_key_press` (CAPTURE phase) — Tab (switch panel), F-keys global (incl. Shift+F4/F5/F8), Del/Shift+Del, Alt+Enter (properties), Ctrl+C/X/V, Ctrl+Shift+C, Ctrl+A/Ctrl+Shift+A, Ctrl+S (filter), Alt+E (extract), Alt+P (pack), Alt+F1/Alt+F2 (devices) (skipped if `GtkEntry` has focus)
 2. `on_tree_key_press` (CAPTURE phase, per-panel) — Up/Down/PgUp/PgDn/Home/End, Shift+Up/Down (mark while moving), Space/Insert (mark toggle), Backspace (go up), Enter (activate), `+`/`-` (select/unselect group), `*` (invert)
 3. `on_path_key_press` (per-panel path_entry) — Enter (navigate to path), Escape (restore original path)
 4. `on_filter_key` (CAPTURE phase, filter entry) — Escape (close search bar), Enter (close + activate item), arrows/PgUp/PgDn/Home/End (close, cursor stays)
@@ -207,17 +208,47 @@ asks `search_needle()` and `FileItem.line` to open on the matching line.
 
 ## Tabs
 
-`Panel.tabs` is a `GPtrArray` of `PanelTab { path, cursor_name }` (local directories
-only, always at least one), `Panel.tab_active` the shown one. The widgets are shared:
+`Panel.tabs` is a `GPtrArray` of `PanelTab { path, cursor_name, conn, rpath }`
+(always at least one), `Panel.tab_active` the shown one. The widgets are shared:
 switching (`panel_tab_cycle()`) remembers the current dir + cursor name in the old tab
 (`tab_remember()`, search results count as `search_prev_cwd`), then `panel_load()`s the
 new tab's path and `panel_select_name()`s its cursor. `panel_load()` calls `tab_track()`
 on success, so the active tab follows every navigation (one place). The strip
 (`tab_scroll` → `tab_box`, flat buttons, `.fm-tab` / `.fm-tab-active`) is rebuilt by
-`tabs_rebuild()` and hidden with a single tab. SFTP panels refuse tab operations
-(status message); tabs recorded before connecting stay. On `shutdown`
+`tabs_rebuild()` and hidden with a single tab.
+
+**SFTP tabs:** the connection belongs to the tab, not the panel. `PanelTab.conn` holds a
+reference (`ssh_conn_ref/unref`, `SshConn.refs`; the connection is closed with the last
+tab), `rpath` its remote directory; `path` stays the local fallback. `p->ssh_conn` is a
+non-owning mirror of the active tab's `conn`: `tab_show()` stops the monitor, cancels a
+connect in flight (`ssh_connect_cancel`, otherwise it would land in the wrong tab),
+swaps `p->ssh_conn` and calls `panel_load_remote(rpath)` (or `panel_load(path)`).
+Only the active tab uses a shared session, so `conn->remote_path` is reset per switch;
+if the listing fails the tab is dropped to local. Ctrl+T / Ctrl+↑ on an SFTP tab share
+its connection. `panel_tab_set_conn()` sets the active tab's connection (connect done,
+or NULL before a new connect – replaces only that tab); `panel_tabs_drop_conn()`
+(Disconnect, lost connection) turns every tab using it local. `panel_tab_close()` and
+`panel_tabs_free()` stop the monitor and clear `p->ssh_conn` before the tab's
+reference is released. `panel_load_remote()` calls `panel_tab_track()`.
+
+On `shutdown`
 `settings_save_tabs()` writes `[tabs] left=/a;/b`, `left_active=N` (same for `right`);
 `panel_tabs_restore()` skips missing directories at startup.
+
+## Devices (`devices.c`)
+
+One global `GVolumeMonitor` (`devices_init()` at startup). Each panel has `dev_btn`
+(`GtkMenuButton`) left of the path entry with a popover `dev_list` (`GtkListBox`),
+refilled on every `show`: File System, Home, non-shadowed `GMount`s with a local path,
+then `GVolume`s without a mount that `can_mount`. The row of the device the panel is on
+is preselected (longest matching mount root). Row data: `fm-path` (open), `fm-volume`
+(mount → open), `fm-mount` (⏏ button / Del = eject if `can_eject`, else unmount).
+Mount / unmount use `gtk_mount_operation_new()` (passphrase, "device busy" dialogs);
+`G_IO_ERROR_FAILED_HANDLED` is not reported. Before unmounting, and on
+`mount-pre-unmount` / `mount-removed`, `panels_leave()` moves local panels, archives and
+tab paths inside the mount root to home (open dir monitors would keep it busy).
+`volume-added` / `mount-added` only show a status message. Opening a device from an
+SFTP tab makes that tab local (`panel_tab_set_conn(p, NULL)`).
 
 ## Archive support
 
@@ -258,7 +289,7 @@ Enter / Ctrl+PgDn on a file `arcfs_supported()` accepts calls `arc_panel_enter()
 - Zero CPU cost while idle (kernel inotify)
 
 **SFTP panels — timer polling:**
-- `g_timeout_add_seconds(5, sftp_poll_tick, panel)` — polls every 5 seconds
+- `g_timeout_add_seconds(fm->sftp_poll_interval, sftp_poll_tick, panel)` — interval from settings (1–300 s, default 5)
 - `sftp_poll_tick`: opens remote directory with `libssh2_sftp_opendir`, builds `GHashTable` of remote filenames
 - Pass 1: remove items no longer on remote (iterate store backwards)
 - Pass 2: add new items from remote (check if already in store)
@@ -320,7 +351,7 @@ SSH connection runs in a background thread via `GTask`:
 2. `ssh_connect_thread` runs `ssh_conn_new()` off the main thread: DNS (all addresses, IPv4/IPv6), TCP, handshake, **host key check**, auth
    - host key: `~/.ssh/known_hosts` loaded line by line (`libssh2_knownhost_readline`, unparsable lines skipped); `MATCH` → continue, `MISMATCH` → abort with MITM warning, unknown → SHA256 fingerprint prompt on the main thread (`fm_call_on_main`), accepted keys appended (`[host]:port` for non-22 ports)
    - auth order: ssh-agent → key files (`id_ed25519`, `id_ecdsa`, `id_rsa` or the configured key; password reused as passphrase) → password → keyboard-interactive
-3. `ssh_connect_done` callback on main thread sets `panel->ssh_conn` and loads remote directory
+3. `ssh_connect_done` callback on main thread hands the connection to the active tab (`panel_tab_set_conn`) and loads remote directory
 4. UI stays responsive during the entire connection process
 
 ## SSH connections — data model
@@ -362,6 +393,7 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `show_hidden` | Hidden files |
 | `show_hover` | Row hover highlight (default true) |
 | `auto_refresh` | Auto-refresh panels via inotify/polling (default false) |
+| `sftp_poll_interval` | SFTP polling interval in seconds (1–300, default 5) |
 | `icon_size` | File icon pixel size (8–64, default 16) |
 | `terminal_app` | Terminal emulator |
 | `cursor_color`, `cursor_outline` | Cursor style |
@@ -379,7 +411,8 @@ Stored in `~/.config/fm/settings.ini`, section `[display]`:
 | `theme` | Theme: 0=dark, 1=light (default 1) |
 
 Section `[tabs]`: `left`, `right` (string lists of tab directories), `left_active`,
-`right_active` (index of the shown tab) — written on exit.
+`right_active` (index of the shown tab) — written on exit. SFTP tabs are stored as their
+local fallback directory (connections are not restored).
 
 ## Dependencies
 

@@ -45,4 +45,4 @@ if [ ! -f "$T/sshd.pid" ]; then
     echo "sftp tests: sshd did not start"; cat "$T/sshd.log"; exit 1
 fi
 
-FM_SFTP_PORT=$PORT FM_SFTP_KEY="$T/clientkey" FM_SFTP_DIR="$T/work" "$BIN"
+FM_SFTP_PORT=$PORT FM_SFTP_KEY="$T/clientkey" FM_SFTP_HOSTKEY="$T/hostkey.pub" FM_SFTP_DIR="$T/work" "$BIN"

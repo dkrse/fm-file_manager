@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.3.1] - 2026-11-01
+
+**New features:**
+- Tabs on SFTP panels: Ctrl+T / Ctrl+↑ open a new tab on the same connection (no new login), Ctrl+Tab / click / Ctrl+W work as on local panels; each tab keeps its own remote directory and cursor; tab label `host:dir`, tooltip `sftp://user@host/path`; Disconnect returns all tabs of the connection to their local directory; a new connection replaces only the active tab's one; an unreachable server disconnects the tab when switching to it
+- Devices (Alt+F1 / Alt+F2, drive button left of the path bar): File System, Home, mounted devices and unmounted volumes; mounting (with passphrase prompt), unmount / eject (⏏ or Del); new devices announced in the status bar; panels and tabs on a removed device move to Home
+- Settings → Display: SFTP refresh interval (1–300 s, default 5 s)
+
+**Changes:**
+- The ".." row shows just the name, without the large up-arrow icon (alignment kept)
+- Alt+F1 / Alt+F2 open the device list (F1 help and F2 search unchanged)
+
 ## [3.3.0] — 2026-10-31
 
 **New features:**

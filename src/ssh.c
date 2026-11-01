@@ -509,21 +509,35 @@ static void ssh_conn_free(SshConn *conn)
     g_free(conn);
 }
 
+SshConn *ssh_conn_ref(SshConn *conn)
+{
+    if (conn) conn->refs++;
+    return conn;
+}
+
+void ssh_conn_unref(SshConn *conn)
+{
+    if (conn && --conn->refs <= 0) ssh_conn_free(conn);
+}
+
+void ssh_connect_cancel(Panel *p)
+{
+    connect_gen[p->idx]++;
+    connect_pending[p->idx] = FALSE;
+}
+
+/* Disconnect: every tab of the panel using this connection goes back
+ * to its local directory; the connection is closed with the last one. */
 void ssh_panel_close(Panel *p)
 {
     panel_monitor_stop(p);
 
     /* invalidate a connect still in flight for this panel */
-    connect_gen[p->idx]++;
-    connect_pending[p->idx] = FALSE;
+    ssh_connect_cancel(p);
 
     SshConn *conn = p->ssh_conn;
     if (!conn) return;
-    ssh_conn_free(conn);
-    p->ssh_conn = NULL;
-    gtk_widget_set_visible(p->disconnect_btn, FALSE);
-
-    panel_load(p, g_get_home_dir());
+    panel_tabs_drop_conn(p, conn);
 }
 
 /* ── ssh_read_file ────────────────────────────────────────────────── */
@@ -759,6 +773,7 @@ void panel_load_remote(Panel *p, const char *path)
     }
 
     p->inhibit_sel = FALSE;
+    panel_tab_track(p);
 
     /* Start SFTP poll if auto-refresh enabled */
     panel_monitor_start(p);
@@ -1003,7 +1018,7 @@ static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_d
     connect_pending[idx] = FALSE;
 
     if (conn) {
-        ctx->panel->ssh_conn = conn;
+        panel_tab_set_conn(ctx->panel, conn);
         /* start in the remote home directory (realpath of ".") */
         char home[4096];
         int hl = libssh2_sftp_realpath(conn->sftp, ".", home, sizeof(home) - 1);
@@ -1183,7 +1198,8 @@ void ssh_connect_dialog(FM *fm)
             fm_status(fm, "SSH: a connection is already in progress for this panel");
         } else if (host && host[0]) {
             Panel *p = active_panel(fm);
-            if (p->ssh_conn) ssh_panel_close(p);
+            /* the new connection replaces this tab's one only */
+            if (p->ssh_conn) panel_tab_set_conn(p, NULL);
 
             fm_status(fm, "Connecting to %s@%s:%d …", user, host, port);
 
@@ -1232,10 +1248,12 @@ void panel_load_remote(Panel *p, const char *path)
 
 void ssh_panel_close(Panel *p)
 {
-    g_free(p->ssh_conn);
-    p->ssh_conn = NULL;
-    panel_load(p, g_get_home_dir());
+    if (p->ssh_conn) panel_tabs_drop_conn(p, p->ssh_conn);
 }
+
+SshConn *ssh_conn_ref(SshConn *conn) { if (conn) conn->refs++; return conn; }
+void ssh_conn_unref(SshConn *conn) { if (conn && --conn->refs <= 0) g_free(conn); }
+void ssh_connect_cancel(Panel *p) { (void)p; }
 
 gchar *ssh_read_file(SshConn *conn, const char *path, gsize *out_len)
 {
