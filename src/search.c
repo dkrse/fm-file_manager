@@ -38,72 +38,7 @@ static void string_pool_destroy(StringPool *sp)
 
 /* ── Content search helper ───────────────────────────────────────── */
 
-/* Case-insensitive strstr for an ASCII needle – no allocation */
-static gboolean ascii_contains(const char *hay, const char *needle_lower, size_t nlen)
-{
-    for (; *hay; hay++) {
-        if (g_ascii_tolower(*hay) != needle_lower[0]) continue;
-        size_t i = 1;
-        while (i < nlen && hay[i] && g_ascii_tolower(hay[i]) == needle_lower[i]) i++;
-        if (i == nlen) return TRUE;
-    }
-    return FALSE;
-}
-
-static gboolean str_is_ascii(const char *s)
-{
-    for (; *s; s++) if ((unsigned char)*s >= 0x80) return FALSE;
-    return TRUE;
-}
-
-static gchar *file_contains(const char *path, const char *needle_lower, int *out_line,
-                            gint *cancelled)
-{
-    /* O_NONBLOCK: never hang on a FIFO/device that slipped through */
-    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return NULL;
-    FILE *fp = fdopen(fd, "r");
-    if (!fp) { close(fd); return NULL; }
-
-    unsigned char probe[512];
-    size_t nr = fread(probe, 1, sizeof(probe), fp);
-    for (size_t i = 0; i < nr; i++) {
-        if (probe[i] == 0) { fclose(fp); return NULL; }
-    }
-    rewind(fp);
-
-    char buf[4096];
-    gchar *result = NULL;
-    /* ASCII needle (the common case): compare in place instead of
-     * lower-casing a copy of every line */
-    gboolean ascii = str_is_ascii(needle_lower);
-    size_t nlen = strlen(needle_lower);
-    int line = 0;
-    gboolean cont = FALSE;      /* previous fgets() stopped mid-line */
-    while (fgets(buf, sizeof(buf), fp)) {
-        if ((line & 1023) == 0 && g_atomic_int_get(cancelled)) break;
-        /* a buffer ending without '\n' is a continuation of the same line */
-        gboolean whole = strchr(buf, '\n') != NULL;
-        if (!cont) line++;
-        cont = !whole;
-        gchar *lower = ascii ? NULL : g_utf8_strdown(buf, -1);
-        if (ascii ? ascii_contains(buf, needle_lower, nlen)
-                  : strstr(lower, needle_lower) != NULL) {
-            g_strstrip(buf);
-            if (g_utf8_strlen(buf, -1) > 200) {
-                gchar *p = g_utf8_offset_to_pointer(buf, 200);
-                *p = '\0';
-            }
-            result = g_utf8_make_valid(buf, -1);
-            if (out_line) *out_line = line;
-            g_free(lower);
-            break;
-        }
-        g_free(lower);
-    }
-    fclose(fp);
-    return result;
-}
+/* fs_file_contains() lives in util.c (unit-tested) */
 
 /* ── Lightweight result record (NOT a GObject) ───────────────────── */
 /* We collect results as small structs first, then create FileItem
@@ -233,7 +168,7 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
                     if (!is_link && S_ISREG(st.st_mode)) {
                         char full[4096];
                         g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-                        ml = file_contains(full, ctx->content, &line, &ctx->cancelled);
+                        ml = fs_file_contains(full, ctx->content, &line, &ctx->cancelled);
                     }
                     if (ml) add_result(ctx, base_interned, de->d_name, &st, ml, line);
                 } else {
@@ -318,16 +253,6 @@ static GPtrArray *build_grouped_list(GPtrArray *results, FM *fm)
 }
 
 /* ── Size parsing helper ─────────────────────────────────────────── */
-
-static gint64 parse_size_with_unit(const char *text, int unit_idx)
-{
-    if (!text || !text[0]) return -1;
-    char *end;
-    double val = g_ascii_strtod(text, &end);
-    if (end == text || val < 0) return -1;
-    static const gint64 mult[] = { 1, 1024, 1024*1024, (gint64)1024*1024*1024 };
-    return (gint64)(val * mult[unit_idx]);
-}
 
 /* ── Search parameters (saved between calls) ─────────────────────── */
 
@@ -515,8 +440,8 @@ static gboolean show_input_dialog(FM *fm, gchar **out_pattern, gchar **out_conte
     *out_pattern = g_strdup(pat_buf);
     *out_content = (raw_cont[0]) ? g_utf8_strdown(raw_cont, -1) : NULL;
     *out_dir = g_strdup(dir_val[0] ? dir_val : active_panel(fm)->cwd);
-    *out_size_min = parse_size_with_unit(smin_text, smin_u);
-    *out_size_max = parse_size_with_unit(smax_text, smax_u);
+    *out_size_min = fs_parse_size(smin_text, smin_u);
+    *out_size_max = fs_parse_size(smax_text, smax_u);
 
     search_params_save(raw_pat, raw_cont, dir_val, smin_text, smax_text, smin_u, smax_u);
 
@@ -886,8 +811,6 @@ void search_run(FM *fm)
 
     /* Block selection callbacks during search to prevent freeze on mouse click */
     p->inhibit_sel = TRUE;
-    fm->panels[0].inhibit_sel = TRUE;
-    fm->panels[1].inhibit_sel = TRUE;
 
     /* Phase 1: collect lightweight result records */
     StringPool pool;
@@ -952,8 +875,7 @@ void search_run(FM *fm)
     gtk_box_remove(GTK_BOX(frame), cancel_btn);
 
     if (close_pending) {            /* window close was deferred: finish it */
-        fm->panels[0].inhibit_sel = FALSE;
-        fm->panels[1].inhibit_sel = FALSE;
+        p->inhibit_sel = FALSE;
         g_ptr_array_unref(ctx.results);
         string_pool_destroy(&pool);
         g_free(info_text);
@@ -975,9 +897,6 @@ void search_run(FM *fm)
     /* Phase 3: load into panel */
     gtk_sort_list_model_set_sorter(p->sort_model, NULL);
 
-    /* Restore inhibit on both panels (was set to block clicks during search) */
-    fm->panels[0].inhibit_sel = FALSE;
-    fm->panels[1].inhibit_sel = FALSE;
     p->inhibit_sel = TRUE;
     if (p->marks)
         g_hash_table_remove_all(p->marks);

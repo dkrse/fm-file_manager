@@ -1,5 +1,29 @@
 # Changelog
 
+## [3.3.2] - 2026-11-08
+
+**Changes:**
+- The main window remembers its size and maximized state (`[window]` in settings.ini), saved on close – also via F10 / Quit, which now close the window instead of killing the application
+- Saved SSH connections: Save with a changed Name stores a new connection instead of overwriting the selected one (the same name updates it), so any number of connections can be kept
+
+**Fixes:**
+- Dark theme: the ".." row of an SFTP panel used the raw directory colour and was dark on dark
+- Content search (F2): a long matching line with invalid UTF-8 could write past a 4 KB buffer; text spanning the 4 KB read boundary of a long line was not found
+- Search: the size filter read past its unit table with no unit selected; very large values no longer overflow
+- Search: the other panel's cursor is no longer frozen while a search runs (F5/F8 there could act on the wrong file)
+- SFTP auto-refresh picks up remote files whose size or date changed (it only noticed added/removed files)
+- Copy progress never shows a negative time left; the clipboard status counts only the files actually copied
+- Devices: no GLib critical for mounts/volumes without an icon
+
+**Performance:**
+- SFTP viewer reads at most 50 MB and the SFTP editor refuses files over 100 MB without downloading them first (multi-GB remote files used to freeze the UI and could exhaust memory)
+- Fallback syntax highlighter (no GtkSourceView) is linear instead of quadratic in the file size
+- Multi-rename on tens of thousands of search results opens instantly (directory nesting check via a hash, not every pair)
+- Ctrl+S jump-to-file no longer allocates a lower-cased copy of every name per keystroke (ASCII fast path)
+
+**Tests:**
+- New unit tests: content search (binary files, non-ASCII, 4 KB chunk boundaries, invalid UTF-8, cancel), size parsing, `fmt_date`, `fs_relpath_is_safe` – 29 core tests, clean under ASan/UBSan
+
 ## [3.3.1] - 2026-11-01
 
 **New features:**

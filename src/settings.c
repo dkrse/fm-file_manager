@@ -621,6 +621,50 @@ void settings_save(FM *fm)
 
 /* ── Panel tabs ───────────────────────────────────────────────────── */
 
+/* ── Main window size ─────────────────────────────────────────────── */
+
+#define SETTINGS_GROUP_WINDOW "window"
+
+/* Saved size of the main window; FALSE (and defaults kept) if none */
+gboolean settings_load_window(int *width, int *height, gboolean *maximized)
+{
+    gchar *path = settings_path();
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
+    g_free(path);
+    int w = g_key_file_get_integer(kf, SETTINGS_GROUP_WINDOW, "width", NULL);
+    int h = g_key_file_get_integer(kf, SETTINGS_GROUP_WINDOW, "height", NULL);
+    *maximized = g_key_file_get_boolean(kf, SETTINGS_GROUP_WINDOW, "maximized", NULL);
+    g_key_file_free(kf);
+    if (w < 200 || h < 150 || w > 16384 || h > 16384) return FALSE;
+    *width = w;
+    *height = h;
+    return TRUE;
+}
+
+void settings_save_window(int width, int height, gboolean maximized)
+{
+    gchar *path = settings_path();
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
+    if (width > 0 && height > 0) {      /* keep the last normal size */
+        g_key_file_set_integer(kf, SETTINGS_GROUP_WINDOW, "width", width);
+        g_key_file_set_integer(kf, SETTINGS_GROUP_WINDOW, "height", height);
+    }
+    g_key_file_set_boolean(kf, SETTINGS_GROUP_WINDOW, "maximized", maximized);
+    GError *err = NULL;
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        g_warning("settings_save_window: %s", err ? err->message : "?");
+        g_clear_error(&err);
+    }
+    g_key_file_free(kf);
+    g_free(path);
+}
+
 #define SETTINGS_GROUP_TABS "tabs"
 static const char *const tab_keys[2]   = { "left",        "right"        };
 static const char *const tab_active[2] = { "left_active", "right_active" };

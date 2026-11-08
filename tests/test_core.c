@@ -674,6 +674,127 @@ static void test_multi_rename(void)
     check_mrn("čaj.txt",    FALSE, "[N].[E]",          "", "", MRN_CASE_UPPER, 1, 1, "ČAJ.TXT");
 }
 
+/* ── content search (fs_file_contains) ───────────────────────────── */
+
+static gchar *contains_in(const char *dir, const char *data, gssize len,
+                          const char *needle, int *line)
+{
+    gchar *f = J(dir, "c.txt");
+    g_assert_true(g_file_set_contents(f, data, len, NULL));
+    gchar *r = fs_file_contains(f, needle, line, NULL);
+    g_free(f);
+    return r;
+}
+
+static void test_content_basic(void)
+{
+    gchar *d = tmp_root();
+    int line = 0;
+    gchar *r = contains_in(d, "alpha\nbeta\n  Hello World  \n", -1, "hello", &line);
+    g_assert_cmpstr(r, ==, "Hello World");          /* stripped snippet */
+    g_assert_cmpint(line, ==, 3);
+    g_free(r);
+
+    g_assert_null(contains_in(d, "alpha\nbeta\n", -1, "gamma", &line));
+    /* binary (NUL in the first 512 bytes) is skipped */
+    g_assert_null(contains_in(d, "abc\0hello", 9, "hello", &line));
+    /* non-ASCII needle, case-insensitive */
+    r = contains_in(d, "x\nŽLTÝ kôň\n", -1, "žltý", &line);
+    g_assert_nonnull(r);
+    g_assert_cmpint(line, ==, 2);
+    g_free(r);
+    rm_rf(d); g_free(d);
+}
+
+/* a needle spanning the 4 KB read boundary of a long line */
+static void test_content_chunk_boundary(void)
+{
+    gchar *d = tmp_root();
+    for (int off = 4090; off <= 4100; off++) {
+        GString *s = g_string_new("first\n");
+        for (int i = 0; i < off; i++) g_string_append_c(s, 'a');
+        g_string_append(s, "NEEDLE");
+        for (int i = 0; i < 9000; i++) g_string_append_c(s, 'b');
+        g_string_append(s, "\nlast NEEDLE\n");
+        int line = 0;
+        gchar *r = contains_in(d, s->str, (gssize)s->len, "needle", &line);
+        g_assert_nonnull(r);
+        g_assert_cmpint(line, ==, 2);            /* the long line, not "last" */
+        g_assert_true(g_utf8_validate(r, -1, NULL));
+        g_assert_cmpint(g_utf8_strlen(r, -1), <=, 200);
+        g_free(r);
+        g_string_free(s, TRUE);
+    }
+    /* line counting across a multi-chunk line */
+    GString *s = g_string_new(NULL);
+    for (int i = 0; i < 20000; i++) g_string_append_c(s, 'z');
+    g_string_append(s, "\nfoo\nbar target\n");
+    int line = 0;
+    gchar *r = contains_in(d, s->str, (gssize)s->len, "target", &line);
+    g_assert_cmpint(line, ==, 3);
+    g_free(r);
+    g_string_free(s, TRUE);
+    rm_rf(d); g_free(d);
+}
+
+/* invalid UTF-8 in a long matching line must not read/write out of bounds */
+static void test_content_invalid_utf8(void)
+{
+    gchar *d = tmp_root();
+    GString *s = g_string_new(NULL);
+    g_string_append(s, "match ");
+    for (int i = 0; i < 4080; i++) g_string_append_c(s, (char)0xF0);  /* lead bytes */
+    g_string_append(s, "\n");
+    int line = 0;
+    gchar *r = contains_in(d, s->str, (gssize)s->len, "match", &line);
+    g_assert_nonnull(r);
+    g_assert_true(g_utf8_validate(r, -1, NULL));
+    g_assert_cmpint(g_utf8_strlen(r, -1), <=, 200);
+    g_free(r);
+    g_string_free(s, TRUE);
+
+    gint cancelled = 1;              /* cancelled before start: no result */
+    gchar *f = J(d, "c.txt");
+    g_assert_null(fs_file_contains(f, "match", NULL, &cancelled));
+    g_assert_null(fs_file_contains("/nonexistent/x", "a", NULL, NULL));
+    g_free(f);
+    rm_rf(d); g_free(d);
+}
+
+static void test_parse_size(void)
+{
+    g_assert_cmpint(fs_parse_size("", 0), ==, -1);
+    g_assert_cmpint(fs_parse_size(NULL, 0), ==, -1);
+    g_assert_cmpint(fs_parse_size("abc", 0), ==, -1);
+    g_assert_cmpint(fs_parse_size("-1", 0), ==, -1);
+    g_assert_cmpint(fs_parse_size("10", 0), ==, 10);
+    g_assert_cmpint(fs_parse_size("1.5", 1), ==, 1536);
+    g_assert_cmpint(fs_parse_size("2", 3), ==, (gint64)2 << 30);
+    /* out-of-range unit index (e.g. GTK_INVALID_LIST_POSITION) → bytes */
+    g_assert_cmpint(fs_parse_size("7", 99), ==, 7);
+    g_assert_cmpint(fs_parse_size("7", -1), ==, 7);
+    g_assert_cmpint(fs_parse_size("1e30", 3), ==, G_MAXINT64);
+}
+
+static void test_fmt_date(void)
+{
+    gchar *a = fmt_date(0);
+    g_assert_nonnull(a);
+    g_free(a);
+    gchar *b = fmt_date(1767225600);           /* 2026-01-01 UTC */
+    g_assert_true(g_str_has_prefix(b, "2025-12-31") || g_str_has_prefix(b, "2026-01-01"));
+    g_free(b);
+}
+
+static void test_relpath_safe(void)
+{
+    g_assert_true (fs_relpath_is_safe("a/b/c"));
+    g_assert_false(fs_relpath_is_safe("/abs"));
+    g_assert_false(fs_relpath_is_safe("a/../b"));
+    g_assert_false(fs_relpath_is_safe(".."));
+    g_assert_false(fs_relpath_is_safe(""));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -686,6 +807,12 @@ int main(int argc, char **argv)
     g_test_add_func("/util/uri-list",          test_uri_list);
     g_test_add_func("/util/patterns",          test_patterns);
     g_test_add_func("/util/multi-rename",      test_multi_rename);
+    g_test_add_func("/util/content-basic",     test_content_basic);
+    g_test_add_func("/util/content-chunks",    test_content_chunk_boundary);
+    g_test_add_func("/util/content-bad-utf8",  test_content_invalid_utf8);
+    g_test_add_func("/util/parse-size",        test_parse_size);
+    g_test_add_func("/util/fmt-date",          test_fmt_date);
+    g_test_add_func("/util/relpath-safe",      test_relpath_safe);
     g_test_add_func("/fsops/copy-tree",        test_copy_tree);
     g_test_add_func("/fsops/copy-into-itself", test_copy_into_itself);
     g_test_add_func("/fsops/copy-same-file",   test_copy_same_file);

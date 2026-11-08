@@ -375,7 +375,8 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     if (!path && p->ssh_conn) {
 #ifdef HAVE_LIBSSH2
         gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
-        content = ssh_read_file(p->ssh_conn, remote_path, &length);
+        content = ssh_read_file(p->ssh_conn, remote_path,
+                                VIEWER_MAX_BYTES + 1, &length);
         g_free(remote_path);
         if (!content) {
             fm_status(fm, "Viewer: error reading remote file '%s'", name);

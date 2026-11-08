@@ -3,6 +3,9 @@
 #include <time.h>
 #include <fnmatch.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 
 /* ─────────────────────────────────────────────────────────────────── *
  *  Formatting
@@ -273,4 +276,104 @@ gchar *mrn_apply(const char *name, gboolean is_dir, const char *mask,
         r = c;
     }
     return r;
+}
+
+/* ── Content search ───────────────────────────────────────────────── */
+
+/* Case-insensitive search of an ASCII needle in hay[0..len) – no allocation */
+static gboolean ascii_contains(const char *hay, size_t len,
+                               const char *needle_lower, size_t nlen)
+{
+    if (nlen == 0) return TRUE;
+    for (size_t i = 0; i + nlen <= len; i++) {
+        if (g_ascii_tolower(hay[i]) != needle_lower[0]) continue;
+        size_t k = 1;
+        while (k < nlen && g_ascii_tolower(hay[i + k]) == needle_lower[k]) k++;
+        if (k == nlen) return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean str_is_ascii(const char *s)
+{
+    for (; *s; s++) if ((unsigned char)*s >= 0x80) return FALSE;
+    return TRUE;
+}
+
+#define FC_CHUNK 4096
+#define FC_SNIPPET_CHARS 200
+
+gchar *fs_file_contains(const char *path, const char *needle_lower,
+                        int *out_line, gint *cancelled)
+{
+    if (!needle_lower) return NULL;
+    /* O_NONBLOCK: never hang on a FIFO/device that slipped through */
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) { close(fd); return NULL; }
+
+    unsigned char probe[512];
+    size_t nr = fread(probe, 1, sizeof(probe), fp);
+    if (memchr(probe, 0, nr)) { fclose(fp); return NULL; }   /* binary */
+    rewind(fp);
+
+    /* A line longer than one chunk is read in pieces; the last nlen-1
+     * bytes of the previous piece are kept in front of the next one so
+     * a match spanning the boundary is still found. */
+    size_t nlen = strlen(needle_lower);
+    size_t keep_max = nlen > 0 ? MIN(nlen - 1, (size_t)FC_CHUNK) : 0;
+    char  *buf = g_malloc(keep_max + FC_CHUNK + 1);
+    gboolean ascii = str_is_ascii(needle_lower);
+    gchar *result = NULL;
+    size_t keep = 0;
+    int line = 0;
+    gboolean cont = FALSE;      /* previous piece stopped mid-line */
+
+    while (fgets(buf + keep, FC_CHUNK + 1, fp)) {
+        if ((line & 1023) == 0 && cancelled && g_atomic_int_get(cancelled)) break;
+        size_t len = keep + strlen(buf + keep);
+        gboolean whole = len > 0 && buf[len - 1] == '\n';
+        if (!cont) line++;
+
+        gboolean hit;
+        if (ascii) {
+            hit = ascii_contains(buf, len, needle_lower, nlen);
+        } else {
+            gchar *valid = g_utf8_make_valid(buf, (gssize)len);
+            gchar *lower = g_utf8_strdown(valid, -1);
+            hit = strstr(lower, needle_lower) != NULL;
+            g_free(lower);
+            g_free(valid);
+        }
+        if (hit) {
+            /* validate first, then truncate – never walk invalid UTF-8 */
+            gchar *snip = g_utf8_make_valid(buf, (gssize)len);
+            g_strstrip(snip);
+            if (g_utf8_strlen(snip, -1) > FC_SNIPPET_CHARS)
+                *g_utf8_offset_to_pointer(snip, FC_SNIPPET_CHARS) = '\0';
+            result = snip;
+            if (out_line) *out_line = line;
+            break;
+        }
+        cont = !whole;
+        keep = cont ? MIN(keep_max, len) : 0;
+        if (keep) memmove(buf, buf + len - keep, keep);
+    }
+    g_free(buf);
+    fclose(fp);
+    return result;
+}
+
+gint64 fs_parse_size(const char *text, int unit_idx)
+{
+    if (!text || !text[0]) return -1;
+    static const gint64 mult[] = { 1, 1024, 1024 * 1024, (gint64)1024 * 1024 * 1024 };
+    if (unit_idx < 0 || unit_idx >= (int)G_N_ELEMENTS(mult)) unit_idx = 0;
+    char *end;
+    double val = g_ascii_strtod(text, &end);
+    if (end == text || val < 0 || val != val) return -1;
+    double r = val * (double)mult[unit_idx];
+    if (r >= (double)G_MAXINT64) return G_MAXINT64;
+    return (gint64)r;
 }

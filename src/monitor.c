@@ -229,6 +229,14 @@ typedef struct {
 
 static gpointer sftp_poll_thread(gpointer data);
 
+static void attrs_to_stat(const LIBSSH2_SFTP_ATTRIBUTES *a, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (a->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) st->st_mode = a->permissions;
+    if (a->flags & LIBSSH2_SFTP_ATTR_SIZE)        st->st_size = (off_t)a->filesize;
+    if (a->flags & LIBSSH2_SFTP_ATTR_ACMODTIME)   st->st_mtime = (time_t)a->mtime;
+}
+
 static gboolean sftp_poll_apply(gpointer data)
 {
     SftpPoll *sp = data;
@@ -260,7 +268,23 @@ static gboolean sftp_poll_apply(gpointer data)
             g_list_store_remove(p->store, i - 1);
             p->inhibit_sel = FALSE;
             changed = TRUE;
-        } else {
+        } else if (strcmp(fi->name, "..") != 0) {
+            /* still there: refresh it when size/mtime changed remotely */
+            const LIBSSH2_SFTP_ATTRIBUTES *a = g_hash_table_lookup(remote, fi->name);
+            struct stat st;
+            attrs_to_stat(a, &st);
+            if (!fi->is_dir && !S_ISDIR(st.st_mode) &&
+                (fi->size_raw != (gint64)st.st_size ||
+                 fi->date_raw != (gint64)st.st_mtime)) {
+                FileItem *nfi = file_item_from_stat(p->fm, fi->name, &st);
+                nfi->marked = fi->marked;
+                p->inhibit_sel = TRUE;
+                g_list_store_splice(p->store, i - 1, 1, (gpointer *)&nfi, 1);
+                p->inhibit_sel = FALSE;
+                changed = TRUE;
+                g_object_unref(fi);
+                fi = nfi;             /* our ref is dropped below; store keeps one */
+            }
             g_hash_table_add(present, fi->name);   /* name owned by store item */
         }
         g_object_unref(fi);
@@ -274,11 +298,8 @@ static gboolean sftp_poll_apply(gpointer data)
         const char *rname = key;
         if (g_hash_table_contains(present, rname)) continue;
 
-        LIBSSH2_SFTP_ATTRIBUTES *a = val;
-        struct stat st = { 0 };
-        if (a->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) st.st_mode = a->permissions;
-        if (a->flags & LIBSSH2_SFTP_ATTR_SIZE)        st.st_size = (off_t)a->filesize;
-        if (a->flags & LIBSSH2_SFTP_ATTR_ACMODTIME)   st.st_mtime = (time_t)a->mtime;
+        struct stat st;
+        attrs_to_stat(val, &st);
         FileItem *fi = file_item_from_stat(p->fm, rname, &st);
         p->inhibit_sel = TRUE;
         g_list_store_append(p->store, fi);

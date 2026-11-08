@@ -276,7 +276,7 @@ static void devices_fill(Panel *p)
         GIcon *icon = g_mount_get_symbolic_icon(m);
         gboolean can = g_mount_can_unmount(m) || g_mount_can_eject(m);
         add_row(p, icon, NULL, name, path, path, NULL, can ? m : NULL);
-        g_object_unref(icon);
+        g_clear_object(&icon);
         g_free(name);
         g_free(path);
     }
@@ -294,7 +294,7 @@ static void devices_fill(Panel *p)
         GIcon *icon = g_volume_get_symbolic_icon(v);
         add_row(p, icon, NULL, name, "Not mounted – click to mount",
                 NULL, v, NULL);
-        g_object_unref(icon);
+        g_clear_object(&icon);
         g_free(name);
     }
     g_list_free_full(vols, g_object_unref);

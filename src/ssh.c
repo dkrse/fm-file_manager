@@ -542,7 +542,8 @@ void ssh_panel_close(Panel *p)
 
 /* ── ssh_read_file ────────────────────────────────────────────────── */
 
-gchar *ssh_read_file(SshConn *conn, const char *path, gsize *out_len)
+gchar *ssh_read_file(SshConn *conn, const char *path, gsize max_len,
+                     gsize *out_len)
 {
     *out_len = 0;
     if (!conn || !conn->sftp) return NULL;
@@ -556,8 +557,15 @@ gchar *ssh_read_file(SshConn *conn, const char *path, gsize *out_len)
     char buf[32768];
     ssize_t n;
     /* session is blocking: no EAGAIN, any negative value is an error */
-    while ((n = libssh2_sftp_read(fh, buf, sizeof(buf))) > 0)
-        g_byte_array_append(ba, (guint8 *)buf, (guint)n);
+    /* max_len > 0: stop after max_len bytes (callers pass limit+1 to
+     * detect an oversized file without downloading all of it) */
+    while ((n = libssh2_sftp_read(fh, buf, sizeof(buf))) > 0) {
+        gsize take = (gsize)n;
+        if (max_len && ba->len + take > max_len) take = max_len - ba->len;
+        g_byte_array_append(ba, (guint8 *)buf, (guint)take);
+        if (max_len && ba->len >= max_len) { n = 0; break; }
+        if (ba->len > G_MAXUINT - sizeof(buf)) { n = -1; break; } /* >4 GB */
+    }
     libssh2_sftp_close(fh);
     ssh_conn_unlock(conn);
     if (n < 0) {                        /* never return a truncated file */
@@ -691,10 +699,12 @@ void panel_load_remote(Panel *p, const char *path)
     GPtrArray *items = g_ptr_array_new_with_free_func(g_object_unref);
 
     /* ".." entry */
+    gchar *up_color = fm_visible_color(p->fm, p->fm->dir_color);
     g_ptr_array_add(items,
         file_item_new("go-up-symbolic", "..", "", "",
-                      TRUE, p->fm->dir_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
+                      TRUE, up_color, p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL,
                       (gint64)-2, (gint64)0));
+    g_free(up_color);
 
     char name_buf[4096];
     char longentry[4096];
@@ -903,6 +913,12 @@ static void on_ssh_bm_save(GtkButton *btn, SshDlgData *d)
     guint sel = gtk_drop_down_get_selected(d->dropdown);
     SshBookmark *bm = (sel != GTK_INVALID_LIST_POSITION)
                       ? g_list_nth_data(d->bookmarks, sel) : NULL;
+    /* a different name means a new connection, not an edit of the
+     * selected one; an existing name is updated in place */
+    if (bm && g_strcmp0(bm->name, bm_name) != 0) bm = NULL;
+    if (!bm)
+        for (GList *l = d->bookmarks; l; l = l->next)
+            if (!g_strcmp0(((SshBookmark *)l->data)->name, bm_name)) { bm = l->data; break; }
 
     if (bm) {
         g_free(bm->name); bm->name = g_strdup(bm_name);
@@ -1255,9 +1271,10 @@ SshConn *ssh_conn_ref(SshConn *conn) { if (conn) conn->refs++; return conn; }
 void ssh_conn_unref(SshConn *conn) { if (conn && --conn->refs <= 0) g_free(conn); }
 void ssh_connect_cancel(Panel *p) { (void)p; }
 
-gchar *ssh_read_file(SshConn *conn, const char *path, gsize *out_len)
+gchar *ssh_read_file(SshConn *conn, const char *path, gsize max_len,
+                     gsize *out_len)
 {
-    (void)conn; (void)path;
+    (void)conn; (void)path; (void)max_len;
     *out_len = 0;
     return NULL;
 }

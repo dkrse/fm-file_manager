@@ -319,7 +319,7 @@ static gboolean job_tick(gpointer d)
         if (elapsed > 500000 && done > 0) {
             double speed = (double)done / (elapsed / 1e6);
             gchar *s_speed = fmt_size((goffset)speed);
-            gint64 left = speed > 0 ? (gint64)((total - done) / speed) : 0;
+            gint64 left = (speed > 0 && total > done) ? (gint64)((total - done) / speed) : 0;
             detail = g_strdup_printf("%s / %s     %s/s     %02d:%02d left",
                                      s_done, s_total, s_speed,
                                      (int)(left / 60), (int)(left % 60));

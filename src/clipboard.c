@@ -29,13 +29,14 @@ void clip_copy(FM *fm, gboolean cut)
     GString *uris  = g_string_new(NULL);
     GString *text  = g_string_new(NULL);
     int n = 0;
-    for (GList *l = paths; l; l = l->next, n++) {
+    for (GList *l = paths; l; l = l->next) {
         gchar *uri = g_filename_to_uri(l->data, NULL, NULL);
         if (!uri) continue;
         g_string_append_printf(gnome, "\n%s", uri);
         g_string_append_printf(uris, "%s\r\n", uri);
         g_string_append_printf(text, "%s%s", n ? "\n" : "", (const char *)l->data);
         g_free(uri);
+        n++;
     }
 
     GBytes *b_gnome = g_string_free_to_bytes(gnome);

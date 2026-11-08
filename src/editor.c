@@ -978,9 +978,17 @@ void editor_show_path(FM *fm, const char *path)
     if (!path && p->ssh_conn) {
         remote_path = g_build_filename(p->ssh_conn->remote_path, name, NULL);
         g_free(name);
-        content = ssh_read_file(p->ssh_conn, remote_path, &content_len);
+        content = ssh_read_file(p->ssh_conn, remote_path,
+                                EDITOR_MAX_BYTES + 1, &content_len);
         if (!content) {
             fm_status(fm, "Editor: SFTP read error – %s", remote_path);
+            g_free(remote_path);
+            return;
+        }
+        if (content_len > EDITOR_MAX_BYTES) {
+            fm_status(fm, "Editor: file too large (limit %d MB)",
+                      EDITOR_MAX_BYTES / (1024 * 1024));
+            g_free(content);
             g_free(remote_path);
             return;
         }

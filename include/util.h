@@ -72,4 +72,12 @@ GList *fs_parse_uri_list(const char *data, gsize len, gboolean *is_cut);
 /* "*.c;*.h" – case-insensitive glob match against any sub-pattern */
 gboolean fs_match_patterns(const char *patterns, const char *name);
 
+/* Content search: first line of a text file containing needle_lower
+ * (already lower-cased); returns a valid-UTF-8 snippet or NULL.
+ * NULL for binary files.  *cancelled (may be NULL) aborts the scan. */
+gchar *fs_file_contains(const char *path, const char *needle_lower,
+                        int *out_line, gint *cancelled);
+/* "1.5" + unit (0=B 1=KB 2=MB 3=GB) → bytes; -1 if empty/invalid */
+gint64 fs_parse_size(const char *text, int unit_idx);
+
 #endif /* FM_UTIL_H */

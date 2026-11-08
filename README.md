@@ -39,13 +39,14 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Incremental search** — Ctrl+S, MC-style jump-to-file search (cursor jumps to matching file, list not filtered)
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel. Results are kept: Enter opens a file in its default app, Ctrl+PgDn / Ctrl+Enter jumps to the file's directory, Alt+← (or the 🔍 button) returns to the results, Shift+F2 lists the last 10 searches. Content search shows `:line  matching text` next to each file; F3 opens the viewer on that match with the text highlighted (F3 / Shift+F3 = next / previous)
-- **File viewer** — F3, displays text (only the first 50 MB of larger local files are read, so even multi-GB files open instantly) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
-- **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too; files up to 100 MB
+- **File viewer** — F3, displays text (only the first 50 MB of larger files are read, also over SFTP, so even multi-GB files open instantly) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
+- **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too; files up to 100 MB (larger remote files are refused without being downloaded)
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS); switched off automatically for files over 2 MB to keep large files fast
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
-- **Saved SSH connections** — named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; custom private key path per connection
+- **Saved SSH connections** — any number of named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; Save with a new name adds a connection, the same name updates it, New clears the form, Remove deletes the selected one; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates (add/remove/update individual files, no full reload)
+- **Remembered window size** — the main window opens with the size (and maximized state) it had when it was last closed
 - **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Dark / Light / System theme** — runtime switching via Settings → System (libadwaita); "System" follows the desktop light/dark setting and switches live when it changes; colors auto-adapt (directories, symlinks, marks, editor scheme)
 - **Settings** — tabbed dialog: Panels / Display / Cursor / Viewer / Editor / System
@@ -157,7 +158,7 @@ sudo make install     # install to /usr/local/bin/fm + icons + .desktop
 make user-install     # install for current user (~/.local/)
 make uninstall        # remove system install
 make clean            # clean build artifacts
-make test             # unit tests of the file-operation core (no display needed)
+make test             # unit tests of the core: file operations, archives, content search, size parsing (no display needed)
 make test-asan        # the same under AddressSanitizer + UBSan
 make test-sftp        # SFTP tests against a private throwaway sshd (skipped without sshd)
 make test-gui         # GUI tests (tabs, SFTP tabs, devices) headless on broadway; SAN=1 for ASan

@@ -234,17 +234,35 @@ void fo_multi_rename(FM *fm)
 
     /* a directory together with something inside it (search results):
      * renaming the directory would move the other item away */
-    for (guint i = 0; i < d.items->len; i++)
-        for (guint j = 0; j < d.items->len; j++) {
-            if (i == j) continue;
-            const MrnItem *a = d.items->pdata[i], *b = d.items->pdata[j];
-            if (a->is_dir && fs_path_is_inside(b->path, a->path)) {
-                fm_status(fm, "Multi-rename: '%s' is inside the selected directory '%s'",
-                          b->old_name, a->old_name);
-                g_ptr_array_unref(d.items);
-                return;
-            }
+    /* hash of selected directories, then walk each item's ancestors:
+     * O(n·depth) instead of O(n²) for large search results */
+    GHashTable *dirs = g_hash_table_new(g_str_hash, g_str_equal);
+    for (guint i = 0; i < d.items->len; i++) {
+        MrnItem *a = d.items->pdata[i];
+        if (a->is_dir) g_hash_table_insert(dirs, a->path, a);
+    }
+    for (guint j = 0; j < d.items->len && g_hash_table_size(dirs); j++) {
+        const MrnItem *b = d.items->pdata[j];
+        gchar *anc = g_path_get_dirname(b->path);
+        const MrnItem *a = NULL;
+        while (!a) {
+            a = g_hash_table_lookup(dirs, anc);
+            gchar *up = g_path_get_dirname(anc);
+            gboolean top = strcmp(up, anc) == 0;
+            g_free(anc);
+            anc = up;
+            if (top) break;
         }
+        g_free(anc);
+        if (a) {
+            fm_status(fm, "Multi-rename: '%s' is inside the selected directory '%s'",
+                      b->old_name, a->old_name);
+            g_hash_table_destroy(dirs);
+            g_ptr_array_unref(d.items);
+            return;
+        }
+    }
+    g_hash_table_destroy(dirs);
 
     DlgCtx ctx;
     dlg_ctx_init(&ctx);

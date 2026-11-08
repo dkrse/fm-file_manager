@@ -16,6 +16,8 @@ static FM g_fm;
  *  Utility
  * ─────────────────────────────────────────────────────────────────── */
 
+static gboolean on_main_close_request(GtkWindow *win, FM *fm);
+
 void fm_status(FM *fm, const char *fmt, ...)
 {
     va_list ap;
@@ -1238,7 +1240,7 @@ static void activate_item(Panel *p)
             fm_status(p->fm, "Downloading '%s'...", name);
             gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
             gsize len = 0;
-            gchar *data = ssh_read_file(p->ssh_conn, remote_path, &len);
+            gchar *data = ssh_read_file(p->ssh_conn, remote_path, 0, &len);
             g_free(remote_path);
             if (data && len > 0) {
                 /* One private temp dir per session (prevents symlink
@@ -1823,13 +1825,25 @@ static void on_filter_changed(GtkEditable *editable, Panel *p)
 
     /* MC-style incremental search: jump cursor to first matching item */
     gchar *lower = g_utf8_strdown(text, -1);
+    gboolean ascii = TRUE;
+    for (const char *c = lower; *c; c++) if ((guchar)*c >= 0x80) { ascii = FALSE; break; }
+    size_t nlen = strlen(lower);
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     for (guint i = 0; i < n; i++) {
         FileItem *item = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
         if (!item) continue;
-        gchar *name_lower = g_utf8_strdown(item->name, -1);
-        gboolean match = (strstr(name_lower, lower) != NULL);
-        g_free(name_lower);
+        gboolean match = FALSE;
+        if (ascii) {        /* common case: no allocation per row */
+            for (const char *h = item->name; *h && !match; h++) {
+                size_t k = 0;
+                while (k < nlen && h[k] && g_ascii_tolower(h[k]) == lower[k]) k++;
+                match = k == nlen;
+            }
+        } else {
+            gchar *name_lower = g_utf8_strdown(item->name, -1);
+            match = strstr(name_lower, lower) != NULL;
+            g_free(name_lower);
+        }
         g_object_unref(item);
         if (match) {
             p->cursor_pos = i;
@@ -2422,7 +2436,9 @@ static void btn_help(GtkButton *b, gpointer d)    { (void)b; help_show(d); }
 static void btn_find(GtkButton *b, gpointer d)    { (void)b; search_run(d); }
 static void btn_view(GtkButton *b, gpointer d)    { (void)b; viewer_show(d); }
 static void btn_editor(GtkButton *b, gpointer d)  { (void)b; editor_show(d); }
-static void btn_quit(GtkButton *b, gpointer d)    { (void)b; g_application_quit(G_APPLICATION(((FM*)d)->app)); }
+/* close the window (not g_application_quit): close-request handlers run,
+ * so the window size is saved and a running search is stopped first */
+static void btn_quit(GtkButton *b, gpointer d)    { (void)b; gtk_window_close(GTK_WINDOW(((FM*)d)->window)); }
 
 static GtkWidget *create_toolbar(FM *fm)
 {
@@ -2560,7 +2576,7 @@ static gboolean on_window_key_press(GtkEventControllerKey *ctrl,
         if (alt) { devices_popup(&fm->panels[0]); return TRUE; }
         help_show(fm);
         return TRUE;
-    case GDK_KEY_F10: g_application_quit(G_APPLICATION(fm->app)); return TRUE;
+    case GDK_KEY_F10: gtk_window_close(GTK_WINDOW(fm->window)); return TRUE;
 
     /* Alt+Enter – properties */
     case GDK_KEY_Return:
@@ -2864,7 +2880,15 @@ static void on_activate(GtkApplication *app, gpointer data)
     /* window */
     fm->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(fm->window), APP_NAME " – File Manager");
-    gtk_window_set_default_size(GTK_WINDOW(fm->window), 1200, 700);
+    {
+        int w = 1200, h = 700;
+        gboolean max = FALSE;
+        settings_load_window(&w, &h, &max);
+        gtk_window_set_default_size(GTK_WINDOW(fm->window), w, h);
+        if (max) gtk_window_maximize(GTK_WINDOW(fm->window));
+    }
+    g_signal_connect(fm->window, "close-request",
+                     G_CALLBACK(on_main_close_request), fm);
 
     /* header bar */
     GtkWidget *hbar = gtk_header_bar_new();
@@ -2950,6 +2974,17 @@ static void on_activate(GtkApplication *app, gpointer data)
     panel_focus(&fm->panels[0]);
 
     fm_status(fm, "Welcome to " APP_NAME " – File Manager");
+}
+
+/* Main window closing: remember its size (the default size tracks the
+ * current unmaximized size in GTK 4) */
+static gboolean on_main_close_request(GtkWindow *win, FM *fm)
+{
+    (void)fm;
+    int w = 0, h = 0;
+    gtk_window_get_default_size(win, &w, &h);
+    settings_save_window(w, h, gtk_window_is_maximized(win));
+    return FALSE;                       /* let the window close */
 }
 
 /* Exit: remember the tabs of both panels, then free them */

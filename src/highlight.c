@@ -223,14 +223,20 @@ void highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled)
 
     ensure_tags(buf);
 
+    /* matches come in increasing order: convert byte → char offsets
+     * incrementally instead of rescanning from the start (was O(n²)) */
+    gint  last_b = 0;
+    glong last_c = 0;
+#define BYTE_TO_CHAR(b) (last_c += g_utf8_pointer_to_offset(text + last_b, text + (b)), \
+                         last_b = (b), last_c)
     GMatchInfo *mi = NULL;
     g_regex_match_full(re, text, (gssize)tlen, 0, 0, &mi, NULL);
     while (mi && g_match_info_matches(mi)) {
         for (int g = 1; g <= 5; g++) {
             gint bs = -1, be = -1;
             if (g_match_info_fetch_pos(mi, g, &bs, &be) && bs >= 0 && be > bs) {
-                glong cs = g_utf8_pointer_to_offset(text, text + bs);
-                glong ce = g_utf8_pointer_to_offset(text, text + be);
+                glong cs = BYTE_TO_CHAR(bs);
+                glong ce = BYTE_TO_CHAR(be);
                 GtkTextIter i1, i2;
                 gtk_text_buffer_get_iter_at_offset(buf, &i1, (gint)cs);
                 gtk_text_buffer_get_iter_at_offset(buf, &i2, (gint)ce);
@@ -240,6 +246,7 @@ void highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled)
         }
         g_match_info_next(mi, NULL);
     }
+#undef BYTE_TO_CHAR
     g_match_info_free(mi);
     g_regex_unref(re);
     g_free(text);

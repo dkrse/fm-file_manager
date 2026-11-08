@@ -367,6 +367,8 @@ void editor_show_path(FM *fm, const char *path);   /* local file */
 void   settings_load(FM *fm);
 void   settings_save(FM *fm);
 void   settings_save_tabs(FM *fm);
+gboolean settings_load_window(int *width, int *height, gboolean *maximized);
+void     settings_save_window(int width, int height, gboolean maximized);
 gchar **settings_load_tabs(int idx, int *active);   /* g_strfreev() */
 void   settings_dialog(FM *fm);
 void   settings_apply_columns(FM *fm);
@@ -400,7 +402,8 @@ void      ssh_connect_cancel(Panel *p);      /* drop a connect in flight */
 gboolean  ssh_conn_trylock(SshConn *conn);   /* main thread: FALSE = job busy */
 void      ssh_conn_lock   (SshConn *conn);
 void      ssh_conn_unlock (SshConn *conn);
-gchar    *ssh_read_file (SshConn *conn, const char *path, gsize *out_len);
+gchar    *ssh_read_file (SshConn *conn, const char *path, gsize max_len,
+                          gsize *out_len);   /* max_len 0 = no limit */
 gboolean  ssh_write_file(SshConn *conn, const char *path, const gchar *data, gsize len);
 
 /* ── shared callbacks ─────────────────────────────────────────────── */
