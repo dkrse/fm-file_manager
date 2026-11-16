@@ -238,10 +238,8 @@ static GPtrArray *build_grouped_list(GPtrArray *results, FM *fm)
         if (is_link)      fg = fm_link_color(fm);
         else if (is_exec) fg = fm_exec_color(fm);
 
-        FileItem *fi = file_item_new_take(icon, r->name,
-                          fmt_size(r->size), fmt_date(r->mtime),
-                          FALSE, fg, wt,
-                          r->size, r->mtime);
+        FileItem *fi = file_item_new_lazy(icon, r->name, FALSE, fg, wt,
+                                          r->size, r->mtime, NULL);
         fi->dir_path = g_strdup(r->dir);
         fi->snippet  = r->snippet;   /* move ownership */
         fi->line     = r->line;

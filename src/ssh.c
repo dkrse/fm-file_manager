@@ -697,6 +697,7 @@ void panel_load_remote(Panel *p, const char *path)
 
     /* Collect all items into array first, then splice once (O(n) instead of O(n²)) */
     GPtrArray *items = g_ptr_array_new_with_free_func(g_object_unref);
+    gchar *vdc = NULL;          /* directory colour – computed once, not per entry */
 
     /* ".." entry */
     gchar *up_color = fm_visible_color(p->fm, p->fm->dir_color);
@@ -742,24 +743,22 @@ void panel_load_remote(Panel *p, const char *path)
         gint64 mtime    = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)
                           ? (gint64)attrs.mtime : 0;
 
-        gchar *vdc = fm_visible_color(p->fm, p->fm->dir_color);
+        if (is_dir && !vdc) vdc = fm_visible_color(p->fm, p->fm->dir_color);
         const gchar *fg = NULL;
         gint         wt = PANGO_WEIGHT_NORMAL;
         if      (is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
         else if (is_link) { fg = fm_link_color(p->fm); }
         else if (is_exec) { fg = fm_exec_color(p->fm); }
 
-        /* file_item_new_take takes ownership of size/date strings */
-        FileItem *fi = file_item_new_take(icon, name_buf,
-                               is_dir ? g_strdup("<DIR>") : fmt_size((goffset)size_raw),
-                               fmt_date(mtime),
-                               is_dir, fg, wt, size_raw, mtime);
-        g_free(vdc);
+        /* size/date text and sort key: formatted when shown / sorted */
+        FileItem *fi = file_item_new_lazy(icon, name_buf, is_dir, fg, wt,
+                                          size_raw, mtime, NULL);
         if (p->marks && g_hash_table_contains(p->marks, name_buf))
             fi->marked = TRUE;
         g_ptr_array_add(items, fi);
     }
     libssh2_sftp_closedir(handle);
+    g_free(vdc);
     ssh_conn_unlock(conn);
     if (rc < 0)                         /* 0 = end of listing */
         fm_status(p->fm, "SFTP: listing of %s incomplete (error %d)", path, rc);
@@ -1000,7 +999,8 @@ static void ssh_connect_thread(GTask *task, gpointer source,
     SshConn *conn = ssh_conn_new(args->host, args->user, args->port,
                                   args->password, args->key_path, &errmsg);
     if (conn) {
-        g_task_return_pointer(task, conn, NULL);
+        /* freed by GTask if nobody collects it (exit during connect) */
+        g_task_return_pointer(task, conn, (GDestroyNotify)ssh_conn_free);
     } else {
         g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
                                 "%s", errmsg ? errmsg : "unknown error");

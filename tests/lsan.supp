@@ -1,0 +1,15 @@
+# LeakSanitizer suppressions for `make test-gui SAN=1`.
+#
+# These are process-lifetime caches of the libraries, not leaks of FM:
+# they are allocated once, kept until exit and left to the OS.  The total
+# is constant (it does not grow with directories, files or windows opened),
+# and the same reports appear on builds before any FM change.
+#
+# A real FM leak still shows up: its stack has an FM function as the
+# allocator (e.g. editor_show), not only a library frame.
+
+# fontconfig: font list / pattern cache built at the first text layout
+leak:libfontconfig.so
+
+# GTK renderer: glyph / texture caches created on the first frame of a window
+leak:gsk_renderer_render

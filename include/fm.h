@@ -26,10 +26,10 @@ struct _FileItem {
     GObject   parent_instance;
     gchar    *icon_name;
     gchar    *name;
-    gchar    *size;
-    gchar    *date;
+    gchar    *size;        /* lazy – read via file_item_size_str */
+    gchar    *date;        /* lazy – read via file_item_date_str */
     gboolean  is_dir;
-    gchar    *fg_color;    /* CSS colour or NULL              */
+    gchar    *fg_color;    /* CSS colour or NULL (interned)   */
     gint      weight;      /* PangoWeight                     */
     gint64    size_raw;    /* for sorting                     */
     gint64    date_raw;    /* for sorting                     */
@@ -45,6 +45,12 @@ const gchar *file_item_sort_key(FileItem *item);
 /* Change the mark and emit "mark-changed" so bound rows re-render in place */
 void file_item_set_marked(FileItem *item, gboolean marked);
 FileItem *file_item_copy(FileItem *src);   /* unmarked duplicate */
+/* size/date text formatted on first use; sort_key (owned) may be NULL */
+FileItem *file_item_new_lazy(const char *icon_name, const char *name,
+                             gboolean is_dir, const char *fg_color, gint weight,
+                             gint64 size_raw, gint64 date_raw, gchar *sort_key);
+const gchar *file_item_size_str(FileItem *item);
+const gchar *file_item_date_str(FileItem *item);
 
 FileItem *file_item_new(const char *icon_name, const char *name,
                         const char *size, const char *date,
@@ -163,6 +169,13 @@ typedef struct {
     gint64              arc_stamp;     /* archive mtime/size when listed      */
     GtkWidget          *dev_btn;       /* device picker (Alt+F1 / Alt+F2)     */
     GtkWidget          *dev_list;
+    GtkWidget          *list_scroll;   /* scrolled window around column_view */
+    GtkWidget          *qv_box;        /* quick view shown instead (Ctrl+Q)  */
+    /* mark key → FileItem* (borrowed) of p->store, built on demand and
+     * dropped on any store change – status bar sums without a full scan */
+    GHashTable         *item_index;
+    GListStore         *item_index_store;  /* weak: store it was built for */
+    gulong              item_index_hid;
 } Panel;
 
 struct _FM {
@@ -193,6 +206,7 @@ struct _FM {
     int             icon_size;          /* pixel size for file icons (16–48) */
     /* application settings */
     gchar          *terminal_app;  /* terminal emulator command */
+    gchar          *diff_tool;     /* Alt+D compare program, NULL/"" = auto */
     /* cursor style */
     gchar          *cursor_color;  /* hex color, e.g. "#1A73E8" */
     gboolean        cursor_outline; /* TRUE = outline only, FALSE = filled */
@@ -224,6 +238,11 @@ struct _FM {
     gboolean        viewer_image_preview;
     /* cached theme-adjusted mark color (avoids alloc in bind callbacks) */
     gchar          *vis_mark_color;
+    /* quick view (Ctrl+Q) */
+    gboolean        qv_on;
+    int             qv_panel;      /* panel showing the preview */
+    guint           qv_timer;
+    gchar          *qv_path;       /* file shown, to skip repaints */
 };
 
 /* ── Dialog helper (replaces gtk_dialog_run with GMainLoop) ───────── */
@@ -278,6 +297,25 @@ void   panel_tabs_free(Panel *p);
 void   panel_tab_track(Panel *p);                 /* after a load */
 void   panel_tab_set_conn(Panel *p, SshConn *conn); /* active tab only */
 void   panel_tabs_drop_conn(Panel *p, SshConn *conn); /* every tab using it */
+void   panel_tab_free(gpointer tab);              /* GPtrArray free func */
+void   set_active_panel(FM *fm, int idx);
+PanelTab *panel_tab_item_new(const char *path);
+void   panel_tabs_cancel_save(void);
+PanelTab *panel_tab_cur(Panel *p);
+
+/* main.c */
+void      panel_show_filter(Panel *p);
+void      panel_apply_mask(Panel *p);        /* after mask_pattern changed */
+gboolean  on_tree_key_press(GtkEventControllerKey *ctrl, guint keyval,
+                            guint keycode, GdkModifierType state, Panel *p);
+/* menus.c */
+GSimpleActionGroup *panel_menu_actions(Panel *p);
+GtkWidget *panel_menu_button(const char *grp);
+void      panel_context_menu_attach(Panel *p, const char *grp);
+/* keys.c */
+GtkWidget *create_toolbar(FM *fm);
+gboolean  on_window_key_press(GtkEventControllerKey *ctrl, guint keyval,
+                              guint keycode, GdkModifierType state, FM *fm);
 gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
 gchar *panel_cursor_fullpath(Panel *p);     /* full path (search-aware), caller must g_free() */
 GList *panel_selection(Panel *p);            /* names; g_list_free_full(l, g_free) */
@@ -358,6 +396,18 @@ void search_update_buttons(Panel *p);
 /* ── viewer ───────────────────────────────────────────────────────── */
 void viewer_show(FM *fm);
 void viewer_show_path(FM *fm, const char *path, const char *name); /* local file */
+gboolean viewer_is_image(const char *name);
+
+/* ── quick view, compare, checksums, network (Ctrl+Q, Alt+C/D, Alt+K, Ctrl+N) */
+void qv_toggle(FM *fm);
+gboolean qv_active(FM *fm);
+void qv_close(FM *fm);
+void cmp_dirs(FM *fm);                 /* Alt+C – compare + synchronize */
+gboolean cmp_mark_dirs(FM *fm, guint *left, guint *right, guint *different);
+void cmp_files(FM *fm);                /* Alt+D – diff two files        */
+void cks_create(FM *fm);               /* Alt+K – checksums of marked files */
+void cks_verify(FM *fm);               /* Alt+Shift+K – verify a .sha256 … */
+void net_connect_dialog(FM *fm);       /* Ctrl+N – smb://, ftp://, dav:// … */
 
 /* ── editor ───────────────────────────────────────────────────────── */
 void editor_show(FM *fm);
@@ -367,6 +417,8 @@ void editor_show_path(FM *fm, const char *path);   /* local file */
 void   settings_load(FM *fm);
 void   settings_save(FM *fm);
 void   settings_save_tabs(FM *fm);
+gchar *settings_get_string(const char *group, const char *key);   /* g_free() */
+void   settings_set_string(const char *group, const char *key, const char *value);
 gboolean settings_load_window(int *width, int *height, gboolean *maximized);
 void     settings_save_window(int width, int height, gboolean maximized);
 gchar **settings_load_tabs(int idx, int *active);   /* g_strfreev() */

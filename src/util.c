@@ -377,3 +377,126 @@ gint64 fs_parse_size(const char *text, int unit_idx)
     if (r >= (double)G_MAXINT64) return G_MAXINT64;
     return (gint64)r;
 }
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Checksums
+ * ─────────────────────────────────────────────────────────────────── */
+
+static gboolean is_hex(const char *s, gsize n)
+{
+    for (gsize i = 0; i < n; i++)
+        if (!g_ascii_isxdigit(s[i])) return FALSE;
+    return n > 0;
+}
+
+gboolean fs_parse_checksum_line(const char *line, gchar **hash, gchar **name)
+{
+    *hash = NULL; *name = NULL;
+    if (!line) return FALSE;
+    while (*line == ' ' || *line == '\t') line++;
+    if (!*line || *line == '#') return FALSE;
+    gsize len = strlen(line);
+    while (len && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
+    if (!len) return FALSE;
+    gchar *l = g_strndup(line, len);
+    gboolean ok = FALSE;
+
+    /* BSD: "SHA256 (name) = hash" */
+    const char *open = strstr(l, " (");
+    const char *eq   = g_strrstr(l, ") = ");
+    if (open && eq && eq > open && is_hex(eq + 4, strlen(eq + 4))) {
+        *name = g_strndup(open + 2, eq - (open + 2));
+        *hash = g_ascii_strdown(eq + 4, -1);
+        ok = TRUE;
+    } else {
+        /* GNU: "hash  name" (text) or "hash *name" (binary) */
+        gsize h = 0;
+        while (l[h] && g_ascii_isxdigit(l[h])) h++;
+        if (h > 0 && l[h] == ' ' && (l[h+1] == ' ' || l[h+1] == '*') && l[h+2]) {
+            *hash = g_ascii_strdown(l, h);
+            *name = g_strdup(l + h + 2);
+            ok = TRUE;
+        }
+    }
+    if (ok) {
+        GChecksumType t;
+        if (!fs_checksum_type_for_hex(strlen(*hash), &t) || !**name) ok = FALSE;
+    }
+    if (!ok) { g_clear_pointer(hash, g_free); g_clear_pointer(name, g_free); }
+    g_free(l);
+    return ok;
+}
+
+gboolean fs_checksum_type_for_hex(gsize len, GChecksumType *type)
+{
+    switch (len) {
+    case 32:  *type = G_CHECKSUM_MD5;    return TRUE;
+    case 40:  *type = G_CHECKSUM_SHA1;   return TRUE;
+    case 64:  *type = G_CHECKSUM_SHA256; return TRUE;
+    case 128: *type = G_CHECKSUM_SHA512; return TRUE;
+    default:  return FALSE;
+    }
+}
+
+const char *fs_checksum_name(GChecksumType type)
+{
+    switch (type) {
+    case G_CHECKSUM_MD5:    return "MD5";
+    case G_CHECKSUM_SHA1:   return "SHA1";
+    case G_CHECKSUM_SHA512: return "SHA512";
+    case G_CHECKSUM_SHA384: return "SHA384";
+    default:                return "SHA256";
+    }
+}
+
+const char *fs_checksum_ext(GChecksumType type)
+{
+    switch (type) {
+    case G_CHECKSUM_MD5:    return ".md5";
+    case G_CHECKSUM_SHA1:   return ".sha1";
+    case G_CHECKSUM_SHA512: return ".sha512";
+    case G_CHECKSUM_SHA384: return ".sha384";
+    default:                return ".sha256";
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Directory compare
+ * ─────────────────────────────────────────────────────────────────── */
+
+FsCmp fs_compare_files(gboolean other_exists, gint64 size, gint64 mtime,
+                       gint64 other_size, gint64 other_mtime, gint64 tolerance)
+{
+    if (!other_exists) return FS_CMP_ONLY;
+    gint64 dt = mtime - other_mtime;
+    if (dt >  tolerance) return FS_CMP_NEWER;
+    if (dt < -tolerance) return FS_CMP_OLDER;
+    return size == other_size ? FS_CMP_SAME : FS_CMP_DIFFERENT;
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Network locations
+ * ─────────────────────────────────────────────────────────────────── */
+
+gchar *fs_net_normalize_uri(const char *text)
+{
+    if (!text) return NULL;
+    gchar *t = g_strstrip(g_strdup(text));
+    if (!t[0]) { g_free(t); return NULL; }
+    gchar *scheme = g_uri_parse_scheme(t);
+    if (!scheme) {
+        gchar *u;
+        if (g_str_has_prefix(t, "//") || g_str_has_prefix(t, "\\\\")) {
+            g_strdelimit(t, "\\", '/');
+            u = g_strconcat("smb:", t, NULL);
+        } else {
+            u = g_strconcat("smb://", t, NULL);
+        }
+        g_free(t);
+        return u;
+    }
+    gboolean bad = g_ascii_strcasecmp(scheme, "file") == 0;
+    g_free(scheme);
+    if (bad) { g_free(t); return NULL; }
+    return t;
+}

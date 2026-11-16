@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #define COPY_BUF (256 * 1024)
+#define COPY_KERNEL_STEP (8 * 1024 * 1024)
 
 /* ─────────────────────────────────────────────────────────────────── *
  *  Context helpers
@@ -266,8 +267,35 @@ static int copy_reg(FsCtx *c, const char *src, const char *dst, const char *tmp,
     int fout = open(out, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fout < 0) { int e = errno; close(fin); return fail(c, dst, e); }
 
-    char *buf = g_malloc(COPY_BUF);
     int r = FS_OK;
+    /* In-kernel copy first: no round trip through user space, a reflink
+     * on btrfs/XFS (instant) and server-side copy on NFS/SMB.  8 MB
+     * steps keep progress and Cancel responsive.  Falls back to
+     * read/write when the file system pair cannot do it. */
+    gboolean kernel = st->st_size > 0;
+    gint64 copied = 0;
+    while (kernel) {
+        if (fs_cancelled(c)) { r = FS_CANCELLED; break; }
+        ssize_t k = copy_file_range(fin, NULL, fout, NULL, COPY_KERNEL_STEP, 0);
+        if (k > 0) { copied += k; report(c, name, k); continue; }
+        if (k == 0) {
+            /* some FUSE / virtual files report 0 at once – read them */
+            if (copied == 0) kernel = FALSE;
+            break;                                  /* end of file */
+        }
+        if (errno == EINTR) continue;
+        if (copied == 0 && (errno == EXDEV || errno == ENOSYS || errno == EINVAL ||
+                            errno == EOPNOTSUPP || errno == EPERM || errno == EBADF ||
+                            errno == ETXTBSY)) {
+            kernel = FALSE;                         /* not supported here */
+            break;
+        }
+        r = fail(c, dst, errno);
+        break;
+    }
+    if (kernel || r != FS_OK) goto done;
+
+    char *buf = g_malloc(COPY_BUF);
     ssize_t n;
     while ((n = read(fin, buf, COPY_BUF)) != 0) {
         if (n < 0) {
@@ -290,6 +318,7 @@ static int copy_reg(FsCtx *c, const char *src, const char *dst, const char *tmp,
         report(c, name, n);
     }
     g_free(buf);
+done:
     close(fin);
 
     if (r == FS_OK) {
@@ -965,3 +994,42 @@ int fs_sftp_download(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *remote,
 }
 
 #endif /* HAVE_LIBSSH2 */
+
+/* ─────────────────────────────────────────────────────────────────── *
+ *  Checksums
+ * ─────────────────────────────────────────────────────────────────── */
+
+gchar *fs_checksum_file(FsCtx *ctx, const char *path, GChecksumType type)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (ctx && !ctx->error)
+            ctx->error = g_strdup_printf("%s: %s", path, g_strerror(errno));
+        return NULL;
+    }
+    GChecksum *cs = g_checksum_new(type);
+    gsize bufsz = 1 << 20;
+    guchar *buf = g_malloc(bufsz);
+    gchar *base = g_path_get_basename(path);
+    gboolean ok = TRUE;
+    for (;;) {
+        if (ctx && fs_cancelled(ctx)) { ok = FALSE; break; }
+        ssize_t n = read(fd, buf, bufsz);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (ctx && !ctx->error)
+                ctx->error = g_strdup_printf("%s: %s", path, g_strerror(errno));
+            ok = FALSE;
+            break;
+        }
+        if (n == 0) break;
+        g_checksum_update(cs, buf, (gssize)n);
+        if (ctx && ctx->progress) ctx->progress(ctx, base, n);
+    }
+    close(fd);
+    g_free(buf);
+    g_free(base);
+    gchar *res = ok ? g_strdup(g_checksum_get_string(cs)) : NULL;
+    g_checksum_free(cs);
+    return res;
+}

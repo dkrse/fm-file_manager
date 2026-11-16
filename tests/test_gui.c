@@ -19,6 +19,8 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <glib/gstdio.h>
+#include <utime.h>
+#include "../include/job.h"
 
 static int failures, checks;
 #define CHECK(cond) do { checks++; if (!(cond)) { failures++; \
@@ -129,12 +131,12 @@ static void test_sftp_tabs(FM *fm, const char *work)
     CHECK(p->ssh_conn == c && c->refs == 1);
     CHECK(store_has(p, "f1") && store_has(p, "sub"));
     CHECK(g_str_has_prefix(gtk_editable_get_text(GTK_EDITABLE(p->path_entry)), "sftp://"));
-    CHECK(g_strcmp0(tab_cur(p)->rpath, rdir) == 0);
+    CHECK(g_strcmp0(panel_tab_cur(p)->rpath, rdir) == 0);
     CHECK(strcmp(p->cwd, local) == 0);          /* local fallback kept */
 
     /* Ctrl+T shares the connection */
     panel_tab_new(p, NULL);
-    CHECK(p->tabs->len == 2 && c->refs == 2 && tab_cur(p)->conn == c);
+    CHECK(p->tabs->len == 2 && c->refs == 2 && panel_tab_cur(p)->conn == c);
 
     /* Ctrl+Up equivalent: remote subdirectory in a new tab */
     gchar *sub = g_build_filename(rdir, "sub", NULL);
@@ -145,7 +147,7 @@ static void test_sftp_tabs(FM *fm, const char *work)
     /* a local tab in between */
     panel_tab_new(p, NULL);
     panel_tab_set_conn(p, NULL);
-    CHECK(p->ssh_conn == NULL && c->refs == 3 && tab_cur(p)->conn == NULL);
+    CHECK(p->ssh_conn == NULL && c->refs == 3 && panel_tab_cur(p)->conn == NULL);
     CHECK(strcmp(p->cwd, local) == 0);
 
     /* switching: each tab its own directory, never blocks */
@@ -154,7 +156,7 @@ static void test_sftp_tabs(FM *fm, const char *work)
         double t0 = now_s();
         panel_tab_cycle(p, 1);
         worst = MAX(worst, now_s() - t0);
-        PanelTab *t = tab_cur(p);
+        PanelTab *t = panel_tab_cur(p);
         CHECK(p->ssh_conn == t->conn);
         if (t->conn) CHECK(g_strcmp0(c->remote_path, t->rpath) == 0);
         else         CHECK(strcmp(p->cwd, local) == 0);
@@ -281,6 +283,161 @@ static void test_devices(FM *fm)
     g_print("ok devices (%d rows)\n", rows);
 }
 
+
+/* ── compare directories, quick view, background queue ───────────── */
+
+static void set_mtime(const char *dir, const char *name, gint64 t)
+{
+    gchar *path = g_build_filename(dir, name, NULL);
+    struct utimbuf ub = { (time_t)t, (time_t)t };
+    utime(path, &ub);
+    g_free(path);
+}
+
+static void write_in(const char *dir, const char *name, const char *data)
+{
+    gchar *path = g_build_filename(dir, name, NULL);
+    g_file_set_contents(path, data, -1, NULL);
+    g_free(path);
+}
+
+static gboolean marked(Panel *p, const char *name)
+{
+    return p->marks && g_hash_table_contains(p->marks, name);
+}
+
+/* the SFTP test may leave a panel connected – these tests are local */
+static void local_panels(FM *fm)
+{
+    for (int i = 0; i < 2; i++)
+        while (fm->panels[i].ssh_conn) { ssh_panel_close(&fm->panels[i]); pump(50); }
+}
+
+static void test_compare_dirs(FM *fm)
+{
+    local_panels(fm);
+    gchar *a = g_build_filename(tmp, "cmpA", NULL), *b = g_build_filename(tmp, "cmpB", NULL);
+    g_mkdir_with_parents(a, 0755);
+    g_mkdir_with_parents(b, 0755);
+    write_in(a, "same.txt", "1");   write_in(b, "same.txt", "1");
+    write_in(a, "newer.txt", "2");  write_in(b, "newer.txt", "2");
+    write_in(a, "only_a.txt", "3");
+    write_in(b, "only_b.txt", "4");
+    write_in(a, "size.txt", "55");  write_in(b, "size.txt", "5");
+    mk(a, "subdir");                         /* directories are not compared */
+    set_mtime(a, "same.txt", 1000000);  set_mtime(b, "same.txt", 1000001);
+    set_mtime(a, "newer.txt", 2000000); set_mtime(b, "newer.txt", 1000000);
+    set_mtime(a, "size.txt", 1000000);  set_mtime(b, "size.txt", 1000000);
+
+    panel_load(&fm->panels[0], a);
+    panel_load(&fm->panels[1], b);
+    pump(100);
+    guint l = 0, r = 0, d = 0;
+    CHECK(cmp_mark_dirs(fm, &l, &r, &d));
+    CHECK(l == 2 && r == 1 && d == 1);
+    Panel *pl = &fm->panels[0], *pr = &fm->panels[1];
+    CHECK(marked(pl, "newer.txt") && marked(pl, "only_a.txt"));
+    CHECK(!marked(pl, "same.txt") && !marked(pl, "size.txt") && !marked(pl, "subdir"));
+    CHECK(marked(pr, "only_b.txt") && !marked(pr, "newer.txt"));
+
+    /* synchronize left → right: the marked files are copied */
+    GList *paths = panel_selection_paths(pl);
+    CHECK(g_list_length(paths) == 2);
+    gchar *dst = g_build_filename(b, "only_a.txt", NULL);
+    /* newer.txt exists on the right → the conflict prompt would block;
+     * copy only the missing file here */
+    GList *only = NULL;
+    for (GList *x = paths; x; x = x->next)
+        if (g_str_has_suffix(x->data, "only_a.txt")) only = g_list_append(only, x->data);
+    CHECK(fo_transfer(fm, only, NULL, b, NULL, FALSE) == FS_OK);
+    CHECK(g_file_test(dst, G_FILE_TEST_IS_REGULAR));
+    g_list_free(only);
+    g_list_free_full(paths, g_free);
+    g_free(dst);
+    sel_mark_all(pl, FALSE);
+    sel_mark_all(pr, FALSE);
+    g_print("ok compare dirs\n");
+    g_free(a);
+    g_free(b);
+}
+
+static void test_quickview(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "qv", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "a.txt", "hello quick view\n");
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    pump(100);
+    panel_focus(p);
+    panel_select_name(p, "a.txt");
+    qv_toggle(fm);
+    pump(300);
+    Panel *q = &fm->panels[1];
+    CHECK(qv_active(fm) && fm->qv_panel == 1);
+    CHECK(q->qv_box && gtk_widget_get_visible(q->qv_box));
+    CHECK(!gtk_widget_get_visible(q->list_scroll));
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(
+        GTK_TEXT_VIEW(g_object_get_data(G_OBJECT(q->qv_box), "text")));
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(buf, &s, &e);
+    gchar *txt = gtk_text_buffer_get_text(buf, &s, &e, FALSE);
+    CHECK(strstr(txt, "hello quick view") != NULL);
+    g_free(txt);
+    qv_toggle(fm);
+    pump(50);
+    CHECK(!qv_active(fm) && gtk_widget_get_visible(q->list_scroll));
+    g_print("ok quick view\n");
+    g_free(d);
+}
+
+static gint64 job1_end, job2_start;
+
+static void slow_worker(Job *job, gpointer d)
+{
+    (void)job; (void)d;
+    g_usleep(400000);
+    job1_end = g_get_monotonic_time();
+}
+
+static void quick_worker(Job *job, gpointer d)
+{
+    (void)job; (void)d;
+    job2_start = g_get_monotonic_time();
+}
+
+static gboolean start_second(gpointer fm)
+{
+    CHECK(job_running_count() == 1);
+    Job *j2 = job_new(fm, "Second");
+    job_run(j2, quick_worker, NULL);       /* queued behind job 1 */
+    job_free(j2);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean press_background(gpointer job)
+{
+    Job *j = job;
+    CHECK(gtk_widget_get_visible(j->bg_btn));
+    g_signal_emit_by_name(j->bg_btn, "clicked");
+    CHECK(j->background && !gtk_widget_get_visible(j->window));
+    g_timeout_add(50, start_second, j->fm);
+    return G_SOURCE_REMOVE;
+}
+
+static void test_background_queue(FM *fm)
+{
+    Job *j1 = job_new(fm, "First");
+    j1->allow_background = TRUE;
+    g_timeout_add(50, press_background, j1);
+    job_run(j1, slow_worker, NULL);
+    job_free(j1);
+    CHECK(job1_end > 0 && job2_start >= job1_end);
+    CHECK(job_running_count() == 0);
+    g_print("ok background queue\n");
+}
+
 /* ── driver ───────────────────────────────────────────────────────── */
 
 static gboolean run_tests(gpointer data)
@@ -292,6 +449,9 @@ static gboolean run_tests(gpointer data)
     if (work && g_getenv("FM_SFTP_PORT")) test_sftp_tabs(fm, work);
     else g_print("skip sftp tabs (no test sshd)\n");
     test_devices(fm);
+    test_compare_dirs(fm);
+    test_quickview(fm);
+    test_background_queue(fm);
     g_application_quit(G_APPLICATION(fm->app));
     return G_SOURCE_REMOVE;
 }

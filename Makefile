@@ -77,7 +77,8 @@ endif
 
 # GLib-only core (unit-tested without GTK)
 CORE_SRCS := $(SRCDIR)/util.c $(SRCDIR)/fsops.c $(SRCDIR)/arcfs.c
-SRCS   := $(SRCDIR)/main.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
+SRCS   := $(SRCDIR)/main.c $(SRCDIR)/tabs.c $(SRCDIR)/menus.c $(SRCDIR)/keys.c \
+          $(SRCDIR)/compare.c $(SRCDIR)/quickview.c $(SRCDIR)/checksum.c $(SRCDIR)/netmount.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
           $(SRCDIR)/archive.c $(SRCDIR)/arcpanel.c $(SRCDIR)/job.c $(SRCDIR)/dialogs.c \
           $(SRCDIR)/selection.c $(SRCDIR)/clipboard.c $(SRCDIR)/monitor.c \
           $(SRCDIR)/icons.c $(SRCDIR)/multirename.c \
@@ -153,7 +154,10 @@ GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/d
 $(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(GUI_TEST_OBJS) $(HDRS)
 	$(CC) $(CFLAGS) tests/test_gui.c $(GUI_TEST_OBJS) -o $@ $(LIBS) $(LDSAN)
 
+# SAN=1: full stacks so tests/lsan.supp can match library caches by frame
 test-gui: $(GUI_TEST_BIN)
+	ASAN_OPTIONS="fast_unwind_on_malloc=0:$$ASAN_OPTIONS" \
+	LSAN_OPTIONS="suppressions=$(CURDIR)/tests/lsan.supp:print_suppressions=0:$$LSAN_OPTIONS" \
 	tests/gui_test.sh $(GUI_TEST_BIN)
 
 clean:

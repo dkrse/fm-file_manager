@@ -795,6 +795,98 @@ static void test_relpath_safe(void)
     g_assert_false(fs_relpath_is_safe(""));
 }
 
+
+/* ── checksums / compare ─────────────────────────────────────────── */
+
+static void test_checksum_parse(void)
+{
+    gchar *h, *n;
+    g_assert_true(fs_parse_checksum_line(
+        "d41d8cd98f00b204e9800998ecf8427e  empty file.txt\n", &h, &n));
+    g_assert_cmpstr(h, ==, "d41d8cd98f00b204e9800998ecf8427e");
+    g_assert_cmpstr(n, ==, "empty file.txt");
+    g_free(h); g_free(n);
+    g_assert_true(fs_parse_checksum_line(
+        "D41D8CD98F00B204E9800998ECF8427E *bin.iso\r\n", &h, &n));
+    g_assert_cmpstr(h, ==, "d41d8cd98f00b204e9800998ecf8427e");
+    g_assert_cmpstr(n, ==, "bin.iso");
+    g_free(h); g_free(n);
+    g_assert_true(fs_parse_checksum_line(
+        "MD5 (a (1).txt) = d41d8cd98f00b204e9800998ecf8427e", &h, &n));
+    g_assert_cmpstr(n, ==, "a (1).txt");
+    g_free(h); g_free(n);
+    g_assert_false(fs_parse_checksum_line("# comment", &h, &n));
+    g_assert_false(fs_parse_checksum_line("", &h, &n));
+    g_assert_false(fs_parse_checksum_line("abc  short", &h, &n));
+    g_assert_false(fs_parse_checksum_line(
+        "d41d8cd98f00b204e9800998ecf8427e nospace", &h, &n));
+    g_assert_null(h); g_assert_null(n);
+
+    GChecksumType t;
+    g_assert_true(fs_checksum_type_for_hex(64, &t));
+    g_assert_cmpint(t, ==, G_CHECKSUM_SHA256);
+    g_assert_false(fs_checksum_type_for_hex(10, &t));
+}
+
+static void test_checksum_file(void)
+{
+    gchar *root = tmp_root();
+    gchar *f = g_build_filename(root, "abc.txt", NULL);
+    write_file(f, "abc");
+    FsCtx ctx = { 0 };
+    gchar *s = fs_checksum_file(&ctx, f, G_CHECKSUM_SHA256);
+    g_assert_cmpstr(s, ==,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    g_free(s);
+    s = fs_checksum_file(&ctx, f, G_CHECKSUM_MD5);
+    g_assert_cmpstr(s, ==, "900150983cd24fb0d6963f7d28e17f72");
+    g_free(s);
+    gchar *missing = g_build_filename(root, "nope", NULL);
+    g_assert_null(fs_checksum_file(&ctx, missing, G_CHECKSUM_MD5));
+    g_assert_nonnull(ctx.error);
+    fs_ctx_clear(&ctx);
+    g_unlink(f);
+    g_rmdir(root);
+    g_free(missing); g_free(f); g_free(root);
+}
+
+/* st_size 0 but content (procfs): copy_file_range copies nothing there –
+ * the read/write fallback must still copy the text */
+static void test_copy_virtual_file(void)
+{
+    gchar *root = tmp_root();
+    gchar *dst = g_build_filename(root, "status", NULL);
+    FsCtx ctx = { 0 };
+    g_assert_cmpint(fs_copy(&ctx, "/proc/self/status", dst), ==, FS_OK);
+    gchar *s = read_file(dst);
+    g_assert_nonnull(strstr(s, "Name:"));
+    g_free(s);
+    fs_ctx_clear(&ctx);
+    g_unlink(dst);
+    g_rmdir(root);
+    g_free(dst); g_free(root);
+}
+
+static void test_net_uri(void)
+{
+    gchar *u;
+    u = fs_net_normalize_uri("  nas/share "); g_assert_cmpstr(u, ==, "smb://nas/share"); g_free(u);
+    u = fs_net_normalize_uri("//nas/share");  g_assert_cmpstr(u, ==, "smb://nas/share"); g_free(u);
+    u = fs_net_normalize_uri("\\\\nas\\share"); g_assert_cmpstr(u, ==, "smb://nas/share"); g_free(u);
+    u = fs_net_normalize_uri("davs://h/x");   g_assert_cmpstr(u, ==, "davs://h/x"); g_free(u);
+    g_assert_null(fs_net_normalize_uri("file:///etc"));
+    g_assert_null(fs_net_normalize_uri("   "));
+}
+
+static void test_compare(void)
+{
+    g_assert_cmpint(fs_compare_files(FALSE, 1, 100, 0, 0, 2), ==, FS_CMP_ONLY);
+    g_assert_cmpint(fs_compare_files(TRUE, 1, 100, 1, 101, 2), ==, FS_CMP_SAME);
+    g_assert_cmpint(fs_compare_files(TRUE, 1, 100, 2, 100, 2), ==, FS_CMP_DIFFERENT);
+    g_assert_cmpint(fs_compare_files(TRUE, 1, 200, 1, 100, 2), ==, FS_CMP_NEWER);
+    g_assert_cmpint(fs_compare_files(TRUE, 1, 100, 1, 200, 2), ==, FS_CMP_OLDER);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -813,6 +905,11 @@ int main(int argc, char **argv)
     g_test_add_func("/util/parse-size",        test_parse_size);
     g_test_add_func("/util/fmt-date",          test_fmt_date);
     g_test_add_func("/util/relpath-safe",      test_relpath_safe);
+    g_test_add_func("/util/checksum-parse",    test_checksum_parse);
+    g_test_add_func("/util/compare",           test_compare);
+    g_test_add_func("/util/net-uri",           test_net_uri);
+    g_test_add_func("/fsops/checksum-file",    test_checksum_file);
+    g_test_add_func("/fsops/copy-virtual",     test_copy_virtual_file);
     g_test_add_func("/fsops/copy-tree",        test_copy_tree);
     g_test_add_func("/fsops/copy-into-itself", test_copy_into_itself);
     g_test_add_func("/fsops/copy-same-file",   test_copy_same_file);

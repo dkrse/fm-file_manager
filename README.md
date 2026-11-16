@@ -46,6 +46,12 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — any number of named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; Save with a new name adds a connection, the same name updates it, New clears the form, Remove deletes the selected one; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates (add/remove/update individual files, no full reload)
+- **Compare / synchronize directories** — Alt+C marks in both panels the files that are missing on the other side or newer (2 s tolerance for FAT); then copy left → right, right → left or both ways in one step (local and SFTP); files with the same time but a different size are reported, not marked
+- **Compare files** — Alt+D on two marked files or the cursor file of each panel: opens meld / kdiff3 / kompare / diffuse (or the program set in Settings → System → Compare tool), otherwise a built-in coloured unified diff
+- **Quick view** — Ctrl+Q shows the file under the cursor in the other panel: text (first 512 KB), images, directory summary; follows the cursor
+- **Background operations** — local copy / move / delete can be sent to the background ("Background" button in the progress window); further operations queue up behind it, the status bar shows the progress, Ctrl+J shows the window again; closing the main window waits for running jobs
+- **Checksums** — Alt+K creates MD5 / SHA-1 / SHA-256 / SHA-512 sums of the marked files (directories recursively), copy them or save as `.sha256` …; Alt+Shift+K verifies a checksum file (GNU and BSD format) and lists failed / missing files first
+- **Network locations** — Ctrl+N connects to `smb://`, `ftp://`, `dav(s)://`, `sftp://`, `nfs://` … through GIO/gvfs (password dialog, keyring); the panel opens the gvfs FUSE path, so every operation works there; last 10 addresses remembered; ⏏ in the device picker disconnects (needs gvfs + gvfs-fuse, standard on GNOME/Xfce/Cinnamon)
 - **Remembered window size** — the main window opens with the size (and maximized state) it had when it was last closed
 - **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
 - **Dark / Light / System theme** — runtime switching via Settings → System (libadwaita); "System" follows the desktop light/dark setting and switches live when it changes; colors auto-adapt (directories, symlinks, marks, editor scheme)
@@ -98,6 +104,12 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Alt+F1 / Alt+F2 | Devices for the left / right panel |
 | Alt+E | Extract archive |
 | Alt+P | Create archive (pack) |
+| Ctrl+Q | Quick view in the other panel |
+| Alt+C | Compare / synchronize directories |
+| Alt+D | Compare two files |
+| Alt+K / Alt+Shift+K | Create / verify checksums |
+| Ctrl+N | Connect to server (SMB, FTP, WebDAV …) |
+| Ctrl+J | Show background jobs |
 
 ### Editor / Viewer
 | Key | Action |
@@ -117,6 +129,8 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - libssh2 (optional — for SFTP panel)
 - gtksourceview-5 (optional — for full syntax highlighting)
 - libarchive (optional — for browsing archives as directories)
+- gvfs + gvfs-fuse (optional, at run time — for Ctrl+N network locations)
+- diffutils (optional — built-in file compare); meld / kdiff3 for a graphical one
 
 ### Archive tools (optional, for extract/pack)
 
@@ -161,7 +175,7 @@ make clean            # clean build artifacts
 make test             # unit tests of the core: file operations, archives, content search, size parsing (no display needed)
 make test-asan        # the same under AddressSanitizer + UBSan
 make test-sftp        # SFTP tests against a private throwaway sshd (skipped without sshd)
-make test-gui         # GUI tests (tabs, SFTP tabs, devices) headless on broadway; SAN=1 for ASan
+make test-gui         # GUI tests (tabs, SFTP tabs, devices, compare, quick view, job queue) headless on broadway; SAN=1 for ASan (library caches suppressed via tests/lsan.supp)
 make debug            # debug build with sanitizers (build-debug/fm)
 ```
 
@@ -173,12 +187,19 @@ CI (`.github/workflows/ci.yml`) builds with `-Werror`, runs the tests (also unde
 include/fm.h        — shared types and declarations
 include/util.h      — GLib-only helpers (formatting, path safety, archive types, clipboard parsing)
 include/fsops.h     — file operation engine API (thread-safe, GTK-free)
-src/main.c          — window, panels, keys, CSS, filter, panel + context menus
+src/main.c          — window, panels, CSS, filter, application start
+src/tabs.c          — panel tabs
+src/menus.c         — hamburger menu, context menu, "Open with", file mask
+src/keys.c          — F-key toolbar, global key handler
+src/compare.c       — compare / synchronize directories, compare files
+src/quickview.c     — quick view (Ctrl+Q)
+src/checksum.c      — create / verify checksums
+src/netmount.c      — network locations via GIO/gvfs (Ctrl+N)
 src/fileitem.c      — FileItem GObject (model for file list)
 src/fileops.c       — copy/move/delete/mkdir/new file/rename/properties (dialogs + jobs)
 src/fsops.c         — engine: local + SFTP copy/move/delete, conflicts, progress, cancel
 src/util.c          — pure helpers used by the engine and the UI
-src/job.c           — worker thread + modal progress dialog + overwrite prompt
+src/job.c           — worker thread + progress dialog (modal or background, queued) + overwrite prompt
 src/dialogs.c       — shared dialogs (destination, text entry, multi-button choice)
 src/archive.c       — extract / pack via tar, zip, 7z, unrar
 src/arcfs.c         — archive listing / extraction via libarchive (GLib-only)

@@ -43,6 +43,11 @@ struct Job {
     GMainLoop *loop;
     JobFunc    fn;
     gpointer   data;
+    /* background (local operations only – SFTP jobs hold the session) */
+    gboolean   allow_background; /* set by the caller before job_run    */
+    gboolean   background;       /* window hidden, progress in status   */
+    gboolean   worker_done;
+    GtkWidget *bg_btn;
 };
 
 Job     *job_new(FM *fm, const char *title);
@@ -56,5 +61,10 @@ void     job_set_total(Job *job, gint64 total);         /* → determinate (byte
 void     job_set_total_items(Job *job, gint64 n);       /* → determinate (items) */
 void     job_add_done(Job *job, gint64 bytes);
 gboolean job_cancelled(Job *job);
+
+/* Background jobs: the worker threads run one after another (a queue);
+ * while one runs in the background the main window stays usable. */
+guint    job_running_count(void);        /* jobs started and not finished */
+void     job_show_background(FM *fm);    /* Ctrl+J – show their windows   */
 
 #endif /* FM_JOB_H */

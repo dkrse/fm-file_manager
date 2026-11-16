@@ -7,7 +7,6 @@ static guint mark_changed_sig;
 static void file_item_finalize(GObject *obj)
 {
     FileItem *self = FILE_ITEM(obj);
-    g_free(self->fg_color);
     g_free(self->name);
     g_free(self->size);
     g_free(self->date);
@@ -45,7 +44,8 @@ FileItem *file_item_new_take(const char *icon_name, const char *name,
     item->size      = size;   /* takes ownership */
     item->date      = date;   /* takes ownership */
     item->is_dir    = is_dir;
-    item->fg_color  = g_strdup(fg_color);
+    /* a handful of distinct colours: interned, never freed */
+    item->fg_color  = (gchar *)(fg_color ? g_intern_string(fg_color) : NULL);
     item->weight    = weight;
     item->size_raw  = size_raw;
     item->date_raw  = date_raw;
@@ -61,6 +61,31 @@ FileItem *file_item_new(const char *icon_name, const char *name,
     return file_item_new_take(icon_name, name,
                               g_strdup(size), g_strdup(date),
                               is_dir, fg_color, weight, size_raw, date_raw);
+}
+
+/* Lazy size/date text: formatting 50k dates (localtime + strftime) at
+ * load time cost more than the rows ever shown – done on first bind. */
+FileItem *file_item_new_lazy(const char *icon_name, const char *name,
+                             gboolean is_dir, const char *fg_color, gint weight,
+                             gint64 size_raw, gint64 date_raw, gchar *sort_key)
+{
+    FileItem *item = file_item_new_take(icon_name, name, NULL, NULL, is_dir,
+                                        fg_color, weight, size_raw, date_raw);
+    item->sort_key = sort_key;   /* takes ownership, may be NULL */
+    return item;
+}
+
+const gchar *file_item_size_str(FileItem *item)
+{
+    if (!item->size)
+        item->size = item->is_dir ? g_strdup("<DIR>") : fmt_size(item->size_raw);
+    return item->size;
+}
+
+const gchar *file_item_date_str(FileItem *item)
+{
+    if (!item->date) item->date = fmt_date(item->date_raw);
+    return item->date;
 }
 
 const gchar *file_item_sort_key(FileItem *item)
@@ -83,7 +108,8 @@ void file_item_set_marked(FileItem *item, gboolean marked)
 /* Independent duplicate (marks are per panel, so the copy is unmarked) */
 FileItem *file_item_copy(FileItem *src)
 {
-    FileItem *it = file_item_new(src->icon_name, src->name, src->size, src->date,
+    FileItem *it = file_item_new(src->icon_name, src->name,
+                                 file_item_size_str(src), file_item_date_str(src),
                                  src->is_dir, src->fg_color, src->weight,
                                  src->size_raw, src->date_raw);
     it->dir_path = g_strdup(src->dir_path);

@@ -409,6 +409,12 @@ static const char *const help_keys[][2] = {
     { "Alt+F1 / Alt+F2",     "Devices – left / right panel" },
     { "Alt+←",          "Back to search results" },
     { "Ctrl+PgDn / Ctrl+Enter", "Go to found file / enter archive" },
+    { "Ctrl+Q",              "Quick view in the other panel" },
+    { "Alt+C",               "Compare / synchronize directories" },
+    { "Alt+D",               "Compare two files" },
+    { "Alt+K / Alt+Shift+K", "Create / verify checksums" },
+    { "Ctrl+N",              "Connect to server (SMB, FTP, WebDAV …)" },
+    { "Ctrl+J",              "Show background jobs" },
     { "F10",                 "Quit" },
 };
 
@@ -435,8 +441,12 @@ void help_show(FM *fm)
         gtk_widget_add_css_class(k, "heading");
         gtk_label_set_xalign(GTK_LABEL(k), 0);
         gtk_label_set_xalign(GTK_LABEL(v), 0);
-        gtk_grid_attach(GTK_GRID(grid), k, 0, (int)i, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), v, 1, (int)i, 1, 1);
+        /* two column pairs keep the window short */
+        gsize half = (G_N_ELEMENTS(help_keys) + 1) / 2;
+        int col = i < half ? 0 : 2, row = (int)(i < half ? i : i - half);
+        if (col) gtk_widget_set_margin_start(k, 24);
+        gtk_grid_attach(GTK_GRID(grid), k, col,     row, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), v, col + 1, row, 1, 1);
     }
     gtk_window_set_child(GTK_WINDOW(win), grid);
 

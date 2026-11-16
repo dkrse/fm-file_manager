@@ -260,7 +260,7 @@ static gboolean on_viewer_key_press(GtkEventControllerKey *ctrl,
 }
 
 /* Check if filename has an image extension */
-static gboolean is_image_file(const char *name)
+gboolean viewer_is_image(const char *name)
 {
     const char *dot = strrchr(name, '.');
     if (!dot) return FALSE;
@@ -355,7 +355,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     }
 
     /* Image preview — local files only, when enabled */
-    if (fm->viewer_image_preview && (path || !p->ssh_conn) && is_image_file(name)) {
+    if (fm->viewer_image_preview && (path || !p->ssh_conn) && viewer_is_image(name)) {
         gchar *fullpath = path ? g_strdup(path) : panel_cursor_fullpath(p);
         if (fullpath) {
             struct stat st;
@@ -531,6 +531,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     }
     ctx.buffer = GTK_TEXT_BUFFER(_vsbuf);
     ctx.text_view = gtk_source_view_new_with_buffer(_vsbuf);
+    g_object_unref(_vsbuf);         /* the view keeps it alive */
     gtk_widget_add_css_class(ctx.text_view, "fm-viewer");
     gtk_source_view_set_show_line_numbers(GTK_SOURCE_VIEW(ctx.text_view), fm->viewer_line_numbers);
     gtk_text_view_set_editable(GTK_TEXT_VIEW(ctx.text_view), FALSE);

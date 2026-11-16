@@ -37,13 +37,9 @@ FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st)
         fg = fm_exec_color(fm);
     }
 
-    /* file_item_new_take takes ownership of size/date strings */
-    FileItem *fi = file_item_new_take(icon_for_entry(name, is_dir, is_link, is_exec),
-                                      name,
-                                      is_dir ? g_strdup("<DIR>") : fmt_size(st->st_size),
-                                      fmt_date(st->st_mtime),
-                                      is_dir, fg, wt,
-                                      (gint64)st->st_size, (gint64)st->st_mtime);
+    FileItem *fi = file_item_new_lazy(icon_for_entry(name, is_dir, is_link, is_exec),
+                                      name, is_dir, fg, wt,
+                                      (gint64)st->st_size, (gint64)st->st_mtime, NULL);
     return fi;
 }
 

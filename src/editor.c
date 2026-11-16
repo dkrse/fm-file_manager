@@ -1162,11 +1162,13 @@ void editor_show_path(FM *fm, const char *path)
     }
     ctx->buffer    = GTK_TEXT_BUFFER(_sbuf);
     ctx->text_view = gtk_source_view_new_with_buffer(_sbuf);
+    g_object_unref(_sbuf);          /* the view keeps it alive */
     gtk_source_view_set_tab_width(GTK_SOURCE_VIEW(ctx->text_view), 4);
     gtk_source_view_set_highlight_current_line(GTK_SOURCE_VIEW(ctx->text_view), TRUE);
 #else
     ctx->buffer    = gtk_text_buffer_new(NULL);
     ctx->text_view = gtk_text_view_new_with_buffer(ctx->buffer);
+    g_object_unref(ctx->buffer);    /* the view keeps it alive */
 #endif
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ctx->text_view), GTK_WRAP_NONE);
     gtk_text_view_set_left_margin(GTK_TEXT_VIEW(ctx->text_view), 4);

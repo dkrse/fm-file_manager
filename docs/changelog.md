@@ -1,5 +1,37 @@
 # Changelog
 
+## [3.5.0] - 2026-11-16
+
+**New:**
+- Compare / synchronize directories (Alt+C): marks missing and newer files in both panels, copies them left → right, right → left or both ways (local and SFTP)
+- Compare files (Alt+D): external tool (meld, kdiff3, kompare, diffuse or Settings → System → Compare tool) or a built-in coloured diff
+- Quick view (Ctrl+Q): text, images and directory summary of the cursor file in the other panel
+- Background operations: local copy / move / delete can run in the background; further jobs queue up behind them; Ctrl+J shows them; the main window does not close while jobs run
+- Checksums: create MD5 / SHA-1 / SHA-256 / SHA-512 (Alt+K), verify GNU / BSD checksum files (Alt+Shift+K)
+- Network locations (Ctrl+N): SMB, FTP, WebDAV, NFS … through GIO/gvfs, opened via the gvfs FUSE path; last 10 addresses remembered
+- Panel menu → Tools submenu with the new functions; F1 help in two columns
+
+**Performance** (50 500-entry directory):
+- Loading a directory 216 → 84 ms: no list filter while no file mask is set (it ran a callback per item, ~75 ms); `fstatat` and sort keys computed in up to 8 threads; size/date text formatted only for rows that are shown; colours interned
+- Selecting / marking / "selection paths" ~4× faster (48 → 12 ms) and jump-to-name 39 → 7 ms – all list scans profit from the unfiltered model
+- Space (mark) 2.2 → 0.3 ms: the status bar sums marked sizes through a name index instead of scanning every item
+- Rows are drawn with shared Pango attribute lists instead of building and parsing markup for 3 labels per row
+- Local copy uses `copy_file_range` (in-kernel; reflink on btrfs/XFS, server-side on NFS/SMB) with read/write as fallback
+- SFTP listing: directory colour computed once per listing instead of per entry; lazy size/date text (also for search results)
+
+**Fixes:**
+- Memory: editor and viewer leaked their text buffer (the whole file) on every open
+- Starting the program a second time rebuilt the whole UI in the running instance (leaking the first one) – it now just raises the window
+- Context-menu popover was never unparented; an SSH connection finishing after exit was never freed
+- Terminal on an SFTP panel: the remote directory was quoted twice, so paths with spaces, `;` or `'` broke the `cd` (or ran a command on the server)
+
+**Code:**
+- `main.c` split: tabs → `tabs.c`, menus → `menus.c`, keys and F-key toolbar → `keys.c`
+
+**Tests:**
+- Unit tests: checksum file parsing, file checksums, compare logic, network address normalisation (33 core tests)
+- GUI tests: compare directories, quick view, background job queue (203 checks); CI runs the GUI tests
+
 ## [3.3.2] - 2026-11-08
 
 **Changes:**

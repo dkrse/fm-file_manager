@@ -23,6 +23,7 @@
 #define KEY_SHOW_HIDDEN    "show_hidden"
 #define KEY_SHOW_HOVER     "show_hover"
 #define KEY_TERMINAL       "terminal_app"
+#define KEY_DIFF_TOOL      "diff_tool"
 #define KEY_CURSOR_COLOR    "cursor_color"
 #define KEY_CURSOR_OUTLINE  "cursor_outline"
 #define KEY_VIEWER_FAMILY   "viewer_font_family"
@@ -435,6 +436,10 @@ void settings_load(FM *fm)
         if (!fm->terminal_app) fm->terminal_app = g_strdup(DEFAULT_TERMINAL);
     }
 
+    /* empty = auto-detect meld / kdiff3 / … at use, built-in diff otherwise */
+    g_free(fm->diff_tool);
+    fm->diff_tool = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_DIFF_TOOL, NULL);
+
     g_free(fm->cursor_color);
     fm->cursor_color = g_key_file_get_string(kf, SETTINGS_GROUP_DISPLAY, KEY_CURSOR_COLOR, NULL);
     if (!fm->cursor_color || !fm->cursor_color[0]) {
@@ -575,6 +580,8 @@ void settings_save(FM *fm)
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SHOW_HOVER, fm->show_hover);
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_TERMINAL,
                           fm->terminal_app ? fm->terminal_app : DEFAULT_TERMINAL);
+    g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_DIFF_TOOL,
+                          fm->diff_tool ? fm->diff_tool : "");
     g_key_file_set_string(kf, SETTINGS_GROUP_DISPLAY, KEY_CURSOR_COLOR,
                           fm->cursor_color ? fm->cursor_color : DEFAULT_CURSOR_COLOR);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_CURSOR_OUTLINE, fm->cursor_outline);
@@ -659,6 +666,36 @@ void settings_save_window(int width, int height, gboolean maximized)
     GError *err = NULL;
     if (!g_key_file_save_to_file(kf, path, &err)) {
         g_warning("settings_save_window: %s", err ? err->message : "?");
+        g_clear_error(&err);
+    }
+    g_key_file_free(kf);
+    g_free(path);
+}
+
+/* Single string value outside FM's fields (e.g. [network] recent) */
+gchar *settings_get_string(const char *group, const char *key)
+{
+    gchar *path = settings_path();
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL);
+    gchar *v = g_key_file_get_string(kf, group, key, NULL);
+    g_key_file_free(kf);
+    g_free(path);
+    return v;
+}
+
+void settings_set_string(const char *group, const char *key, const char *value)
+{
+    gchar *path = settings_path();
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL);
+    g_key_file_set_string(kf, group, key, value ? value : "");
+    GError *err = NULL;
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        g_warning("settings_set_string: %s", err ? err->message : "?");
         g_clear_error(&err);
     }
     g_key_file_free(kf);
@@ -1302,6 +1339,19 @@ void settings_dialog(FM *fm)
     gtk_grid_attach(GTK_GRID(g4), lbl_term,   0, row, 1, 1);
     gtk_grid_attach(GTK_GRID(g4), entry_term, 1, row++, 1, 1);
 
+    GtkWidget *lbl_diff = gtk_label_new("Compare tool:");
+    gtk_widget_set_halign(lbl_diff, GTK_ALIGN_END);
+    GtkWidget *entry_diff = gtk_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(entry_diff), fm->diff_tool ? fm->diff_tool : "");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry_diff), "auto (meld, kdiff3, kompare…) or built-in");
+    gtk_widget_set_hexpand(entry_diff, TRUE);
+    gtk_widget_set_tooltip_text(entry_diff,
+        "Program for Alt+D (compare files), called as: tool FILE1 FILE2.\n"
+        "Empty = first of meld, kdiff3, kompare, diffuse found, else the built-in viewer.\n"
+        "\"builtin\" = always the built-in viewer.");
+    gtk_grid_attach(GTK_GRID(g4), lbl_diff,   0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(g4), entry_diff, 1, row++, 1, 1);
+
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), g4,
                              gtk_label_new("System"));
 
@@ -1420,6 +1470,8 @@ void settings_dialog(FM *fm)
         const gchar *term_txt = gtk_editable_get_text(GTK_EDITABLE(entry_term));
         g_free(fm->terminal_app);
         fm->terminal_app = g_strdup(term_txt && term_txt[0] ? term_txt : DEFAULT_TERMINAL);
+        g_free(fm->diff_tool);
+        fm->diff_tool = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(entry_diff))));
 
         /* editor */
         PangoFontDescription *efd_result =

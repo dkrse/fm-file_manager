@@ -254,6 +254,38 @@ gboolean job_cancelled(Job *job)
  *  Dialog
  * ─────────────────────────────────────────────────────────────────── */
 
+/* All workers take this lock for their whole run: a job started while
+ * another one runs in the background waits for it (queue). */
+static GMutex  queue_lock;
+static GList  *running_jobs;            /* Job*, main thread only */
+
+guint job_running_count(void)
+{
+    return g_list_length(running_jobs);
+}
+
+void job_show_background(FM *fm)
+{
+    guint n = 0;
+    for (GList *l = running_jobs; l; l = l->next) {
+        Job *job = l->data;
+        if (!job->background) continue;
+        gtk_window_present(GTK_WINDOW(job->window));
+        n++;
+    }
+    if (!n) fm_status(fm, "No background jobs");
+}
+
+static void on_job_background(GtkButton *b, Job *job)
+{
+    (void)b;
+    job->background = TRUE;
+    gtk_window_set_modal(GTK_WINDOW(job->window), FALSE);
+    gtk_widget_set_visible(job->window, FALSE);
+    gtk_widget_set_visible(job->bg_btn, FALSE);
+    fm_refocus_if_lost(job->fm);
+}
+
 static void on_job_cancel(GtkButton *b, Job *job)
 {
     fs_cancel(&job->ctx);
@@ -264,6 +296,8 @@ static void on_job_cancel(GtkButton *b, Job *job)
 static gboolean on_job_close(GtkWindow *w, Job *job)
 {
     (void)w;
+    /* a background job's window only hides; Cancel cancels */
+    if (job->background) { gtk_widget_set_visible(job->window, FALSE); return TRUE; }
     fs_cancel(&job->ctx);
     return TRUE;          /* window is destroyed by job_free */
 }
@@ -330,6 +364,15 @@ static gboolean job_tick(gpointer d)
         g_free(s_done); g_free(s_total);
     }
     gtk_label_set_text(GTK_LABEL(job->detail_lbl), detail ? detail : "");
+    if (job->background && !job->worker_done) {
+        guint queued = job_running_count() - 1;
+        const char *bar_txt = gtk_progress_bar_get_text(GTK_PROGRESS_BAR(job->bar));
+        gchar *q = queued ? g_strdup_printf("  (+%u queued)", queued) : g_strdup("");
+        fm_status(job->fm, "Background: %s %s  %s%s    Ctrl+J shows it",
+                  phase ? phase : "", det && bar_txt ? bar_txt : "",
+                  detail ? detail : "", q);
+        g_free(q);
+    }
     g_free(detail);
     g_free(phase); g_free(from); g_free(to);
     return G_SOURCE_CONTINUE;
@@ -431,7 +474,20 @@ Job *job_new(FM *fm, const char *title)
     gtk_box_append(GTK_BOX(vbox), job->file_bar);
     gtk_box_append(GTK_BOX(vbox), job->bar);
     gtk_box_append(GTK_BOX(vbox), job->detail_lbl);
-    gtk_box_append(GTK_BOX(vbox), cancel_btn);
+    job->bg_btn = gtk_button_new_with_label("Background");
+    gtk_widget_set_tooltip_text(job->bg_btn,
+        "Keep working while this runs – Ctrl+J shows the window again");
+    gtk_widget_set_size_request(job->bg_btn, 100, -1);
+    gtk_widget_set_visible(job->bg_btn, FALSE);   /* job_run decides */
+    g_signal_connect(job->bg_btn, "clicked", G_CALLBACK(on_job_background), job);
+
+    GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(btn_row, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(btn_row, 4);
+    gtk_widget_set_margin_top(cancel_btn, 0);
+    gtk_box_append(GTK_BOX(btn_row), job->bg_btn);
+    gtk_box_append(GTK_BOX(btn_row), cancel_btn);
+    gtk_box_append(GTK_BOX(vbox), btn_row);
     gtk_window_set_child(GTK_WINDOW(job->window), vbox);
     g_signal_connect(job->window, "close-request", G_CALLBACK(on_job_close), job);
 
@@ -444,6 +500,17 @@ Job *job_new(FM *fm, const char *title)
 static gboolean job_finished_idle(gpointer d)
 {
     Job *job = d;
+    job->worker_done = TRUE;
+    if (job->background) {
+        /* the caller's report may wait for a job started later (nested
+         * loops unwind in order) – refresh and tell the user right now */
+        gtk_widget_set_visible(job->window, FALSE);
+        panel_reload(&job->fm->panels[0]);
+        panel_reload(&job->fm->panels[1]);
+        fm_status(job->fm, "Background job finished: %s%s",
+                  job->phase ? job->phase : "",
+                  job->ctx.error ? " (with errors)" : "");
+    }
     g_main_loop_quit(job->loop);
     return G_SOURCE_REMOVE;
 }
@@ -451,7 +518,20 @@ static gboolean job_finished_idle(gpointer d)
 static gpointer job_thread(gpointer d)
 {
     Job *job = d;
-    job->fn(job, job->data);
+    if (!g_mutex_trylock(&queue_lock)) {
+        g_mutex_lock(&job->lock);
+        gchar *title = g_strdup(job->phase);
+        g_mutex_unlock(&job->lock);
+        job_set_phase(job, "Waiting for the previous job…");
+        g_mutex_lock(&queue_lock);
+        job_set_phase(job, title);
+        g_free(title);
+        g_mutex_lock(&job->lock);
+        job->start_time = g_get_monotonic_time();
+        g_mutex_unlock(&job->lock);
+    }
+    if (!fs_cancelled(&job->ctx)) job->fn(job, job->data);
+    g_mutex_unlock(&queue_lock);
     g_idle_add(job_finished_idle, job);
     return NULL;
 }
@@ -462,13 +542,17 @@ void job_run(Job *job, JobFunc fn, gpointer data)
     job->data = data;
     job->loop = g_main_loop_new(NULL, FALSE);
 
-    /* Modal: the panels cannot start a second operation meanwhile */
+    /* Modal by default; "Background" (local operations only) lets the
+     * user go on – a second job then queues behind this one */
+    gtk_widget_set_visible(job->bg_btn, job->allow_background);
+    running_jobs = g_list_prepend(running_jobs, job);
     gtk_window_present(GTK_WINDOW(job->window));
     job->timer_id = g_timeout_add(100, job_tick, job);
 
     GThread *t = g_thread_new("fm-job", job_thread, job);
     g_main_loop_run(job->loop);
     g_thread_join(t);
+    running_jobs = g_list_remove(running_jobs, job);
 
     g_source_remove(job->timer_id);
     job->timer_id = 0;

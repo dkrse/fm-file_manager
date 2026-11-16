@@ -80,4 +80,34 @@ gchar *fs_file_contains(const char *path, const char *needle_lower,
 /* "1.5" + unit (0=B 1=KB 2=MB 3=GB) → bytes; -1 if empty/invalid */
 gint64 fs_parse_size(const char *text, int unit_idx);
 
+/* ── checksums ────────────────────────────────────────────────────── */
+
+/* One line of a checksum file: GNU "hash  name" / "hash *name" or BSD
+ * "SHA256 (name) = hash".  Comments and blank lines → FALSE.  The hash
+ * is returned lower-case; both outputs g_free(). */
+gboolean fs_parse_checksum_line(const char *line, gchar **hash, gchar **name);
+/* Algorithm from the length of a hex digest (32 MD5, 40 SHA-1, 64
+ * SHA-256, 128 SHA-512); FALSE for anything else */
+gboolean fs_checksum_type_for_hex(gsize len, GChecksumType *type);
+const char *fs_checksum_name(GChecksumType type);      /* "SHA256" … */
+const char *fs_checksum_ext(GChecksumType type);       /* ".sha256" … */
+
+/* ── directory compare ────────────────────────────────────────────── */
+typedef enum {
+    FS_CMP_SAME,       /* same size and time                         */
+    FS_CMP_NEWER,      /* this side is newer                         */
+    FS_CMP_OLDER,      /* the other side is newer                    */
+    FS_CMP_DIFFERENT,  /* same time, different size                  */
+    FS_CMP_ONLY,       /* missing on the other side                  */
+} FsCmp;
+/* Compare one file with its namesake on the other side.  Times within
+ * `tolerance` seconds count as equal (FAT has 2 s resolution). */
+FsCmp fs_compare_files(gboolean other_exists, gint64 size, gint64 mtime,
+                       gint64 other_size, gint64 other_mtime, gint64 tolerance);
+
+/* ── network locations (Ctrl+N) ───────────────────────────────────── */
+/* "server/share" and "//server/share" → "smb://server/share", URIs with
+ * a scheme unchanged; empty, file:// → NULL.  Caller frees. */
+gchar *fs_net_normalize_uri(const char *text);
+
 #endif /* FM_UTIL_H */

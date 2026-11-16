@@ -235,6 +235,7 @@ static Panel *panel_of_conn(FM *fm, SshConn *c)
 static void run_transfer(FM *fm, Xfer *x)
 {
     Job *job = job_new(fm, x->move ? "Moving" : "Copying");
+    job->allow_background = !x->sconn && !x->dconn;
     job_run(job, xfer_worker, x);
     if (job_cancelled(job)) x->worst = fs_worst(x->worst, FS_CANCELLED);
 
@@ -462,6 +463,7 @@ static void delete_impl(FM *fm, gboolean permanent)
 
     DelJob dj = { .paths = paths, .conn = p->ssh_conn, .trash = trash };
     Job *job = job_new(fm, dj.trash ? "Moving to trash" : "Deleting");
+    job->allow_background = !dj.conn;
     job_run(job, delete_worker, &dj);
     report_result(fm, dj.trash ? "Trashed" : "Deleted", job, dj.ok, dj.skipped, dj.fail);
     job_free(job);
