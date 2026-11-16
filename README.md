@@ -16,8 +16,14 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | F3 — viewer | Tabs (left) and a zip archive opened as a directory (right) |
 | ![Dark theme with tabs](screenshots/08.png) | ![Search dialog](screenshots/09.png) |
 | Dark theme with tabs in both panels | F2 — search by name, content and size |
-| ![Settings](screenshots/10.png) | |
-| Settings — theme and terminal | |
+| ![Settings](screenshots/10.png) | ![Synchronize directories](screenshots/12.png) |
+| Settings — theme and terminal | Alt+C — synchronize after comparing |
+| ![Compare directories](screenshots/11.png) | ![Quick view](screenshots/13.png) |
+| Alt+C — compare directories: missing and newer files marked in both panels | Ctrl+Q — quick view of the file under the cursor in the other panel |
+| ![Compare files](screenshots/14.png) | ![Verify checksums](screenshots/15.png) |
+| Alt+D — compare two files (built-in diff, or meld / kdiff3) | Alt+Shift+K — verify a checksum file, problems listed first |
+| ![Connect to server](screenshots/16.png) | ![Background copy](screenshots/17.png) |
+| Ctrl+N — connect to SMB, FTP, WebDAV, NFS … | Copy with the Background button – keep working, Ctrl+J shows it again |
 
 ## Features
 
