@@ -34,6 +34,7 @@
 #define KEY_EDITOR_GUI_SIZE   "editor_gui_font_size"
 #define KEY_EDITOR_LINENUM      "editor_line_numbers"
 #define KEY_EDITOR_LINENUM_SIZE  "editor_linenum_font_size"
+#define KEY_FONT_UNITS           "font_units"   /* "pt" since sizes moved from px */
 #define KEY_SYNTAX_HIGHLIGHT         "syntax_highlight"
 #define KEY_VIEWER_SYNTAX_HIGHLIGHT  "viewer_syntax_highlight"
 #define KEY_VIEWER_LINE_NUMBERS      "viewer_line_numbers"
@@ -225,9 +226,9 @@ void apply_editor_css(FM *fm)
     int gfsz = fm->editor_gui_font_size > 0 ? fm->editor_gui_font_size : DEFAULT_EDITOR_GUI_SIZE;
     gchar *css = g_strdup_printf(
         "textview.fm-editor, textview.fm-editor > text {"
-        "  font-family: %s; font-size: %dpx; }"
+        "  font-family: %s; font-size: %dpt; }"
         "label.fm-editor-status {"
-        "  font-family: %s; font-size: %dpx; }",
+        "  font-family: %s; font-size: %dpt; }",
         fam, fsz, gfam, gfsz);
     gtk_css_provider_load_from_string(fm->editor_css_provider, css);
     g_free(css);
@@ -242,7 +243,7 @@ void apply_viewer_css(FM *fm)
     int fsz = fm->viewer_font_size > 0 ? fm->viewer_font_size : DEFAULT_VIEWER_SIZE;
     gchar *css = g_strdup_printf(
         "textview.fm-viewer, textview.fm-viewer > text {"
-        "  font-family: %s; font-size: %dpx; }",
+        "  font-family: %s; font-size: %dpt; }",
         fam, fsz);
     gtk_css_provider_load_from_string(fm->viewer_css_provider, css);
     g_free(css);
@@ -253,7 +254,7 @@ static void apply_font_css(FM *fm)
 {
     if (!fm->font_css_provider) return;
     gchar *css = g_strdup_printf(
-        "columnview { font-family: %s; font-size: %dpx; }",
+        "columnview { font-family: %s; font-size: %dpt; }",
         fm->font_family ? fm->font_family : DEFAULT_FONT_FAMILY,
         fm->font_size   > 0 ? fm->font_size : DEFAULT_FONT_SIZE);
     gtk_css_provider_load_from_string(fm->font_css_provider, css);
@@ -306,7 +307,7 @@ static void apply_gui_css(FM *fm)
     }
 
     gchar *css = g_strdup_printf(
-        "* { font-family: %s; font-size: %dpx; }"
+        "* { font-family: %s; font-size: %dpt; }"
         "entry.active-panel {"
         "  background-color: %s;"
         "  color: %s;"
@@ -377,6 +378,18 @@ void settings_apply_columns(FM *fm)
         if (c) { gtk_column_view_column_set_fixed_width(c, dw); g_object_unref(c); }
     }
 }
+
+/* Font size from a font dialog in points; absolute (pixel) sizes are converted
+ * assuming 96 dpi (1pt = 4/3 px). */
+static int font_desc_size_pt(const PangoFontDescription *fd)
+{
+    double sz = (double)pango_font_description_get_size(fd) / PANGO_SCALE;
+    if (pango_font_description_get_size_is_absolute(fd)) sz *= 0.75;
+    return (int)(sz + 0.5);
+}
+
+/* Old settings stored CSS pixel sizes; convert to points once, keeping the look */
+static int px_to_pt(int px) { return px > 0 ? MAX(1, (int)(px * 0.75 + 0.5)) : px; }
 
 static int load_int(GKeyFile *kf, const char *key, int def)
 {
@@ -479,6 +492,15 @@ void settings_load(FM *fm)
     fm->editor_line_numbers = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_EDITOR_LINENUM, &lnerr);
     if (lnerr) { g_clear_error(&lnerr); fm->editor_line_numbers = TRUE; }
     fm->editor_linenum_font_size = load_int(kf, KEY_EDITOR_LINENUM_SIZE, DEFAULT_EDITOR_LINENUM_SIZE);
+
+    if (g_key_file_has_group(kf, SETTINGS_GROUP_DISPLAY) &&
+        !g_key_file_has_key(kf, SETTINGS_GROUP_DISPLAY, KEY_FONT_UNITS, NULL)) {
+        fm->font_size            = px_to_pt(fm->font_size);
+        fm->gui_font_size        = px_to_pt(fm->gui_font_size);
+        fm->viewer_font_size     = px_to_pt(fm->viewer_font_size);
+        fm->editor_font_size     = px_to_pt(fm->editor_font_size);
+        fm->editor_gui_font_size = px_to_pt(fm->editor_gui_font_size);
+    }
 
     GError *sherr2 = NULL;
     fm->syntax_highlight = g_key_file_get_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SYNTAX_HIGHLIGHT, &sherr2);
@@ -598,6 +620,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_EDITOR_GUI_SIZE,
                            fm->editor_gui_font_size > 0 ? fm->editor_gui_font_size : DEFAULT_EDITOR_GUI_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_EDITOR_LINENUM, fm->editor_line_numbers);
+    g_key_file_set_string (kf, SETTINGS_GROUP_DISPLAY, KEY_FONT_UNITS, "pt");
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_EDITOR_LINENUM_SIZE,
                            fm->editor_linenum_font_size > 0 ? fm->editor_linenum_font_size : DEFAULT_EDITOR_LINENUM_SIZE);
     g_key_file_set_boolean(kf, SETTINGS_GROUP_DISPLAY, KEY_SYNTAX_HIGHLIGHT, fm->syntax_highlight);
@@ -1389,7 +1412,7 @@ void settings_dialog(FM *fm)
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(panel_font_btn));
         if (pfd_result) {
             const gchar *family = pango_font_description_get_family(pfd_result);
-            gint size = pango_font_description_get_size(pfd_result) / PANGO_SCALE;
+            gint size = font_desc_size_pt(pfd_result);
             if (size <= 0) size = DEFAULT_FONT_SIZE;
             g_free(fm->font_family);
             fm->font_family = g_strdup(family ? family : DEFAULT_FONT_FAMILY);
@@ -1402,7 +1425,7 @@ void settings_dialog(FM *fm)
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(gui_font_btn));
         if (gfd_result) {
             const gchar *family = pango_font_description_get_family(gfd_result);
-            gint size = pango_font_description_get_size(gfd_result) / PANGO_SCALE;
+            gint size = font_desc_size_pt(gfd_result);
             if (size <= 0) size = DEFAULT_GUI_SIZE;
             g_free(fm->gui_font_family);
             fm->gui_font_family = g_strdup(family ? family : DEFAULT_GUI_FAMILY);
@@ -1478,7 +1501,7 @@ void settings_dialog(FM *fm)
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(editor_font_btn));
         if (efd_result) {
             const gchar *efamily = pango_font_description_get_family(efd_result);
-            gint esize = pango_font_description_get_size(efd_result) / PANGO_SCALE;
+            gint esize = font_desc_size_pt(efd_result);
             if (esize <= 0) esize = DEFAULT_EDITOR_SIZE;
             g_free(fm->editor_font_family);
             fm->editor_font_family = g_strdup(efamily ? efamily : DEFAULT_EDITOR_FAMILY);
@@ -1488,7 +1511,7 @@ void settings_dialog(FM *fm)
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(editor_gui_font_btn));
         if (egfd_result) {
             const gchar *egfamily = pango_font_description_get_family(egfd_result);
-            gint egsize = pango_font_description_get_size(egfd_result) / PANGO_SCALE;
+            gint egsize = font_desc_size_pt(egfd_result);
             if (egsize <= 0) egsize = DEFAULT_EDITOR_GUI_SIZE;
             g_free(fm->editor_gui_font_family);
             fm->editor_gui_font_family = g_strdup(egfamily ? egfamily : DEFAULT_EDITOR_GUI_FAMILY);
@@ -1532,7 +1555,7 @@ void settings_dialog(FM *fm)
             gtk_font_dialog_button_get_font_desc(GTK_FONT_DIALOG_BUTTON(viewer_font_btn));
         if (vfd_result) {
             const gchar *vfamily = pango_font_description_get_family(vfd_result);
-            gint vsize = pango_font_description_get_size(vfd_result) / PANGO_SCALE;
+            gint vsize = font_desc_size_pt(vfd_result);
             if (vsize <= 0) vsize = DEFAULT_VIEWER_SIZE;
             g_free(fm->viewer_font_family);
             fm->viewer_font_family = g_strdup(vfamily ? vfamily : DEFAULT_VIEWER_FAMILY);

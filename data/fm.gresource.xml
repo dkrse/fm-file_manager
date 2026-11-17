@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/sk/km/fm/language-specs">
+    <file alias="asm.lang">language-specs/asm.lang</file>
+    <file alias="nginx.lang">language-specs/nginx.lang</file>
+    <file alias="devicetree.lang">language-specs/devicetree.lang</file>
+    <file alias="kconfig.lang">language-specs/kconfig.lang</file>
+  </gresource>
+</gresources>

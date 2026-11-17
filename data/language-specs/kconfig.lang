@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Linux Kconfig – fm file manager -->
+<language id="kconfig" name="Kconfig" version="2.0" _section="Other">
+  <metadata>
+    <property name="globs">Kconfig;Kconfig.*;Config.in</property>
+    <property name="line-comment-start">#</property>
+  </metadata>
+  <styles>
+    <style id="comment" name="Comment" map-to="def:comment"/>
+    <style id="string"  name="String"  map-to="def:string"/>
+    <style id="keyword" name="Keyword" map-to="def:keyword"/>
+    <style id="type"    name="Type"    map-to="def:type"/>
+    <style id="symbol"  name="Symbol"  map-to="def:identifier"/>
+  </styles>
+  <definitions>
+    <context id="comment" style-ref="comment" end-at-line-end="true" class="comment"><start>#</start></context>
+    <context id="string" style-ref="string" end-at-line-end="true" class="string"><start>"</start><end>"</end></context>
+    <context id="keyword" style-ref="keyword">
+      <keyword>config</keyword><keyword>menuconfig</keyword><keyword>menu</keyword>
+      <keyword>endmenu</keyword><keyword>choice</keyword><keyword>endchoice</keyword>
+      <keyword>if</keyword><keyword>endif</keyword><keyword>source</keyword>
+      <keyword>rsource</keyword><keyword>osource</keyword><keyword>orsource</keyword>
+      <keyword>comment</keyword><keyword>mainmenu</keyword><keyword>depends</keyword>
+      <keyword>on</keyword><keyword>select</keyword><keyword>imply</keyword>
+      <keyword>default</keyword><keyword>range</keyword><keyword>prompt</keyword>
+      <keyword>help</keyword><keyword>visible</keyword><keyword>option</keyword>
+      <keyword>modules</keyword><keyword>optional</keyword>
+    </context>
+    <context id="type" style-ref="type">
+      <keyword>bool</keyword><keyword>tristate</keyword><keyword>string</keyword>
+      <keyword>hex</keyword><keyword>int</keyword><keyword>def_bool</keyword>
+      <keyword>def_tristate</keyword>
+    </context>
+    <context id="symbol" style-ref="symbol"><match>\b[A-Z][A-Z0-9_]+\b</match></context>
+    <context id="kconfig" class="no-spell-check">
+      <include>
+        <context ref="comment"/><context ref="string"/><context ref="keyword"/>
+        <context ref="type"/><context ref="symbol"/>
+      </include>
+    </context>
+  </definitions>
+</language>

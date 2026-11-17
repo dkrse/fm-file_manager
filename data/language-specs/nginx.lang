@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- nginx configuration – fm file manager -->
+<language id="nginx" name="nginx" version="2.0" _section="Other">
+  <metadata>
+    <property name="mimetypes">text/x-nginx-conf</property>
+    <property name="globs">nginx.conf;*.nginx;*.nginxconf</property>
+    <property name="line-comment-start">#</property>
+  </metadata>
+  <styles>
+    <style id="comment"  name="Comment"  map-to="def:comment"/>
+    <style id="string"   name="String"   map-to="def:string"/>
+    <style id="block"    name="Block"    map-to="def:keyword"/>
+    <style id="directive" name="Directive" map-to="def:function"/>
+    <style id="variable" name="Variable" map-to="def:identifier"/>
+    <style id="number"   name="Number"   map-to="def:decimal"/>
+    <style id="boolean"  name="Boolean"  map-to="def:boolean"/>
+  </styles>
+  <definitions>
+    <context id="comment" style-ref="comment" end-at-line-end="true" class="comment" class-disabled="no-spell-check"><start>#</start></context>
+    <context id="dq" style-ref="string" class="string"><start>"</start><end>"</end>
+      <include><context id="dq-var" style-ref="variable"><match>\$\{?\w+\}?</match></context></include></context>
+    <context id="sq" style-ref="string" class="string"><start>'</start><end>'</end></context>
+    <context id="block" style-ref="block">
+      <keyword>http</keyword><keyword>server</keyword><keyword>location</keyword>
+      <keyword>upstream</keyword><keyword>events</keyword><keyword>stream</keyword>
+      <keyword>mail</keyword><keyword>if</keyword><keyword>map</keyword>
+      <keyword>geo</keyword><keyword>types</keyword><keyword>limit_except</keyword>
+      <keyword>include</keyword>
+    </context>
+    <context id="directive"><match>^\s*(?P&lt;d&gt;[a-z_][a-z0-9_]*)</match><include><context sub-pattern="d" style-ref="directive"/></include></context>
+    <context id="variable" style-ref="variable"><match>\$\{?\w+\}?</match></context>
+    <context id="boolean" style-ref="boolean"><keyword>on</keyword><keyword>off</keyword></context>
+    <context id="number" style-ref="number"><match>\b[0-9]+[kmgsdhwy]?\b</match></context>
+    <context id="nginx" class="no-spell-check">
+      <include>
+        <context ref="comment"/><context ref="dq"/><context ref="sq"/>
+        <context ref="block"/><context ref="directive"/><context ref="variable"/>
+        <context ref="boolean"/><context ref="number"/>
+      </include>
+    </context>
+  </definitions>
+</language>

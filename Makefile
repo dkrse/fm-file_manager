@@ -98,6 +98,13 @@ ifeq ($(SAN),1)
 endif
 
 OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
+
+# Bundled GtkSourceView language specs (asm, nginx, …) compiled into the binary
+ifneq ($(strip $(_SV_LIBS)),)
+  RES_XML  := data/fm.gresource.xml
+  RES_DEPS := $(wildcard data/language-specs/*.lang)
+  OBJS     += $(BUILDDIR)/resources.o
+endif
 BIN    := $(BUILDDIR)/$(TARGET)
 
 .PHONY: all clean install user-install uninstall debug test test-asan test-sftp test-gui
@@ -113,6 +120,12 @@ $(BIN): $(OBJS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(HDRS) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILDDIR)/resources.c: $(RES_XML) $(RES_DEPS) | $(BUILDDIR)
+	glib-compile-resources --sourcedir=data --generate-source --target=$@ $(RES_XML)
+
+$(BUILDDIR)/resources.o: $(BUILDDIR)/resources.c
+	$(CC) $(CFLAGS) -Wno-overlength-strings -c $< -o $@
 
 debug:
 	$(MAKE) SAN=1 all

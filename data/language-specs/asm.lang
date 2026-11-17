@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Assembly (GNU as / AT&T and NASM / Intel syntax) – fm file manager -->
+<language id="asm" name="Assembly" version="2.0" _section="Source">
+  <metadata>
+    <property name="mimetypes">text/x-asm;text/x-nasm</property>
+    <property name="globs">*.asm;*.s;*.S;*.nasm;*.inc;*.a51;*.a65;*.x86</property>
+    <property name="line-comment-start">;</property>
+    <property name="block-comment-start">/*</property>
+    <property name="block-comment-end">*/</property>
+  </metadata>
+  <styles>
+    <style id="comment"     name="Comment"      map-to="def:comment"/>
+    <style id="string"      name="String"       map-to="def:string"/>
+    <style id="char"        name="Character"    map-to="def:character"/>
+    <style id="directive"   name="Directive"    map-to="def:preprocessor"/>
+    <style id="preproc"     name="Preprocessor" map-to="def:preprocessor"/>
+    <style id="label"       name="Label"        map-to="def:function"/>
+    <style id="register"    name="Register"     map-to="def:type"/>
+    <style id="keyword"     name="Keyword"      map-to="def:keyword"/>
+    <style id="decimal"     name="Decimal"      map-to="def:decimal"/>
+    <style id="hex"         name="Hex"          map-to="def:base-n-integer"/>
+  </styles>
+  <default-regex-options case-sensitive="false"/>
+  <definitions>
+    <context id="block-comment" style-ref="comment" class="comment" class-disabled="no-spell-check">
+      <start>/\*</start><end>\*/</end>
+    </context>
+    <!-- ';' (NASM/MASM), '#' at line start or after space (GAS), '//' (ARM), '@' (ARM GAS) -->
+    <context id="line-comment" style-ref="comment" end-at-line-end="true" class="comment" class-disabled="no-spell-check">
+      <start>;|//|(?&lt;![^\s])#(?![a-z])|(?&lt;![^\s])@(?![a-z])</start>
+    </context>
+    <context id="string" style-ref="string" end-at-line-end="true" class="string" class-disabled="no-spell-check">
+      <start>"</start><end>"</end>
+      <include><context id="escape" style-ref="char"><match>\\.</match></context></include>
+    </context>
+    <context id="char" style-ref="string" end-at-line-end="true">
+      <start>'</start><end>'</end>
+    </context>
+    <context id="cpp" style-ref="preproc">
+      <match>^\s*#\s*(include|define|undef|if|ifdef|ifndef|else|elif|endif|error|warning|pragma|line)\b</match>
+    </context>
+    <context id="nasm-preproc" style-ref="preproc">
+      <match>^\s*%[a-z_]+\b</match>
+    </context>
+    <!-- optional "label:" followed by an instruction mnemonic at line start -->
+    <context id="label-insn">
+      <match>^\s*(?P&lt;label&gt;[.$@?a-z_][\w.$@?]*:)?\s*(?P&lt;insn&gt;(lock\s+|rep(n?[ez])?\s+)?[a-z][a-z0-9]*(\.[a-z0-9]+)*)(?=\s|$|;|#|//)</match>
+      <include>
+        <context sub-pattern="label" style-ref="label"/>
+        <context sub-pattern="insn" style-ref="keyword"/>
+      </include>
+    </context>
+    <context id="gas-directive" style-ref="directive">
+      <match>(?&lt;![\w.])\.[a-z_][\w]*\b</match>
+    </context>
+    <context id="nasm-directive" style-ref="directive">
+      <keyword>section</keyword><keyword>segment</keyword><keyword>global</keyword>
+      <keyword>extern</keyword><keyword>bits</keyword><keyword>use16</keyword>
+      <keyword>use32</keyword><keyword>use64</keyword><keyword>default</keyword>
+      <keyword>org</keyword><keyword>align</keyword><keyword>alignb</keyword>
+      <keyword>times</keyword><keyword>equ</keyword><keyword>incbin</keyword>
+      <keyword>db</keyword><keyword>dw</keyword><keyword>dd</keyword><keyword>dq</keyword>
+      <keyword>dt</keyword><keyword>do</keyword><keyword>dy</keyword><keyword>dz</keyword>
+      <keyword>resb</keyword><keyword>resw</keyword><keyword>resd</keyword><keyword>resq</keyword>
+      <keyword>rest</keyword><keyword>reso</keyword><keyword>resy</keyword><keyword>resz</keyword>
+      <keyword>struc</keyword><keyword>endstruc</keyword><keyword>istruc</keyword>
+      <keyword>iend</keyword><keyword>at</keyword><keyword>proc</keyword><keyword>endp</keyword>
+      <keyword>macro</keyword><keyword>endm</keyword><keyword>public</keyword>
+      <keyword>model</keyword><keyword>end</keyword><keyword>assume</keyword>
+      <keyword>byte</keyword><keyword>word</keyword><keyword>dword</keyword>
+      <keyword>qword</keyword><keyword>tword</keyword><keyword>oword</keyword>
+      <keyword>yword</keyword><keyword>zword</keyword><keyword>ptr</keyword>
+      <keyword>near</keyword><keyword>far</keyword><keyword>short</keyword>
+      <keyword>rel</keyword><keyword>abs</keyword><keyword>wrt</keyword>
+    </context>
+    <!-- x86 / x86-64 registers, with optional AT&T '%' prefix -->
+    <context id="x86-register" style-ref="register">
+      <match>%?\b(r[abcd]x|r[sd]i|r[sb]p|r(8|9|1[0-5])[dwb]?|e[abcd]x|e[sd]i|e[sb]p|[abcd][xhl]|[sd]il?|[sb]pl?|[cdefgs]s|rip|eip|ip|[re]?flags|cr[0-8]|dr[0-7]|st(\([0-7]\))?|mm[0-7]|[xyz]mm([12]?[0-9]|3[01])|k[0-7])\b</match>
+    </context>
+    <!-- ARM / AArch64 / RISC-V registers -->
+    <context id="risc-register" style-ref="register">
+      <match>\b([rxwvqdsbh]([12]?[0-9]|3[01])|sp|lr|pc|xzr|wzr|fp|zero|ra|gp|tp|[ast][0-9]|s1[01]|f[ast]?[0-9]+|cpsr|spsr|apsr)\b</match>
+    </context>
+    <context id="label" style-ref="label">
+      <match>^\s*[.$@?a-z_][\w.$@?]*:</match>
+    </context>
+    <context id="hex" style-ref="hex">
+      <match>(\$|#|\b)(0x[0-9a-f_]+|[0-9][0-9a-f_]*h|0b[01_]+|[01_]+b|0o[0-7_]+|[0-7_]+[oq])\b</match>
+    </context>
+    <context id="decimal" style-ref="decimal">
+      <match>(\$|#|\b)-?[0-9][0-9_]*(\.[0-9]+)?([df])?\b</match>
+    </context>
+    <context id="asm" class="no-spell-check">
+      <include>
+        <context ref="block-comment"/>
+        <context ref="cpp"/>
+        <context ref="line-comment"/>
+        <context ref="string"/>
+        <context ref="char"/>
+        <context ref="nasm-preproc"/>
+        <context ref="gas-directive"/>
+        <context ref="nasm-directive"/>
+        <context ref="label-insn"/>
+        <context ref="label"/>
+        <context ref="x86-register"/>
+        <context ref="risc-register"/>
+        <context ref="hex"/>
+        <context ref="decimal"/>
+      </include>
+    </context>
+  </definitions>
+</language>

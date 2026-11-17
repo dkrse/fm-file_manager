@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Devicetree source (.dts/.dtsi) – fm file manager -->
+<language id="devicetree" name="Devicetree" version="2.0" _section="Other">
+  <metadata>
+    <property name="mimetypes">text/x-devicetree</property>
+    <property name="globs">*.dts;*.dtsi;*.dtso;*.overlay</property>
+    <property name="line-comment-start">//</property>
+    <property name="block-comment-start">/*</property>
+    <property name="block-comment-end">*/</property>
+  </metadata>
+  <styles>
+    <style id="comment"  name="Comment"      map-to="def:comment"/>
+    <style id="string"   name="String"       map-to="def:string"/>
+    <style id="preproc"  name="Preprocessor" map-to="def:preprocessor"/>
+    <style id="keyword"  name="Keyword"      map-to="def:keyword"/>
+    <style id="label"    name="Label"        map-to="def:function"/>
+    <style id="ref"      name="Reference"    map-to="def:identifier"/>
+    <style id="property" name="Property"     map-to="def:type"/>
+    <style id="number"   name="Number"       map-to="def:base-n-integer"/>
+  </styles>
+  <definitions>
+    <context id="line-comment" style-ref="comment" end-at-line-end="true" class="comment"><start>//</start></context>
+    <context id="block-comment" style-ref="comment" class="comment"><start>/\*</start><end>\*/</end></context>
+    <context id="string" style-ref="string" end-at-line-end="true" class="string"><start>"</start><end>"</end></context>
+    <context id="preproc" style-ref="preproc"><match>^\s*#\s*[a-z]+\b</match></context>
+    <context id="keyword" style-ref="keyword"><match>/(dts-v1|plugin|include|delete-node|delete-property|memreserve|bits|omit-if-no-ref)/</match></context>
+    <context id="label" style-ref="label"><match>\b[a-zA-Z_][\w]*:(?=\s)</match></context>
+    <context id="ref" style-ref="ref"><match>&amp;(\{[^}]*\}|[a-zA-Z_][\w]*)</match></context>
+    <context id="property"><match>^\s*(?P&lt;p&gt;[#a-zA-Z0-9,._+?-]+)(?=\s*[=;])</match><include><context sub-pattern="p" style-ref="property"/></include></context>
+    <context id="number" style-ref="number"><match>\b(0x[0-9a-fA-F]+|[0-9]+)\b</match></context>
+    <context id="devicetree" class="no-spell-check">
+      <include>
+        <context ref="line-comment"/><context ref="block-comment"/><context ref="string"/>
+        <context ref="preproc"/><context ref="keyword"/><context ref="label"/>
+        <context ref="ref"/><context ref="property"/><context ref="number"/>
+      </include>
+    </context>
+  </definitions>
+</language>

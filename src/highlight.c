@@ -5,12 +5,35 @@
 #ifdef HAVE_GTKSOURCEVIEW
 #include <gtksourceview/gtksource.h>
 
+/* Default language manager plus the specs bundled in the binary
+ * (resource:///sk/km/fm/language-specs: asm, nginx, devicetree, kconfig).
+ * The search path must be set before the manager loads any language. */
+static GtkSourceLanguageManager *fm_language_manager(void)
+{
+    static gboolean done = FALSE;
+    GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
+    if (!done) {
+        done = TRUE;
+        const gchar * const *cur = gtk_source_language_manager_get_search_path(lm);
+        GPtrArray *paths = g_ptr_array_new();
+        for (; cur && *cur; cur++) g_ptr_array_add(paths, (gpointer)*cur);
+        /* last = lowest priority: a user's own ~/.local/share spec still wins */
+        g_ptr_array_add(paths, (gpointer)"resource:///sk/km/fm/language-specs/");
+        g_ptr_array_add(paths, NULL);
+        gchar **copy = g_strdupv((gchar **)paths->pdata);
+        g_ptr_array_free(paths, TRUE);
+        gtk_source_language_manager_set_search_path(lm, (const gchar * const *)copy);
+        g_strfreev(copy);
+    }
+    return lm;
+}
+
 /* Helper: guess language with fallback for special filenames */
 GtkSourceLanguage *source_guess_language(const char *filename)
 {
     if (!filename) return NULL;
 
-    GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
+    GtkSourceLanguageManager *lm = fm_language_manager();
 
     /* Extract basename */
     const char *base = strrchr(filename, '/');
@@ -26,8 +49,18 @@ GtkSourceLanguage *source_guess_language(const char *filename)
         { "makefile",       "makefile" },
         { "GNUmakefile",    "makefile" },
         { "CMakeLists.txt", "cmake" },
-        { "Dockerfile",     "dockerfile" },
-        { "dockerfile",     "dockerfile" },
+        { "Dockerfile",     "docker" },
+        { "dockerfile",     "docker" },
+        { "Containerfile",  "docker" },
+        { "Jenkinsfile",    "groovy" },
+        { "Vagrantfile",    "ruby" },
+        { "Gemfile",        "ruby" },
+        { "Rakefile",       "ruby" },
+        { ".env",           "sh" },
+        { ".editorconfig",  "ini" },
+        { ".npmrc",         "ini" },
+        { ".gitconfig",     "ini" },
+        { ".gitmodules",    "ini" },
         { "meson.build",    "meson" },
         { "meson_options.txt", "meson" },
         { "PKGBUILD",       "sh" },
@@ -47,6 +80,31 @@ GtkSourceLanguage *source_guess_language(const char *filename)
         if (strcmp(base, special[i].name) == 0) {
             lang = gtk_source_language_manager_get_language(lm, special[i].lang_id);
             if (lang) return lang;
+        }
+    }
+
+    /* Fallback by extension for languages GtkSourceView knows but doesn't glob */
+    static const struct { const char *ext; const char *lang_id; } exts[] = {
+        { "service", "ini" }, { "socket", "ini" }, { "timer", "ini" },
+        { "target",  "ini" }, { "mount",  "ini" }, { "path",  "ini" },
+        { "network", "ini" }, { "netdev", "ini" }, { "link",  "ini" },
+        { "cfg",     "ini" }, { "conf",   "ini" }, { "properties", "ini" },
+        { "env",     "sh"  },
+        { "jsonc",   "json" }, { "json5", "json" }, { "ipynb", "json" },
+        { "plist",   "xml" }, { "vue",  "html" }, { "svelte", "html" },
+        { "mm",      "objc" }, { "hxx",  "cpp" },
+        { "frag",    "glsl" }, { "vert", "glsl" }, { "geom", "glsl" },
+        { "comp",    "glsl" }, { "hlsl", "cg" },
+        { "tsv",     "csv" }, { "dockerfile", "docker" },
+        { NULL, NULL }
+    };
+    const char *dot = strrchr(base, '.');
+    if (dot && dot[1]) {
+        for (int i = 0; exts[i].ext; i++) {
+            if (g_ascii_strcasecmp(dot + 1, exts[i].ext) == 0) {
+                lang = gtk_source_language_manager_get_language(lm, exts[i].lang_id);
+                if (lang) return lang;
+            }
         }
     }
 

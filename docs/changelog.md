@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+**New:**
+- Syntax highlighting for Assembly (NASM/Intel and GNU as/AT&T; x86-64, ARM, RISC-V registers), nginx, Devicetree and Kconfig – language specs bundled in the binary (GResource)
+- More files recognised: systemd units, `.conf`/`.cfg`/`.properties`, `.env`, `.jsonc`/`.json5`/`.ipynb`, `.vue`/`.svelte`, GLSL shaders, `.hxx`, `.mm`, `Containerfile`, `Jenkinsfile`, `Vagrantfile`, `Gemfile`, `.editorconfig` …
+
+**Changed:**
+- Font sizes are now in points (pt) like the rest of GTK, so the viewer/editor/panel text matches the size shown in the font dialog; old pixel sizes are converted once on first start
+
+**Fixed:**
+- `Dockerfile` was not highlighted (wrong language id)
+
 ## [3.5.0] - 2026-11-16
 
 **New:**
