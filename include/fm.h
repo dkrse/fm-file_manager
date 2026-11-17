@@ -335,6 +335,14 @@ gpointer fm_wait_work(FM *fm, const char *title, const char *what,
                       GDestroyNotify free_result, void (*cancel)(gpointer arg),
                       gboolean *cancelled);
 
+/* Read a whole file (local, or remote when conn is set) in a worker
+ * with the same "Reading…" window.  max_len 0 = no limit, otherwise at
+ * most max_len bytes (pass limit+1 to detect an oversized file).  The
+ * result is NUL-terminated.  NULL + *err (may be NULL) on error,
+ * NULL + *cancelled when the user cancelled. */
+gchar *fm_read_file(FM *fm, SshConn *conn, const char *path, gsize max_len,
+                    gsize *out_len, gchar **err, gboolean *cancelled);
+
 /* ── archives as directories (arcpanel.c, read-only) ──────────────── */
 gboolean arc_panel_enter(Panel *p, const char *archive); /* FALSE = not browsable */
 void     arc_panel_leave(Panel *p);          /* forget archive state (panel_load) */

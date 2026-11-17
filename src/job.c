@@ -88,6 +88,7 @@ static gpointer conflict_main(gpointer d)
     ConflictReq *rq = d;
     Job *job = rq->job;
 
+    if (job->window) gtk_widget_set_opacity(job->window, 1.0);
     ConflictDlg cd = { .loop = g_main_loop_new(NULL, FALSE), .answer = FS_ANS_CANCEL };
 
     GtkWidget *dlg = gtk_window_new();
@@ -270,6 +271,7 @@ void job_show_background(FM *fm)
     for (GList *l = running_jobs; l; l = l->next) {
         Job *job = l->data;
         if (!job->background) continue;
+        gtk_widget_set_opacity(job->window, 1.0);
         gtk_window_present(GTK_WINDOW(job->window));
         n++;
     }
@@ -322,6 +324,12 @@ static gboolean job_tick(gpointer d)
     gint64   total = job->total, done = job->done, t0 = job->start_time;
     gboolean det = job->determinate, items = job->count_items;
     g_mutex_unlock(&job->lock);
+
+    /* short jobs never flash a window: it stays transparent (but modal,
+     * so no key reaches the panels) for the first ~250 ms */
+    if (gtk_widget_get_opacity(job->window) < 1.0 &&
+        g_get_monotonic_time() - job->created >= 250000)
+        gtk_widget_set_opacity(job->window, 1.0);
 
     if (!fs_cancelled(&job->ctx) && phase)
         gtk_label_set_text(GTK_LABEL(job->phase_lbl), phase);
@@ -546,6 +554,8 @@ void job_run(Job *job, JobFunc fn, gpointer data)
      * user go on – a second job then queues behind this one */
     gtk_widget_set_visible(job->bg_btn, job->allow_background);
     running_jobs = g_list_prepend(running_jobs, job);
+    job->created = g_get_monotonic_time();
+    gtk_widget_set_opacity(job->window, 0.0);
     gtk_window_present(GTK_WINDOW(job->window));
     job->timer_id = g_timeout_add(100, job_tick, job);
 

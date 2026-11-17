@@ -509,15 +509,16 @@ static void ssh_conn_free(SshConn *conn)
     g_free(conn);
 }
 
+/* atomic: a cancelled listing worker may drop the last reference */
 SshConn *ssh_conn_ref(SshConn *conn)
 {
-    if (conn) conn->refs++;
+    if (conn) g_atomic_int_inc(&conn->refs);
     return conn;
 }
 
 void ssh_conn_unref(SshConn *conn)
 {
-    if (conn && --conn->refs <= 0) ssh_conn_free(conn);
+    if (conn && g_atomic_int_dec_and_test(&conn->refs)) ssh_conn_free(conn);
 }
 
 void ssh_connect_cancel(Panel *p)
@@ -647,6 +648,103 @@ gboolean ssh_write_file(SshConn *conn, const char *path,
 
 /* ── panel_load_remote ────────────────────────────────────────────── */
 
+typedef struct {
+    gchar   *name;
+    gboolean is_dir, is_link, is_exec;
+    gint64   size, mtime;
+} RemEnt;
+
+typedef struct {
+    gboolean   opened;
+    int        rc;
+    GPtrArray *ents;          /* RemEnt* */
+} RemList;
+
+typedef struct {
+    SshConn *conn;            /* referenced: a cancelled worker may outlive the tab */
+    gchar   *path;
+} RemReq;
+
+static void rem_ent_free(gpointer d)
+{
+    RemEnt *e = d;
+    g_free(e->name);
+    g_free(e);
+}
+
+static void rem_list_free(gpointer d)
+{
+    RemList *l = d;
+    if (l->ents) g_ptr_array_unref(l->ents);
+    g_free(l);
+}
+
+static void rem_req_free(gpointer d)
+{
+    RemReq *r = d;
+    ssh_conn_unref(r->conn);
+    g_free(r->path);
+    g_free(r);
+}
+
+static gpointer rem_list_thread(gpointer d)
+{
+    RemReq *q = d;
+    SshConn *conn = q->conn;
+    RemList *l = g_new0(RemList, 1);
+    l->ents = g_ptr_array_new_with_free_func(rem_ent_free);
+
+    ssh_conn_lock(conn);                /* the background poll may be using it */
+    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, q->path);
+    if (!handle) { ssh_conn_unlock(conn); return l; }
+    l->opened = TRUE;
+
+    char name_buf[4096];
+    char longentry[4096];
+    LIBSSH2_SFTP_ATTRIBUTES attrs;
+    int rc;
+    while ((rc = libssh2_sftp_readdir_ex(handle, name_buf, sizeof(name_buf),
+                                         longentry, sizeof(longentry), &attrs)) > 0) {
+        if (strcmp(name_buf, ".") == 0 || strcmp(name_buf, "..") == 0)
+            continue;
+        gboolean perm = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) != 0;
+        RemEnt *e = g_new0(RemEnt, 1);
+        e->name    = g_strdup(name_buf);
+        e->is_dir  = perm && LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
+        e->is_link = perm && LIBSSH2_SFTP_S_ISLNK(attrs.permissions);
+        if (e->is_link) {               /* a link to a directory opens like one */
+            gchar *lp = fs_remote_join(q->path, name_buf);
+            LIBSSH2_SFTP_ATTRIBUTES ta;
+            if (libssh2_sftp_stat(conn->sftp, lp, &ta) == 0 &&
+                (ta.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                LIBSSH2_SFTP_S_ISDIR(ta.permissions))
+                e->is_dir = TRUE;
+            g_free(lp);
+        }
+        e->is_exec = !e->is_dir && perm &&
+                     (attrs.permissions & (S_IXUSR | S_IXGRP | S_IXOTH));
+        e->size  = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (gint64)attrs.filesize : 0;
+        e->mtime = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? (gint64)attrs.mtime : 0;
+        g_ptr_array_add(l->ents, e);
+    }
+    l->rc = rc;
+    libssh2_sftp_closedir(handle);
+    ssh_conn_unlock(conn);
+    return l;
+}
+
+/* NULL = cancelled */
+static RemList *rem_list_read(FM *fm, SshConn *conn, const char *path)
+{
+    RemReq *q = g_new0(RemReq, 1);
+    q->conn = ssh_conn_ref(conn);
+    q->path = g_strdup(path);
+    gboolean cancelled;
+    RemList *l = fm_wait_work(fm, "Reading", path, rem_list_thread, q,
+                              rem_req_free, rem_list_free, NULL, &cancelled);
+    return cancelled ? NULL : l;
+}
+
 /* remote_icon removed — using shared icon_for_entry() from main.c */
 
 void panel_load_remote(Panel *p, const char *path)
@@ -664,13 +762,29 @@ void panel_load_remote(Panel *p, const char *path)
         search_update_buttons(p);
     }
 
-    /* the background poll may be using the session */
-    ssh_conn_lock(conn);
-    /* open first: an unreadable directory leaves the panel where it was */
-    LIBSSH2_SFTP_HANDLE *handle = libssh2_sftp_opendir(conn->sftp, path);
-    if (!handle) {
-        ssh_conn_unlock(conn);
+    /* The listing (and a stat per symlink) is network I/O: it runs in a
+     * worker; a slow server shows the cancellable "Reading…" window
+     * instead of freezing the UI. */
+    gchar *want = g_strdup(path);       /* path may alias remote_path */
+    ssh_conn_ref(conn);
+    RemList *rl = rem_list_read(p->fm, conn, want);
+    gboolean gone = p->ssh_conn != conn; /* disconnected while waiting */
+    ssh_conn_unref(conn);
+    if (gone) {
+        if (rl) rem_list_free(rl);
+        g_free(want);
+        return;
+    }
+    path = want;
+    if (!rl) {                          /* cancelled: stay where we were */
+        fm_status(p->fm, "Reading the directory was cancelled");
+        g_free(want);
+        return;
+    }
+    if (!rl->opened) {
+        rem_list_free(rl);
         fm_status(p->fm, "SFTP: failed to open directory %s", path);
+        g_free(want);
         if (!conn->remote_path) {       /* nothing to fall back to */
             g_list_store_remove_all(p->store);
             panel_update_status(p);
@@ -685,10 +799,9 @@ void panel_load_remote(Panel *p, const char *path)
     /* Suppress selection events during load */
     p->inhibit_sel = TRUE;
 
-    gchar *new_path = g_strdup(path);   /* copy before free – path may alias remote_path */
     g_free(conn->remote_path);
-    conn->remote_path = new_path;
-    path = conn->remote_path;          /* use the safe copy from here on */
+    conn->remote_path = want;          /* owned by conn from here on */
+    path = conn->remote_path;
 
     gchar *entry_text = g_strdup_printf("sftp://%s@%s%s",
                                          conn->user, conn->host, path);
@@ -707,61 +820,29 @@ void panel_load_remote(Panel *p, const char *path)
                       (gint64)-2, (gint64)0));
     g_free(up_color);
 
-    char name_buf[4096];
-    char longentry[4096];
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    int rc;
-
-    while ((rc = libssh2_sftp_readdir_ex(handle, name_buf, sizeof(name_buf),
-                                         longentry, sizeof(longentry), &attrs)) > 0) {
-        if (strcmp(name_buf, ".") == 0 || strcmp(name_buf, "..") == 0)
+    for (guint i = 0; i < rl->ents->len; i++) {
+        RemEnt *e = g_ptr_array_index(rl->ents, i);
+        if (!p->fm->show_hidden && e->name[0] == '.')
             continue;
-        if (!p->fm->show_hidden && name_buf[0] == '.')
-            continue;
-
-        gboolean is_dir  = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
-        gboolean is_link = (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            LIBSSH2_SFTP_S_ISLNK(attrs.permissions);
-        if (is_link) {                  /* a link to a directory opens like one */
-            gchar *lp = fs_remote_join(path, name_buf);
-            LIBSSH2_SFTP_ATTRIBUTES ta;
-            if (libssh2_sftp_stat(conn->sftp, lp, &ta) == 0 &&
-                (ta.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                LIBSSH2_SFTP_S_ISDIR(ta.permissions))
-                is_dir = TRUE;
-            g_free(lp);
-        }
-        gboolean is_exec = !is_dir &&
-                            (attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                            (attrs.permissions & (S_IXUSR | S_IXGRP | S_IXOTH));
-
-        const char *icon = icon_for_entry(name_buf, is_dir, is_link, is_exec);
-
-        gint64 size_raw = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
-                          ? (gint64)attrs.filesize : 0;
-        gint64 mtime    = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)
-                          ? (gint64)attrs.mtime : 0;
-
-        if (is_dir && !vdc) vdc = fm_visible_color(p->fm, p->fm->dir_color);
+        const char *icon = icon_for_entry(e->name, e->is_dir, e->is_link, e->is_exec);
+        if (e->is_dir && !vdc) vdc = fm_visible_color(p->fm, p->fm->dir_color);
         const gchar *fg = NULL;
         gint         wt = PANGO_WEIGHT_NORMAL;
-        if      (is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
-        else if (is_link) { fg = fm_link_color(p->fm); }
-        else if (is_exec) { fg = fm_exec_color(p->fm); }
+        if      (e->is_dir)  { fg = vdc; wt = p->fm->dir_bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL; }
+        else if (e->is_link) { fg = fm_link_color(p->fm); }
+        else if (e->is_exec) { fg = fm_exec_color(p->fm); }
 
         /* size/date text and sort key: formatted when shown / sorted */
-        FileItem *fi = file_item_new_lazy(icon, name_buf, is_dir, fg, wt,
-                                          size_raw, mtime, NULL);
-        if (p->marks && g_hash_table_contains(p->marks, name_buf))
+        FileItem *fi = file_item_new_lazy(icon, e->name, e->is_dir, fg, wt,
+                                          e->size, e->mtime, NULL);
+        if (p->marks && g_hash_table_contains(p->marks, e->name))
             fi->marked = TRUE;
         g_ptr_array_add(items, fi);
     }
-    libssh2_sftp_closedir(handle);
     g_free(vdc);
-    ssh_conn_unlock(conn);
-    if (rc < 0)                         /* 0 = end of listing */
-        fm_status(p->fm, "SFTP: listing of %s incomplete (error %d)", path, rc);
+    if (rl->rc < 0)                     /* 0 = end of listing */
+        fm_status(p->fm, "SFTP: listing of %s incomplete (error %d)", path, rl->rc);
+    rem_list_free(rl);
 
     /* Single splice: one items-changed signal → one sort pass */
     g_list_store_remove_all(p->store);
@@ -999,6 +1080,14 @@ static void ssh_connect_thread(GTask *task, gpointer source,
     SshConn *conn = ssh_conn_new(args->host, args->user, args->port,
                                   args->password, args->key_path, &errmsg);
     if (conn) {
+        /* start in the remote home directory (realpath of ".") – resolved
+         * here, not in the main thread: it is a network round trip */
+        char home[4096];
+        int hl = libssh2_sftp_realpath(conn->sftp, ".", home, sizeof(home) - 1);
+        if (hl > 0) {
+            g_free(conn->remote_path);
+            conn->remote_path = g_strndup(home, (gsize)hl);
+        }
         /* freed by GTask if nobody collects it (exit during connect) */
         g_task_return_pointer(task, conn, (GDestroyNotify)ssh_conn_free);
     } else {
@@ -1035,14 +1124,14 @@ static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_d
 
     if (conn) {
         panel_tab_set_conn(ctx->panel, conn);
-        /* start in the remote home directory (realpath of ".") */
-        char home[4096];
-        int hl = libssh2_sftp_realpath(conn->sftp, ".", home, sizeof(home) - 1);
-        gchar *start = (hl > 0) ? g_strndup(home, (gsize)hl) : g_strdup("/");
+        gchar *start = g_strdup(conn->remote_path);   /* home, see thread */
         panel_load_remote(ctx->panel, start);
         g_free(start);
-        gtk_widget_set_visible(ctx->panel->disconnect_btn, TRUE);
-        fm_status(ctx->fm, "Connected: %s@%s", conn->user, conn->host);
+        /* the listing may wait in a nested loop: still connected? */
+        if (ctx->panel->ssh_conn == conn) {
+            gtk_widget_set_visible(ctx->panel->disconnect_btn, TRUE);
+            fm_status(ctx->fm, "Connected: %s@%s", conn->user, conn->host);
+        }
     } else {
         fm_status(ctx->fm, "SSH error: %s", err ? err->message : "unknown");
         g_clear_error(&err);

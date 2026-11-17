@@ -941,6 +941,9 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
             return TRUE;                /* cancelled or save failed: keep open */
     }
     if (ctx->hl_idle) g_source_remove(ctx->hl_idle);
+    /* the window (and with it buffer/adjustment) dies after this returns */
+    g_signal_handlers_disconnect_by_data(ctx->buffer, ctx);
+    if (ctx->vadj) g_signal_handlers_disconnect_by_data(ctx->vadj, ctx);
     if (ctx->match_lines) g_array_free(ctx->match_lines, TRUE);
     FM *fm = ctx->fm;
     g_free(ctx->filepath);
@@ -975,51 +978,47 @@ void editor_show_path(FM *fm, const char *path)
     gchar  *remote_path = NULL;
     SshConn *ssh_conn   = NULL;
 
+    /* read in a worker – a big or remote file never freezes the UI */
+    SshConn *src_conn = NULL;
+    const char *rd_path;
     if (!path && p->ssh_conn) {
-        remote_path = g_build_filename(p->ssh_conn->remote_path, name, NULL);
-        g_free(name);
-        content = ssh_read_file(p->ssh_conn, remote_path,
-                                EDITOR_MAX_BYTES + 1, &content_len);
-        if (!content) {
-            fm_status(fm, "Editor: SFTP read error – %s", remote_path);
-            g_free(remote_path);
-            return;
-        }
-        if (content_len > EDITOR_MAX_BYTES) {
-            fm_status(fm, "Editor: file too large (limit %d MB)",
-                      EDITOR_MAX_BYTES / (1024 * 1024));
-            g_free(content);
-            g_free(remote_path);
-            return;
-        }
-        ssh_conn = p->ssh_conn;
+        src_conn    = p->ssh_conn;
+        remote_path = g_build_filename(src_conn->remote_path, name, NULL);
+        rd_path     = remote_path;
     } else {
         filepath = path ? g_strdup(path) : panel_cursor_fullpath(p);
-        g_free(name);
-
-        struct stat st;
-        if (stat(filepath, &st) != 0 || S_ISDIR(st.st_mode)) {
-            g_free(filepath);
-            fm_status(fm, "Editor: not a file");
+        rd_path  = filepath;
+    }
+    g_free(name);
+    if (!rd_path) { fm_status(fm, "Editor: not a file"); return; }
+    {
+        gchar *err = NULL;
+        gboolean canc = FALSE;
+        content = fm_read_file(fm, src_conn, rd_path, EDITOR_MAX_BYTES + 1,
+                               &content_len, &err, &canc);
+        if (!content) {
+            if (canc) fm_status(fm, "Editor: reading cancelled");
+            else      fm_status(fm, "Editor: read error – %s", err ? err : "?");
+            g_free(err);
+            g_free(filepath); g_free(remote_path);
             return;
         }
-
-        /* Check file size before loading */
-        if (st.st_size > EDITOR_MAX_BYTES) {
-            fm_status(fm, "Editor: file is too large (%.1f MB, max %d MB)",
-                      st.st_size / (1024.0 * 1024.0), EDITOR_MAX_BYTES / (1024 * 1024));
-            g_free(filepath);
+        g_free(err);
+    }
+    if (content_len > EDITOR_MAX_BYTES) {
+        fm_status(fm, "Editor: file is too large (limit %d MB)",
+                  EDITOR_MAX_BYTES / (1024 * 1024));
+        g_free(content); g_free(filepath); g_free(remote_path);
+        return;
+    }
+    if (src_conn) {
+        /* the panel may have been disconnected while reading */
+        if (p->ssh_conn != src_conn) {
+            fm_status(fm, "Editor: the SFTP connection was closed");
+            g_free(content); g_free(remote_path);
             return;
         }
-
-        GError *err = NULL;
-        g_file_get_contents(filepath, &content, &content_len, &err);
-        if (err) {
-            fm_status(fm, "Editor: read error – %s", err->message);
-            g_clear_error(&err);
-            g_free(filepath);
-            return;
-        }
+        ssh_conn = src_conn;
     }
 
     /* NUL bytes: binary file, shown read-only.  Other invalid UTF-8 is

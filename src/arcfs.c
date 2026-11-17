@@ -446,7 +446,8 @@ int arcfs_extract(FsCtx *c, const char *archive, const char *base,
         if (fs_cancelled(c)) { r = FS_CANCELLED; break; }
         gchar *path = clean_path(archive_entry_pathname(ae));
         if (path && selected(path, inner, n) &&
-            (!x.base_len || strncmp(path, base, x.base_len - 1) == 0))
+            (!x.base_len || (strncmp(path, base, x.base_len - 1) == 0 &&
+                             path[x.base_len - 1] == '/')))
             r = fs_worst(r, extract_entry(&x, a, ae, path));
         g_free(path);
         if (r == FS_CANCELLED) break;

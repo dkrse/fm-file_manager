@@ -423,6 +423,120 @@ gpointer fm_wait_work(FM *fm, const char *title, const char *what,
     return result;
 }
 
+/* ── reading a whole file in a worker (viewer, editor, open, verify) ── */
+typedef struct {
+    SshConn *conn;              /* ref held, NULL = local */
+    gchar   *path;
+    gsize    max_len;
+    gint     cancelled;         /* atomic */
+} ReadReq;
+
+typedef struct {
+    gchar *data;
+    gsize  len;
+    gchar *err;
+} ReadRes;
+
+static void read_req_free(gpointer d)
+{
+    ReadReq *q = d;
+    if (q->conn) ssh_conn_unref(q->conn);
+    g_free(q->path);
+    g_free(q);
+}
+
+static void read_res_free(gpointer d)
+{
+    ReadRes *r = d;
+    if (!r) return;
+    g_free(r->data);
+    g_free(r->err);
+    g_free(r);
+}
+
+static void read_req_cancel(gpointer d)
+{
+    g_atomic_int_set(&((ReadReq *)d)->cancelled, 1);
+}
+
+static gpointer read_file_thread(gpointer d)
+{
+    ReadReq *q = d;
+    ReadRes *r = g_new0(ReadRes, 1);
+    if (q->conn) {
+#ifdef HAVE_LIBSSH2
+        r->data = ssh_read_file(q->conn, q->path, q->max_len, &r->len);
+        if (!r->data) r->err = g_strdup("SFTP read error");
+#else
+        r->err = g_strdup("SFTP is not supported");
+#endif
+        return r;
+    }
+    int fd = open(q->path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        r->err = g_strdup(g_strerror(errno));
+        if (fd >= 0) close(fd);
+        return r;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        r->err = g_strdup(g_strerror(EISDIR));
+        close(fd);
+        return r;
+    }
+    gsize cap = (S_ISREG(st.st_mode) && st.st_size > 0) ? (gsize)st.st_size + 1 : 65536;
+    if (q->max_len && cap > q->max_len) cap = q->max_len;
+    GByteArray *ba = g_byte_array_sized_new((guint)MIN(cap, (gsize)G_MAXUINT - 1));
+    guint8 buf[65536];
+    for (;;) {
+        if (g_atomic_int_get(&q->cancelled)) break;
+        gsize want = sizeof buf;
+        if (q->max_len) {
+            if (ba->len >= q->max_len) break;
+            want = MIN(want, q->max_len - ba->len);
+        }
+        ssize_t n = read(fd, buf, want);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { r->err = g_strdup(g_strerror(errno)); break; }
+        if (n == 0) break;
+        if (ba->len > G_MAXUINT - sizeof buf) { r->err = g_strdup("File too large"); break; }
+        g_byte_array_append(ba, buf, (guint)n);
+    }
+    close(fd);
+    if (r->err) { g_byte_array_free(ba, TRUE); return r; }
+    r->len = ba->len;
+    g_byte_array_append(ba, (const guint8 *)"", 1);    /* NUL-terminate */
+    r->data = (gchar *)g_byte_array_free(ba, FALSE);
+    return r;
+}
+
+gchar *fm_read_file(FM *fm, SshConn *conn, const char *path, gsize max_len,
+                    gsize *out_len, gchar **err, gboolean *cancelled)
+{
+    *out_len = 0;
+    if (err) *err = NULL;
+    gboolean dummy;
+    if (!cancelled) cancelled = &dummy;
+    *cancelled = FALSE;
+    if (!path) { if (err) *err = g_strdup("No file"); return NULL; }
+    ReadReq *q = g_new0(ReadReq, 1);
+    q->conn    = conn ? ssh_conn_ref(conn) : NULL;
+    q->path    = g_strdup(path);
+    q->max_len = max_len;
+    gchar *base = g_path_get_basename(path);
+    ReadRes *r = fm_wait_work(fm, "Reading file", base, read_file_thread, q,
+                              read_req_free, read_res_free, read_req_cancel,
+                              cancelled);
+    g_free(base);
+    if (!r) return NULL;                  /* cancelled */
+    gchar *data = r->data;
+    *out_len = r->len;
+    if (err) { *err = r->err; r->err = NULL; }
+    r->data = NULL;
+    read_res_free(r);
+    return data;
+}
+
 /* Directory-specific part */
 typedef struct {
     struct stat st;
@@ -472,6 +586,9 @@ static gpointer dir_slice_thread(gpointer data)
 static gpointer dir_load_thread(gpointer data)
 {
     DirLoad *d = data;
+    /* the stat runs here too: on a hung network mount it blocks */
+    struct stat st;
+    if (stat(d->path, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
     DIR *dir = opendir(d->path);
     if (!dir) return NULL;
     GPtrArray *ents = g_ptr_array_new_with_free_func(dirent_free);
@@ -534,8 +651,7 @@ void panel_load(Panel *p, const char *path)
 
     if (p->busy) return;            /* a search is filling this panel */
     panel_scroll_remember(p);
-    struct stat st;
-    if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    if (!path || !path[0]) return;
     if (strlen(path) >= sizeof(p->cwd)) {
         fm_status(p->fm, "Path too long: %.60s...", path);
         return;
@@ -549,6 +665,13 @@ void panel_load(Panel *p, const char *path)
     if (cancelled) {
         fm_status(p->fm, "Reading the directory was cancelled");
         panel_monitor_start(p);     /* stay in the old directory */
+        g_free(want);
+        return;
+    }
+    if (!ents) {                    /* not a directory or unreadable */
+        if (strcmp(p->cwd, want) != 0)
+            fm_status(p->fm, "Cannot open directory %s", want);
+        panel_monitor_start(p);
         g_free(want);
         return;
     }
@@ -1012,12 +1135,11 @@ static void activate_item(Panel *p)
             g_free(np);
         } else {
 #ifdef HAVE_LIBSSH2
-            /* No main-loop pump here: re-entering would let the panel
-             * change under us while the (blocking) download runs. */
-            fm_status(p->fm, "Downloading '%s'...", name);
             gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
             gsize len = 0;
-            gchar *data = ssh_read_file(p->ssh_conn, remote_path, 0, &len);
+            gboolean canc = FALSE;
+            gchar *data = fm_read_file(p->fm, p->ssh_conn, remote_path, 0, &len,
+                                       NULL, &canc);
             g_free(remote_path);
             if (data && len > 0) {
                 /* One private temp dir per session (prevents symlink
@@ -1045,6 +1167,8 @@ static void activate_item(Panel *p)
                 } else {
                     fm_status(p->fm, "Error creating temp directory");
                 }
+            } else if (canc) {
+                fm_status(p->fm, "Download cancelled");
             } else {
                 fm_status(p->fm, "Error downloading '%s'", name);
             }
@@ -1955,8 +2079,32 @@ static void on_window_focus_in(GtkEventControllerFocus *ctrl, FM *fm)
 /* ─────────────────────────────────────────────────────────────────── */
 
 
+/* Dialogs without their own titlebar get server-side decorations drawn
+ * by the compositor in the *system* theme – a light title bar on a dark
+ * fm.  Give every new toplevel a GTK header bar so it follows fm's theme
+ * (a window that sets its own titlebar later simply replaces it). */
+static void on_toplevels_changed(GListModel *list, guint pos, guint removed,
+                                 guint added, gpointer d)
+{
+    (void)removed; (void)d;
+    for (guint i = pos; i < pos + added; i++) {
+        GtkWindow *w = g_list_model_get_item(list, i);
+        if (GTK_IS_WINDOW(w) && !gtk_window_get_titlebar(w) &&
+            !gtk_widget_get_realized(GTK_WIDGET(w)) &&
+            !GTK_IS_DIALOG(w) && gtk_window_get_decorated(w))
+            gtk_window_set_titlebar(w, gtk_header_bar_new());
+        g_object_unref(w);
+    }
+}
+
 static void on_activate(GtkApplication *app, gpointer data)
 {
+    static gboolean hooked;
+    if (!hooked) {
+        hooked = TRUE;
+        g_signal_connect(gtk_window_get_toplevels(), "items-changed",
+                         G_CALLBACK(on_toplevels_changed), NULL);
+    }
     FM *fm = data;
     /* second launch: the running instance just comes to the front
      * (building everything again would leak the first UI) */

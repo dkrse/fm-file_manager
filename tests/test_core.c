@@ -887,6 +887,163 @@ static void test_compare(void)
     g_assert_cmpint(fs_compare_files(TRUE, 1, 100, 1, 200, 2), ==, FS_CMP_OLDER);
 }
 
+
+/* ── added: core helpers without coverage ────────────────────────── */
+
+static void test_worst_and_cancel(void)
+{
+    g_assert_cmpint(fs_worst(FS_OK, FS_ERR), ==, FS_ERR);
+    g_assert_cmpint(fs_worst(FS_ERR, FS_OK), ==, FS_ERR);
+    g_assert_cmpint(fs_worst(FS_SKIPPED, FS_CANCELLED), ==, FS_CANCELLED);
+    g_assert_cmpint(fs_worst(FS_OK, FS_OK), ==, FS_OK);
+    FsCtx c = { 0 };
+    g_assert_false(fs_cancelled(&c));
+    fs_cancel(&c);
+    g_assert_true(fs_cancelled(&c));
+}
+
+static void test_checksum_names(void)
+{
+    static const struct { gsize len; GChecksumType t; } m[] = {
+        { 32, G_CHECKSUM_MD5 }, { 40, G_CHECKSUM_SHA1 },
+        { 64, G_CHECKSUM_SHA256 }, { 128, G_CHECKSUM_SHA512 },
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(m); i++) {
+        GChecksumType t;
+        g_assert_true(fs_checksum_type_for_hex(m[i].len, &t));
+        g_assert_cmpint(t, ==, m[i].t);
+        g_assert_nonnull(fs_checksum_name(t));
+        g_assert_cmpuint(strlen(fs_checksum_name(t)), >, 0);
+        const char *ext = fs_checksum_ext(t);
+        g_assert_nonnull(ext);
+        g_assert_true(ext[0] == '.');
+    }
+    GChecksumType t;
+    g_assert_false(fs_checksum_type_for_hex(33, &t));
+    g_assert_false(fs_checksum_type_for_hex(0, &t));
+}
+
+static void test_calc_size(void)
+{
+    gchar *root = tmp_root(), *d = J(root, "d");
+    g_assert_cmpint(g_mkdir(d, 0755), ==, 0);
+    gchar *a = J(d, "a"), *b = J(d, "b"), *ln = J(d, "ln");
+    write_file(a, "12345");
+    write_file(b, "123");
+    g_assert_cmpint(symlink("/nonexistent-target-xyz", ln), ==, 0);
+    FsCtx c = { 0 };
+    gint64 sz = fs_calc_size(&c, d);
+    /* files 8 B + the link itself (not followed) */
+    g_assert_cmpint(sz, >=, 8);
+    g_assert_cmpint(sz, <=, 8 + (gint64)strlen("/nonexistent-target-xyz"));
+    g_assert_cmpint(fs_calc_size(&c, a), ==, 5);
+    FsCtx cc = { 0 };
+    fs_cancel(&cc);
+    g_assert_cmpint(fs_calc_size(&cc, d), <=, 8 + 64);  /* must not hang/crash */
+    fs_ctx_clear(&c); fs_ctx_clear(&cc);
+    rm_rf(root);
+    g_free(a); g_free(b); g_free(ln); g_free(d); g_free(root);
+}
+
+static void test_local_exists(void)
+{
+    gchar *root = tmp_root(), *f = J(root, "f"), *ln = J(root, "dangling");
+    write_file(f, "x");
+    g_assert_cmpint(symlink("/nonexistent-target-xyz", ln), ==, 0);
+    g_assert_true(fs_local_exists(root, "f", NULL));
+    g_assert_false(fs_local_exists(root, "missing", NULL));
+    g_assert_true(fs_local_exists(root, "dangling", NULL));   /* lstat */
+    rm_rf(root);
+    g_free(f); g_free(ln); g_free(root);
+}
+
+static void test_content_extra(void)
+{
+    gchar *root = tmp_root(), *t = J(root, "t.txt"), *bin = J(root, "b.bin");
+    write_file(t, "first\nsecond line\nŽLUŤ kôň here\n");
+    int line = 0;
+    gchar *needle = g_utf8_strdown("žluť", -1);
+    gchar *hit = fs_file_contains(t, needle, &line, NULL);
+    g_assert_nonnull(hit);
+    g_assert_cmpint(line, ==, 3);
+    g_assert_true(g_utf8_validate(hit, -1, NULL));
+    g_free(hit);
+
+    gint cancelled = 1;
+    g_assert_null(fs_file_contains(t, "second", &line, &cancelled));
+
+    static const char bdata[] = "abc\0second\0\0\0";
+    g_assert_true(g_file_set_contents(bin, bdata, sizeof bdata, NULL));
+    g_assert_null(fs_file_contains(bin, "second", &line, NULL));
+
+    g_assert_null(fs_file_contains(t, "notthere", &line, NULL));
+    g_free(needle);
+    rm_rf(root);
+    g_free(t); g_free(bin); g_free(root);
+}
+
+static FsAnswer arc_skip(FsCtx *c, const char *s, const char *d)
+{
+    (void)c; (void)s; (void)d;
+    return FS_ANS_SKIP;
+}
+
+/* base "a" must not match a sibling "ab/…" and an entry equal to base
+ * must not read past its end */
+static void test_arcfs_base_prefix(void)
+{
+    gchar *root = tmp_root(), *tar = J(root, "t.tar"), *out = J(root, "out");
+    static const TarItem items[] = {
+        { "a",      NULL, NULL, TRUE  },
+        { "a/x",    "X",  NULL, FALSE },
+        { "ab/y",   "YY", NULL, FALSE },
+        { NULL, NULL, NULL, FALSE }
+    };
+    make_tar(tar, items);
+
+    GError *err = NULL;
+    GPtrArray *e = arcfs_list(tar, &err);
+    g_assert_no_error(err);
+    const char *sa[] = { "a" };
+    g_assert_cmpint(arcfs_size(e, sa, 1), ==, 1);      /* not ab/y */
+    GPtrArray *ac = arcfs_children(e, "a");
+    g_assert_cmpuint(ac->len, ==, 1);
+    g_ptr_array_unref(ac);
+    GPtrArray *rc = arcfs_children(e, "");
+    g_assert_cmpuint(rc->len, ==, 2);                  /* a, ab */
+    g_ptr_array_unref(rc);
+    g_ptr_array_unref(e);
+
+    FsCtx c = { .conflict = arc_overwrite };
+    const char *sel[] = { "a/x" };
+    g_assert_cmpint(arcfs_extract(&c, tar, "a", sel, 1, out), ==, FS_OK);
+    gchar *x = J(out, "x"), *y = J(out, "y"), *ab = J(out, "ab");
+    g_assert_true(g_file_test(x, G_FILE_TEST_IS_REGULAR));
+    g_assert_false(g_file_test(y, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(ab, G_FILE_TEST_EXISTS));
+    fs_ctx_clear(&c);
+
+    /* conflicts: skip keeps the existing file, overwrite replaces it */
+    write_file(x, "OLD");
+    FsCtx s = { .conflict = arc_skip };
+    g_assert_cmpint(arcfs_extract(&s, tar, "a", sel, 1, out), ==, FS_SKIPPED);
+    gchar *d = read_file(x); g_assert_cmpstr(d, ==, "OLD"); g_free(d);
+    fs_ctx_clear(&s);
+    FsCtx o = { .policy = FS_OVERWRITE_ALL };
+    g_assert_cmpint(arcfs_extract(&o, tar, "a", sel, 1, out), ==, FS_OK);
+    d = read_file(x); g_assert_cmpstr(d, ==, "X"); g_free(d);
+    fs_ctx_clear(&o);
+
+    /* cancelled before start */
+    FsCtx k = { .conflict = arc_overwrite };
+    fs_cancel(&k);
+    g_assert_cmpint(arcfs_extract(&k, tar, "a", sel, 1, out), ==, FS_CANCELLED);
+    fs_ctx_clear(&k);
+
+    rm_rf(root);
+    g_free(x); g_free(y); g_free(ab); g_free(tar); g_free(out); g_free(root);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -925,6 +1082,12 @@ int main(int argc, char **argv)
     g_test_add_func("/arcfs/list",             test_arcfs_list);
     g_test_add_func("/arcfs/extract",          test_arcfs_extract);
     g_test_add_func("/arcfs/symlink-escape",   test_arcfs_symlink_escape);
+    g_test_add_func("/arcfs/base-prefix",      test_arcfs_base_prefix);
+    g_test_add_func("/fsops/worst-cancel",     test_worst_and_cancel);
+    g_test_add_func("/fsops/calc-size",        test_calc_size);
+    g_test_add_func("/util/checksum-names",    test_checksum_names);
+    g_test_add_func("/util/local-exists",      test_local_exists);
+    g_test_add_func("/util/content-extra",     test_content_extra);
 #endif
     return g_test_run();
 }

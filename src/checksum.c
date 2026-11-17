@@ -306,8 +306,15 @@ void cks_verify(FM *fm)
     gchar *file = panel_cursor_fullpath(p);
     gchar *data = NULL;
     gsize len = 0;
-    if (!file || !g_file_test(file, G_FILE_TEST_IS_REGULAR) ||
-        !g_file_get_contents(file, &data, &len, NULL) || len > 64 * 1024 * 1024) {
+    gboolean canc = FALSE;
+    if (file)       /* worker read – the size limit is checked while reading */
+        data = fm_read_file(fm, NULL, file, 64 * 1024 * 1024 + 1, &len, NULL, &canc);
+    if (canc) {
+        fm_status(fm, "Verify: reading cancelled");
+        g_free(file);
+        return;
+    }
+    if (!data || len > 64 * 1024 * 1024) {
         fm_status(fm, "Verify: put the cursor on a checksum file (.sha256, .md5, …)");
         g_free(file); g_free(data);
         return;

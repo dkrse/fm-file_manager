@@ -25,6 +25,8 @@ typedef struct {
     GtkWidget     *match_map;
     GtkTextTag    *match_tag;
     GArray        *match_lines;
+    GArray        *match_offs;      /* char offset of each match start */
+    int            needle_chars;    /* match length in characters */
     int            current_match;
     int            total_matches;
     int            total_lines;
@@ -39,6 +41,8 @@ static void viewer_search_clear(ViewerCtx *ctx)
     gtk_text_buffer_remove_tag(ctx->buffer, ctx->match_tag, &start, &end);
     if (ctx->match_lines)
         g_array_set_size(ctx->match_lines, 0);
+    if (ctx->match_offs)
+        g_array_set_size(ctx->match_offs, 0);
     ctx->total_matches = 0;
     ctx->current_match = 0;
     if (ctx->match_lbl)
@@ -60,7 +64,10 @@ static void viewer_search_highlight_all(ViewerCtx *ctx, const gchar *needle)
                 GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         gtk_text_buffer_apply_tag(ctx->buffer, ctx->match_tag, &match_start, &match_end);
         int line = gtk_text_iter_get_line(&match_start);
+        int off  = gtk_text_iter_get_offset(&match_start);
         g_array_append_val(ctx->match_lines, line);
+        g_array_append_val(ctx->match_offs, off);
+        ctx->needle_chars = gtk_text_iter_get_offset(&match_end) - off;
         count++;
         start = match_end;
     }
@@ -86,31 +93,22 @@ static void viewer_search_goto_match(ViewerCtx *ctx, int index)
     if (ctx->total_matches == 0 || index < 1 || index > ctx->total_matches)
         return;
 
-    const gchar *needle = gtk_editable_get_text(GTK_EDITABLE(ctx->search_entry));
-    if (!needle || !needle[0]) return;
-
-    GtkTextIter start, match_start, match_end;
-    gtk_text_buffer_get_start_iter(ctx->buffer, &start);
-
-    int count = 0;
-    while (gtk_text_iter_forward_search(&start, needle,
-                GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
-        count++;
-        if (count == index) {
-            gtk_text_buffer_select_range(ctx->buffer, &match_start, &match_end);
-            /* mark-based scroll also works before the view is laid out */
-            gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(ctx->text_view),
-                                         gtk_text_buffer_get_insert(ctx->buffer),
-                                         0.2, FALSE, 0, 0);
-            ctx->current_match = index;
-            if (ctx->match_lbl) {
-                gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
-                gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
-                g_free(txt);
-            }
-            return;
-        }
-        start = match_end;
+    /* offsets cached by highlight_all – no rescan from the start per step */
+    if (!ctx->match_offs || (guint)index > ctx->match_offs->len) return;
+    GtkTextIter match_start, match_end;
+    int off = g_array_index(ctx->match_offs, int, index - 1);
+    gtk_text_buffer_get_iter_at_offset(ctx->buffer, &match_start, off);
+    gtk_text_buffer_get_iter_at_offset(ctx->buffer, &match_end, off + ctx->needle_chars);
+    gtk_text_buffer_select_range(ctx->buffer, &match_start, &match_end);
+    /* mark-based scroll also works before the view is laid out */
+    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(ctx->text_view),
+                                 gtk_text_buffer_get_insert(ctx->buffer),
+                                 0.2, FALSE, 0, 0);
+    ctx->current_match = index;
+    if (ctx->match_lbl) {
+        gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
+        gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
+        g_free(txt);
     }
 }
 
@@ -285,6 +283,15 @@ static gboolean on_image_viewer_key(GtkEventControllerKey *ctrl, guint kv,
     return FALSE;
 }
 
+/* close-request must return TRUE: the window is destroyed by the caller
+ * after the loop ends (a FALSE/garbage return would destroy it twice) */
+static gboolean quit_on_close(GtkWindow *w, gpointer loop)
+{
+    (void)w;
+    g_main_loop_quit(loop);
+    return TRUE;
+}
+
 /* Image viewer — simple window with GtkPicture + close/key handling */
 static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
 {
@@ -318,7 +325,7 @@ static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
     gtk_window_set_child(GTK_WINDOW(win), vbox);
 
     g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(g_main_loop_quit), loop);
-    g_signal_connect_swapped(win, "close-request", G_CALLBACK(g_main_loop_quit), loop);
+    g_signal_connect(win, "close-request", G_CALLBACK(quit_on_close), loop);
 
     /* Escape / Q closes */
     GtkEventController *key_ctrl = gtk_event_controller_key_new();
@@ -372,58 +379,30 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     gchar *content = NULL;
     gsize  length  = 0;
 
-    if (!path && p->ssh_conn) {
-#ifdef HAVE_LIBSSH2
-        gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
-        content = ssh_read_file(p->ssh_conn, remote_path,
-                                VIEWER_MAX_BYTES + 1, &length);
-        g_free(remote_path);
-        if (!content) {
-            fm_status(fm, "Viewer: error reading remote file '%s'", name);
-            g_free(name);
-            return;
+    {
+        /* read in a worker – a big or remote file never freezes the UI */
+        gchar *fullpath = NULL;
+        SshConn *conn = NULL;
+        if (!path && p->ssh_conn) {
+            conn     = p->ssh_conn;
+            fullpath = fs_remote_join(conn->remote_path, name);
+        } else {
+            fullpath = path ? g_strdup(path) : panel_cursor_fullpath(p);
         }
-#else
-        fm_status(fm, "Remote file viewer is not supported");
-        g_free(name);
-        return;
-#endif
-    } else {
-        gchar *fullpath = path ? g_strdup(path) : panel_cursor_fullpath(p);
-        struct stat st;
-        if (!fullpath || (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode))) {
-            fm_status(fm, "Viewer: '%s' is a directory", name);
-            g_free(name);
-            g_free(fullpath);
-            return;
-        }
-
-        /* Read at most one byte past the limit, so huge files are not
-         * loaded whole just to be truncated */
-        FILE *fp = fopen(fullpath, "rb");
-        if (!fp) {
-            fm_status(fm, "Viewer: read error – %s", g_strerror(errno));
-            g_free(name);
-            g_free(fullpath);
-            return;
-        }
-        struct stat fst;
-        gsize want = (fstat(fileno(fp), &fst) == 0 && S_ISREG(fst.st_mode)
-                      && (guint64)fst.st_size <= VIEWER_MAX_BYTES)
-                     ? (gsize)fst.st_size + 1 : VIEWER_MAX_BYTES + 1;
-        content = g_malloc(want + 1);
-        length  = fread(content, 1, want, fp);
-        gboolean rerr = ferror(fp);
-        fclose(fp);
-        if (rerr) {
-            fm_status(fm, "Viewer: read error – %s", g_strerror(errno));
-            g_free(content);
-            g_free(name);
-            g_free(fullpath);
-            return;
-        }
-        content[length] = '\0';
+        gchar *err = NULL;
+        gboolean canc = FALSE;
+        content = fm_read_file(fm, conn, fullpath, VIEWER_MAX_BYTES + 1,
+                               &length, &err, &canc);
         g_free(fullpath);
+        if (!content) {
+            if (canc) fm_status(fm, "Viewer: reading cancelled");
+            else      fm_status(fm, "Viewer: read error '%s' – %s", name,
+                                err ? err : "?");
+            g_free(err);
+            g_free(name);
+            return;
+        }
+        g_free(err);
     }
 
     gboolean truncated = FALSE;
@@ -452,6 +431,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     ViewerCtx ctx = {0};
     ctx.loop = g_main_loop_new(NULL, FALSE);
     ctx.match_lines = g_array_new(FALSE, FALSE, sizeof(int));
+    ctx.match_offs  = g_array_new(FALSE, FALSE, sizeof(int));
 
     /* Count lines for match map */
     ctx.total_lines = 1;
@@ -592,7 +572,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     gtk_widget_add_controller(ctx.window, key_ctrl);
 
     g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(g_main_loop_quit), ctx.loop);
-    g_signal_connect_swapped(ctx.window, "close-request", G_CALLBACK(g_main_loop_quit), ctx.loop);
+    g_signal_connect(ctx.window, "close-request", G_CALLBACK(quit_on_close), ctx.loop);
 
     gtk_window_present(GTK_WINDOW(ctx.window));
 
@@ -618,6 +598,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
     g_main_loop_run(ctx.loop);
     g_main_loop_unref(ctx.loop);
     g_array_free(ctx.match_lines, TRUE);
+    g_array_free(ctx.match_offs, TRUE);
     gtk_window_destroy(GTK_WINDOW(ctx.window));
 
     Panel *ap = active_panel(fm);

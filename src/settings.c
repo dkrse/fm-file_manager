@@ -214,6 +214,32 @@ static gchar *settings_path(void)
     return g_build_filename(g_get_user_config_dir(), "fm", "settings.ini", NULL);
 }
 
+/* Like g_key_file_save_to_file, but without the fsync it does when
+ * replacing a file: settings are saved from the main thread on every
+ * toggle/tab change and an fsync can stall the UI for many ms.  The
+ * rename still keeps the file consistent (old or new, never torn). */
+static gboolean kf_save(GKeyFile *kf, const char *path, GError **err)
+{
+    gsize len = 0;
+    gchar *data = g_key_file_to_data(kf, &len, err);
+    if (!data) return FALSE;
+    gboolean ok = g_file_set_contents_full(path, data, (gssize)len,
+                                           G_FILE_SET_CONTENTS_CONSISTENT,
+                                           0600, err);
+    g_free(data);
+    return ok;
+}
+
+/* Reloading a provider restyles every widget (the GUI one matches `*`):
+ * skip it when the generated CSS did not change. */
+static void css_load(GtkCssProvider *prov, const char *css)
+{
+    const char *old = g_object_get_data(G_OBJECT(prov), "fm-css");
+    if (g_strcmp0(old, css) == 0) return;
+    gtk_css_provider_load_from_string(prov, css);
+    g_object_set_data_full(G_OBJECT(prov), "fm-css", g_strdup(css), g_free);
+}
+
 /* Apply editor font CSS – text content + editor window GUI font */
 void apply_editor_css(FM *fm)
 {
@@ -230,7 +256,7 @@ void apply_editor_css(FM *fm)
         "label.fm-editor-status {"
         "  font-family: %s; font-size: %dpt; }",
         fam, fsz, gfam, gfsz);
-    gtk_css_provider_load_from_string(fm->editor_css_provider, css);
+    css_load(fm->editor_css_provider, css);
     g_free(css);
 }
 
@@ -245,7 +271,7 @@ void apply_viewer_css(FM *fm)
         "textview.fm-viewer, textview.fm-viewer > text {"
         "  font-family: %s; font-size: %dpt; }",
         fam, fsz);
-    gtk_css_provider_load_from_string(fm->viewer_css_provider, css);
+    css_load(fm->viewer_css_provider, css);
     g_free(css);
 }
 
@@ -257,7 +283,7 @@ static void apply_font_css(FM *fm)
         "columnview { font-family: %s; font-size: %dpt; }",
         fm->font_family ? fm->font_family : DEFAULT_FONT_FAMILY,
         fm->font_size   > 0 ? fm->font_size : DEFAULT_FONT_SIZE);
-    gtk_css_provider_load_from_string(fm->font_css_provider, css);
+    css_load(fm->font_css_provider, css);
     g_free(css);
 }
 
@@ -353,7 +379,7 @@ static void apply_gui_css(FM *fm)
             "  background-image: none;"
             "}");
     g_free(cursor_css);
-    gtk_css_provider_load_from_string(fm->css_provider, css);
+    css_load(fm->css_provider, css);
     g_free(css);
 }
 
@@ -641,7 +667,7 @@ void settings_save(FM *fm)
     g_key_file_set_integer(kf, SETTINGS_GROUP_DISPLAY, KEY_THEME, fm->theme);
 
     GError *err = NULL;
-    if (!g_key_file_save_to_file(kf, path, &err)) {
+    if (!kf_save(kf, path, &err)) {
         g_warning("settings_save: %s", err ? err->message : "?");
         g_clear_error(&err);
     }
@@ -687,7 +713,7 @@ void settings_save_window(int width, int height, gboolean maximized)
     }
     g_key_file_set_boolean(kf, SETTINGS_GROUP_WINDOW, "maximized", maximized);
     GError *err = NULL;
-    if (!g_key_file_save_to_file(kf, path, &err)) {
+    if (!kf_save(kf, path, &err)) {
         g_warning("settings_save_window: %s", err ? err->message : "?");
         g_clear_error(&err);
     }
@@ -717,7 +743,7 @@ void settings_set_string(const char *group, const char *key, const char *value)
     g_key_file_load_from_file(kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL);
     g_key_file_set_string(kf, group, key, value ? value : "");
     GError *err = NULL;
-    if (!g_key_file_save_to_file(kf, path, &err)) {
+    if (!kf_save(kf, path, &err)) {
         g_warning("settings_set_string: %s", err ? err->message : "?");
         g_clear_error(&err);
     }
@@ -756,7 +782,7 @@ void settings_save_tabs(FM *fm)
     }
 
     GError *err = NULL;
-    if (!g_key_file_save_to_file(kf, path, &err)) {
+    if (!kf_save(kf, path, &err)) {
         g_warning("settings_save_tabs: %s", err ? err->message : "?");
         g_clear_error(&err);
     }
@@ -909,7 +935,7 @@ void settings_save_ssh_bookmarks(FM *fm, GList *list)
     }
 
     GError *err = NULL;
-    if (!g_key_file_save_to_file(kf, path, &err)) {
+    if (!kf_save(kf, path, &err)) {
         g_warning("settings_save_ssh_bookmarks: %s", err ? err->message : "?");
         g_clear_error(&err);
     }

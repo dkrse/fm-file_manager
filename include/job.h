@@ -40,6 +40,7 @@ struct Job {
     GtkWidget *window, *phase_lbl, *from_key, *from_lbl, *to_key, *to_lbl;
     GtkWidget *file_bar, *bar, *detail_lbl;
     guint      timer_id;
+    gint64     created;      /* job_run start: delayed window reveal  */
     GMainLoop *loop;
     JobFunc    fn;
     gpointer   data;

@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define QV_TEXT_MAX   (512 * 1024)  /* read at most this much text      */
 #define QV_BINARY_CHK 8192          /* NUL in the first bytes → binary  */
@@ -73,16 +75,24 @@ static void show_text(Panel *q, const char *title, const char *text)
 
 static gchar *dir_summary(const char *path)
 {
-    GDir *d = g_dir_open(path, 0, NULL);
+    /* d_type avoids one stat() per entry on the main thread */
+    DIR *d = opendir(path);
     if (!d) return g_strdup_printf("Directory\n\n(cannot be read: %s)", g_strerror(errno));
     guint dirs = 0, files = 0;
-    const char *n;
-    while ((n = g_dir_read_name(d)) && dirs + files < QV_DIR_MAX) {
-        gchar *f = g_build_filename(path, n, NULL);
-        if (g_file_test(f, G_FILE_TEST_IS_DIR)) dirs++; else files++;
-        g_free(f);
+    struct dirent *de;
+    while ((de = readdir(d)) && dirs + files < QV_DIR_MAX) {
+        const char *n = de->d_name;
+        if (n[0] == '.' && (!n[1] || (n[1] == '.' && !n[2]))) continue;
+        gboolean isdir;
+        if (de->d_type == DT_DIR) isdir = TRUE;
+        else if (de->d_type != DT_UNKNOWN && de->d_type != DT_LNK) isdir = FALSE;
+        else {
+            struct stat st;
+            isdir = fstatat(dirfd(d), n, &st, 0) == 0 && S_ISDIR(st.st_mode);
+        }
+        if (isdir) dirs++; else files++;
     }
-    g_dir_close(d);
+    closedir(d);
     return g_strdup_printf("Directory\n\n%u subdirectories\n%u files%s",
                            dirs, files, dirs + files >= QV_DIR_MAX ? " (or more)" : "");
 }
@@ -106,7 +116,9 @@ static void qv_render(FM *fm, Panel *q, const char *path)
     gchar *size = fmt_size(st.st_size);
     gchar *title = g_strdup_printf("%s  —  %s", base, size);
 
-    if (fm->viewer_image_preview && viewer_is_image(base)) {
+    /* images decode synchronously on every cursor move: skip huge ones */
+    if (fm->viewer_image_preview && viewer_is_image(base) &&
+        st.st_size <= 32 * 1024 * 1024) {
         gtk_label_set_text(GTK_LABEL(qv_title(q)), title);
         gtk_widget_set_visible(qv_tscroll(q), FALSE);
         gtk_widget_set_visible(qv_pic(q), TRUE);

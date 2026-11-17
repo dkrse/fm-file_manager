@@ -92,21 +92,14 @@ static void monitor_remove(Panel *p, const char *name)
     g_list_store_remove(p->store, (guint)i);
     p->inhibit_sel = FALSE;
     if (p->marks) g_hash_table_remove(p->marks, name);
-    panel_update_status(p);
 }
 
 /* Add a new entry or refresh an existing one (size/date/type changed) */
-static void monitor_upsert(Panel *p, const char *name)
+static void monitor_upsert(Panel *p, const char *name, const struct stat *fst)
 {
     if (!p->fm->show_hidden && name[0] == '.') return;
 
-    gchar *fullpath = g_build_filename(p->cwd, name, NULL);
-    struct stat fst;
-    gboolean ok = lstat(fullpath, &fst) == 0;
-    g_free(fullpath);
-    if (!ok) return;
-
-    FileItem *nfi = file_item_from_stat(p->fm, name, &fst);
+    FileItem *nfi = file_item_from_stat(p->fm, name, fst);
     gint i = store_find(p, name);
     p->inhibit_sel = TRUE;
     if (i >= 0) {
@@ -120,7 +113,6 @@ static void monitor_upsert(Panel *p, const char *name)
     }
     p->inhibit_sel = FALSE;
     g_object_unref(nfi);
-    panel_update_status(p);
 }
 
 /* Events are collected and applied in one batch: unpacking an archive
@@ -150,9 +142,12 @@ static gboolean monitor_flush(gpointer data)
             struct stat st;
             gboolean exists = lstat(full, &st) == 0;
             g_free(full);
-            if (exists) monitor_upsert(p, key);
+            if (exists) monitor_upsert(p, key, &st);
             else        monitor_remove(p, key);
         }
+        /* once per batch: each store change invalidates the item index,
+         * so a per-event status update rebuilt it for every file */
+        panel_update_status(p);
         cursor_name_restore(p, cur, old_pos);
     }
     g_hash_table_destroy(pending);

@@ -238,36 +238,69 @@ static int same_bytes(const char *a, const char *b)
 
 #define DIFF_MAX_SHOW (8 * 1024 * 1024)
 
+/* diff runs asynchronously – a big pair of files must not freeze the UI */
+typedef struct { FM *fm; gchar *f1, *f2; } DiffCtx;
+
+static void diff_show(FM *fm, const char *f1, const char *f2, gchar *out);
+
+static void on_diff_done(GObject *src, GAsyncResult *res, gpointer d)
+{
+    DiffCtx *dc = d;
+    GSubprocess *sp = G_SUBPROCESS(src);
+    GBytes *bout = NULL, *berr = NULL;
+    GError *e = NULL;
+    gboolean ok = g_subprocess_communicate_finish(sp, res, &bout, &berr, &e);
+    int code = ok && g_subprocess_get_if_exited(sp) ? g_subprocess_get_exit_status(sp) : -1;
+    gsize lo = 0, le = 0;
+    const char *po = bout ? g_bytes_get_data(bout, &lo) : NULL;
+    const char *pe = berr ? g_bytes_get_data(berr, &le) : NULL;
+    gchar *out = po ? g_strndup(po, lo) : NULL;
+    gchar *err = pe ? g_strndup(pe, le) : NULL;
+    if (bout) g_bytes_unref(bout);
+    if (berr) g_bytes_unref(berr);
+
+    if (!ok) {
+        fm_status(dc->fm, "Compare files: %s", e ? e->message : "diff failed");
+        g_clear_error(&e);
+        g_free(out);
+    } else if (code == 0) {
+        fm_status(dc->fm, "Files are identical");
+        g_free(out);
+    } else if (code != 1 || !out || !out[0]) {
+        fm_status(dc->fm, "Compare files: %s", err && err[0] ? g_strstrip(err) : "diff failed");
+        g_free(out);
+    } else {
+        fm_status(dc->fm, "%s", "");
+        diff_show(dc->fm, dc->f1, dc->f2, out);     /* takes out */
+    }
+    g_free(err);
+    g_free(dc->f1); g_free(dc->f2);
+    g_free(dc);
+}
+
 static void builtin_diff(FM *fm, const char *f1, const char *f2)
 {
-    gchar *out = NULL, *err = NULL;
-    gint status = 0;
     GError *e = NULL;
-    const gchar *argv[] = { "diff", "-u", "--", f1, f2, NULL };
-    gboolean ran = g_spawn_sync(NULL, (gchar **)argv, NULL,
-                                G_SPAWN_SEARCH_PATH, NULL, NULL,
-                                &out, &err, &status, &e);
-    int code = ran && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    if (!ran) {
+    GSubprocess *sp = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+                                       G_SUBPROCESS_FLAGS_STDERR_PIPE, &e,
+                                       "diff", "-u", "--", f1, f2, NULL);
+    if (!sp) {
         g_clear_error(&e);
         int same = same_bytes(f1, f2);
         fm_status(fm, same == 1 ? "Files are identical" :
                       same == 0 ? "Files differ (install diffutils for a line-by-line view)"
                                 : "Compare files: cannot read the files");
-        g_free(out); g_free(err);
         return;
     }
-    if (code == 0) {
-        fm_status(fm, "Files are identical");
-        g_free(out); g_free(err);
-        return;
-    }
-    if (code != 1 || !out || !out[0]) {
-        fm_status(fm, "Compare files: %s", err && err[0] ? g_strstrip(err) : "diff failed");
-        g_free(out); g_free(err);
-        return;
-    }
-    g_free(err);
+    DiffCtx *dc = g_new0(DiffCtx, 1);
+    dc->fm = fm; dc->f1 = g_strdup(f1); dc->f2 = g_strdup(f2);
+    fm_status(fm, "Comparing…");
+    g_subprocess_communicate_async(sp, NULL, NULL, on_diff_done, dc);
+    g_object_unref(sp);
+}
+
+static void diff_show(FM *fm, const char *f1, const char *f2, gchar *out)
+{
 
     gsize len = strlen(out);
     gboolean cut = len > DIFF_MAX_SHOW;

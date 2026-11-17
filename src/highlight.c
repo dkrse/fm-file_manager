@@ -276,7 +276,10 @@ void highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled)
     gsize  tlen = strlen(text);
     if (tlen > 512 * 1024) { g_free(text); return; }
 
-    GRegex *re = build_regex(lang);
+    /* compiling the optimized regex costs more than matching small files */
+    static GRegex *cache[LANG_JS + 1];
+    if (!cache[lang]) cache[lang] = build_regex(lang);
+    GRegex *re = cache[lang] ? g_regex_ref(cache[lang]) : NULL;
     if (!re) { g_free(text); return; }
 
     ensure_tags(buf);
