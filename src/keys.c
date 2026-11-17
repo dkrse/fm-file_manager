@@ -305,16 +305,16 @@ gboolean on_window_key_press(GtkEventControllerKey *ctrl,
         if (state & GDK_CONTROL_MASK) {
             Panel *a = active_panel(fm), *o = other_panel(fm);
             if (a->ssh_conn || o->ssh_conn) {
-                /* remote → remote only within the same server */
-                SshConn *ac = a->ssh_conn, *oc = o->ssh_conn;
-                if (ac && oc && ac->port == oc->port &&
-                    g_strcmp0(ac->host, oc->host) == 0 &&
-                    g_strcmp0(ac->user, oc->user) == 0) {
-                    panel_load(o, ac->remote_path);
-                    fm_status(fm, "Panels synchronized");
+                /* remote → remote: load the same path in the other panel */
+                if (a->ssh_conn && o->ssh_conn) {
+                    gchar *want = g_strdup(a->ssh_conn->remote_path);
+                    panel_load(o, want);
+                    if (g_strcmp0(o->ssh_conn ? o->ssh_conn->remote_path : NULL,
+                                  want) == 0)
+                        fm_status(fm, "Panels synchronized");
+                    g_free(want);
                 } else {
-                    fm_status(fm, "Cannot synchronize a local and an SFTP panel "
-                                  "(or two different servers)");
+                    fm_status(fm, "Cannot synchronize a local and an SFTP panel");
                 }
                 return TRUE;
             }

@@ -14,14 +14,69 @@ static GdkClipboard *clipboard(FM *fm)
     return gtk_widget_get_clipboard(fm->window);
 }
 
+/* SFTP items cannot go through the system clipboard as file:// URIs –
+ * keep them here; the system clipboard gets sftp:// text, and the remote
+ * copy stays valid only while that text is still our clipboard content. */
+static struct {
+    guint               serial;     /* SshConn->serial of the source */
+    GList              *paths;      /* remote paths */
+    gboolean            cut;
+    GdkContentProvider *owner;      /* weak: content we set */
+} rclip;
+
+static void rclip_clear(void)
+{
+    g_list_free_full(rclip.paths, g_free);
+    rclip.paths = NULL;
+    rclip.serial = 0;
+    rclip.owner = NULL;
+}
+
+/* the source connection, if some tab still uses it */
+static SshConn *rclip_conn(FM *fm)
+{
+    for (int i = 0; i < 2; i++) {
+        Panel *p = &fm->panels[i];
+        if (p->ssh_conn && p->ssh_conn->serial == rclip.serial) return p->ssh_conn;
+        for (guint j = 0; p->tabs && j < p->tabs->len; j++) {
+            PanelTab *t = g_ptr_array_index(p->tabs, j);
+            if (t->conn && t->conn->serial == rclip.serial) return t->conn;
+        }
+    }
+    return NULL;
+}
+
+static gpointer dup_str(gconstpointer s, gpointer u) { (void)u; return g_strdup(s); }
+
+static void clip_copy_remote(FM *fm, Panel *p, gboolean cut)
+{
+    GList *paths = panel_selection_paths(p);
+    if (!paths) { fm_status(fm, "Nothing is selected"); return; }
+    rclip_clear();
+    GString *s = g_string_new(NULL);
+    int n = 0;
+    for (GList *l = paths; l; l = l->next, n++) {
+        if (s->len) g_string_append_c(s, '\n');
+        g_string_append_printf(s, "sftp://%s@%s%s", p->ssh_conn->user,
+                               p->ssh_conn->host, (const char *)l->data);
+    }
+    GdkContentProvider *cp = gdk_content_provider_new_typed(G_TYPE_STRING, s->str);
+    gdk_clipboard_set_content(clipboard(fm), cp);
+    g_object_unref(cp);
+    g_string_free(s, TRUE);
+    rclip.serial = p->ssh_conn->serial;
+    rclip.paths  = paths;
+    rclip.cut    = cut;
+    rclip.owner  = cp;          /* clipboard keeps it alive while ours */
+    fm_status(fm, "%s %d item%s to clipboard", cut ? "Cut" : "Copied",
+              n, n == 1 ? "" : "s");
+}
+
 void clip_copy(FM *fm, gboolean cut)
 {
     Panel *p = active_panel(fm);
     if (arc_panel_readonly_msg(p)) return;      /* F5 extracts instead */
-    if (p->ssh_conn) {
-        fm_status(fm, "Clipboard works with local files only – use F5/F6 for SFTP");
-        return;
-    }
+    if (p->ssh_conn) { clip_copy_remote(fm, p, cut); return; }
     GList *paths = panel_selection_paths(p);
     if (!paths) { fm_status(fm, "Nothing is selected"); return; }
 
@@ -51,6 +106,7 @@ void clip_copy(FM *fm, gboolean cut)
         gdk_content_provider_new_typed(G_TYPE_STRING, s_text),
     };
     GdkContentProvider *u = gdk_content_provider_new_union(provs, G_N_ELEMENTS(provs));
+    rclip_clear();
     gdk_clipboard_set_content(clipboard(fm), u);
     g_object_unref(u);
     g_bytes_unref(b_gnome); g_bytes_unref(b_uris); g_bytes_unref(b_kde);
@@ -159,7 +215,30 @@ void clip_paste(FM *fm)
     static const char *mimes[] = {
         "x-special/gnome-copied-files", "text/uri-list", NULL
     };
-    if (arc_panel_readonly_msg(active_panel(fm))) return;
-    gdk_clipboard_read_async(clipboard(fm), mimes, G_PRIORITY_DEFAULT, NULL,
+    Panel *p = active_panel(fm);
+    if (arc_panel_readonly_msg(p)) return;
+    GdkClipboard *cb = clipboard(fm);
+    if (rclip.paths && gdk_clipboard_is_local(cb) &&
+        gdk_clipboard_get_content(cb) == rclip.owner) {
+        SshConn *src = rclip_conn(fm);
+        if (!src) {
+            fm_status(fm, "The SFTP connection of the copied files is closed");
+        } else if (p->search_mode) {
+            fm_status(fm, "Leave search results first");
+        } else {
+            gboolean cut = rclip.cut;
+            GList *paths = g_list_copy_deep(rclip.paths, dup_str, NULL);
+            int r = fo_transfer(fm, paths, src, panel_dir(p), p->ssh_conn, cut);
+            if (cut && r == FS_OK) {
+                gdk_clipboard_set_content(cb, NULL);
+                rclip_clear();
+            }
+            g_list_free_full(paths, g_free);
+            panel_focus(p);
+        }
+        return;
+    }
+    if (rclip.paths) rclip_clear();     /* someone else owns the clipboard */
+    gdk_clipboard_read_async(cb, mimes, G_PRIORITY_DEFAULT, NULL,
                              on_clipboard_read, fm);
 }
