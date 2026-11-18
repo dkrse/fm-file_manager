@@ -72,6 +72,9 @@ gboolean on_window_key_press(GtkEventControllerKey *ctrl,
         return TRUE;
     }
 
+    /* command line: typing in a panel, Ctrl+Enter, navigation */
+    if (cmdline_handle_key(fm, keyval, state)) return TRUE;
+
     /* Tools: quick view, compare, checksums, network, background jobs */
     {
         gboolean c = (state & GDK_CONTROL_MASK) != 0;
@@ -137,7 +140,10 @@ gboolean on_window_key_press(GtkEventControllerKey *ctrl,
 
     /* F-keys – only when not typing in path entry */
     GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(fm->window));
-    if (focus && (GTK_IS_EDITABLE(focus) || GTK_IS_TEXT_VIEW(focus))) return FALSE;
+    gboolean in_cmd = focus && fm->cmdline &&
+        (focus == fm->cmdline || gtk_widget_is_ancestor(focus, fm->cmdline));
+    if (in_cmd && !(keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F12)) return FALSE;
+    if (!in_cmd && focus && (GTK_IS_EDITABLE(focus) || GTK_IS_TEXT_VIEW(focus))) return FALSE;
 
     gboolean shift = (state & GDK_SHIFT_MASK) != 0;
     gboolean ctl   = (state & GDK_CONTROL_MASK) != 0;

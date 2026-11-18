@@ -541,6 +541,45 @@ void ssh_panel_close(Panel *p)
     panel_tabs_drop_conn(p, conn);
 }
 
+/* ── ssh_exec ─ run a shell command on the server (blocking; call it
+ * from a worker thread).  Returns the exit status, -1 on failure. */
+static void chan_drain(LIBSSH2_CHANNEL *ch, int stream, GString *s)
+{
+    char buf[16384];
+    ssize_t n;
+    while ((n = libssh2_channel_read_ex(ch, stream, buf, sizeof buf)) > 0)
+        if (s->len < 1024 * 1024) g_string_append_len(s, buf, n);
+}
+
+int ssh_exec(SshConn *conn, const char *dir, const char *cmd,
+             gchar **out, gchar **err_out)
+{
+    *out = *err_out = NULL;
+    if (!conn || !conn->session) return -1;
+    ssh_conn_lock(conn);
+    LIBSSH2_CHANNEL *ch = libssh2_channel_open_session(conn->session);
+    if (!ch) { ssh_conn_unlock(conn); return -1; }
+    gchar *qd = g_shell_quote(dir && dir[0] ? dir : "/");
+    gchar *full = g_strdup_printf("cd -- %s && %s", qd, cmd);
+    int code = -1;
+    if (libssh2_channel_exec(ch, full) == 0) {
+        GString *o = g_string_new(NULL), *e = g_string_new(NULL);
+        chan_drain(ch, 0, o);
+        chan_drain(ch, SSH_EXTENDED_DATA_STDERR, e);
+        libssh2_channel_send_eof(ch);
+        libssh2_channel_wait_eof(ch);
+        libssh2_channel_close(ch);
+        libssh2_channel_wait_closed(ch);
+        code = libssh2_channel_get_exit_status(ch);
+        *out = g_string_free(o, FALSE);
+        *err_out = g_string_free(e, FALSE);
+    }
+    libssh2_channel_free(ch);
+    ssh_conn_unlock(conn);
+    g_free(full); g_free(qd);
+    return code;
+}
+
 /* ── ssh_read_file ────────────────────────────────────────────────── */
 
 gchar *ssh_read_file(SshConn *conn, const char *path, gsize max_len,
@@ -1359,6 +1398,8 @@ void ssh_panel_close(Panel *p)
 SshConn *ssh_conn_ref(SshConn *conn) { if (conn) conn->refs++; return conn; }
 void ssh_conn_unref(SshConn *conn) { if (conn && --conn->refs <= 0) g_free(conn); }
 void ssh_connect_cancel(Panel *p) { (void)p; }
+int ssh_exec(SshConn *conn, const char *dir, const char *cmd, gchar **out, gchar **err_out)
+{ (void)conn; (void)dir; (void)cmd; *out = *err_out = NULL; return -1; }
 
 gchar *ssh_read_file(SshConn *conn, const char *path, gsize max_len,
                      gsize *out_len)

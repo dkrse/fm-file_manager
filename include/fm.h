@@ -184,7 +184,9 @@ struct _FM {
     GtkWidget      *paned;
     Panel           panels[2];
     int             active;     /* 0 = left, 1 = right                */
-    GtkWidget      *statusbar;  /* GtkLabel                           */
+    GtkWidget      *statusbar;  /* GtkLabel (not shown; last message)  */
+    GtkWidget      *cmdline;    /* command line entry (mc style)      */
+    GtkWidget      *cmd_prompt; /* "dir$" label before it             */
     /* CSS providers */
     GtkCssProvider *css_provider;        /* static app CSS              */
     GtkCssProvider *font_css_provider;   /* panel font – reloaded       */
@@ -314,6 +316,10 @@ GtkWidget *panel_menu_button(const char *grp);
 void      panel_context_menu_attach(Panel *p, const char *grp);
 /* keys.c */
 GtkWidget *create_toolbar(FM *fm);
+GtkWidget *create_cmdline(FM *fm);
+void      cmdline_update_prompt(FM *fm);
+void      cmdline_insert(FM *fm, const char *text);
+gboolean  cmdline_handle_key(FM *fm, guint keyval, GdkModifierType state);
 gboolean  on_window_key_press(GtkEventControllerKey *ctrl, guint keyval,
                               guint keycode, GdkModifierType state, FM *fm);
 gchar *panel_cursor_name(Panel *p);          /* caller must g_free()  */
@@ -462,6 +468,8 @@ void      ssh_connect_cancel(Panel *p);      /* drop a connect in flight */
 gboolean  ssh_conn_trylock(SshConn *conn);   /* main thread: FALSE = job busy */
 void      ssh_conn_lock   (SshConn *conn);
 void      ssh_conn_unlock (SshConn *conn);
+int       ssh_exec(SshConn *conn, const char *dir, const char *cmd,
+                   gchar **out, gchar **err_out);
 gchar    *ssh_read_file (SshConn *conn, const char *path, gsize max_len,
                           gsize *out_len);   /* max_len 0 = no limit */
 gboolean  ssh_write_file(SshConn *conn, const char *path, const gchar *data, gsize len);

@@ -26,6 +26,11 @@ void fm_status(FM *fm, const char *fmt, ...)
     gchar *msg = g_strdup_vprintf(fmt, ap);
     va_end(ap);
     gtk_label_set_text(GTK_LABEL(fm->statusbar), msg);
+    /* no status bar – the last message shows in the empty command line */
+    if (fm->cmdline) {
+        gtk_entry_set_placeholder_text(GTK_ENTRY(fm->cmdline), msg);
+        gtk_widget_set_tooltip_text(fm->cmdline, msg);
+    }
     g_free(msg);
 }
 
@@ -66,6 +71,7 @@ static GHashTable *item_index(Panel *p)
 
 void panel_update_status(Panel *p)
 {
+    if (p->idx == p->fm->active) cmdline_update_prompt(p->fm);
     guint n_marks = p->marks ? g_hash_table_size(p->marks) : 0;
     guint total = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
 
@@ -1381,6 +1387,7 @@ void set_active_panel(FM *fm, int idx)
             gtk_widget_add_css_class(pp->path_entry, "inactive-panel");
         }
     }
+    cmdline_update_prompt(fm);
 }
 
 /* Make p the active panel and put the keyboard cursor on it.
@@ -2201,8 +2208,8 @@ static void on_activate(GtkApplication *app, gpointer data)
 
     gtk_widget_set_vexpand(fm->paned, TRUE);
     gtk_box_append(GTK_BOX(vbox), fm->paned);
+    gtk_box_append(GTK_BOX(vbox), create_cmdline(fm));
     gtk_box_append(GTK_BOX(vbox), toolbar);
-    gtk_box_append(GTK_BOX(vbox), fm->statusbar);
 
     /* global key handler (CAPTURE phase for Tab + F-keys) */
     GtkEventController *win_key = gtk_event_controller_key_new();

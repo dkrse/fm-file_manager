@@ -415,6 +415,12 @@ static const char *const help_keys[][2] = {
     { "Alt+K / Alt+Shift+K", "Create / verify checksums" },
     { "Ctrl+N",              "Connect to server (SMB, FTP, WebDAV …)" },
     { "Ctrl+J",              "Show background jobs" },
+    { "Typing in a panel",   "Command line – Enter runs it (also on SFTP)" },
+    { "cd dir",              "Change directory of the active panel" },
+    { "Ctrl+Enter / +Shift", "Insert file name / full path into it" },
+    { "Tab (command line)",  "Complete file name" },
+    { "Alt+P / Alt+N",       "Command history (in the command line)" },
+    { "Esc (command line)",  "Clear it, back to the panel" },
     { "F10",                 "Quit" },
 };
 

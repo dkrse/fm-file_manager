@@ -1,12 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## [3.5.1] - 2026-11-18
 
 **New:**
 - Syntax highlighting for Assembly (NASM/Intel and GNU as/AT&T; x86-64, ARM, RISC-V registers), nginx, Devicetree and Kconfig – language specs bundled in the binary (GResource)
 - More files recognised: systemd units, `.conf`/`.cfg`/`.properties`, `.env`, `.jsonc`/`.json5`/`.ipynb`, `.vue`/`.svelte`, GLSL shaders, `.hxx`, `.mm`, `Containerfile`, `Jenkinsfile`, `Vagrantfile`, `Gemfile`, `.editorconfig` …
 
+- Command line like in Midnight Commander above the F-key bar: typing in a panel goes there, Enter runs the command in the panel's directory without a terminal (on SFTP panels on the server), `cd`, Ctrl+Enter inserts the file name, Tab completion, history (Alt+P / Alt+N)
+
 **Changed:**
+- The status bar at the bottom was removed; status messages appear in the empty command line
 - Font sizes are now in points (pt) like the rest of GTK, so the viewer/editor/panel text matches the size shown in the font dialog; old pixel sizes are converted once on first start
 
 **Fixed:**

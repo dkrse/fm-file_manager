@@ -29,7 +29,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 
 - **Two panels** — navigation like in Total Commander
 - **Tabs** — Total Commander style tabs per panel: Ctrl+T new, Ctrl+W close, Ctrl+Tab / Ctrl+Shift+Tab switch, Ctrl+↑ opens the directory under the cursor in a new tab; click a tab to switch, middle-click to close; the tab strip appears with 2+ tabs; tabs work on SFTP panels too — a new tab shares the connection (tab label `host:dir`), each tab keeps its own remote directory, Disconnect returns every tab of that connection to its local directory; tabs are saved right after every change and restored on the next start (SFTP tabs as their local directory)
-- **Devices** — drive button left of the path bar (Alt+F1 left panel, Alt+F2 right panel), like Double / Total Commander: File System, Home, mounted devices and not-yet-mounted volumes (USB sticks, partitions, encrypted disks, phones); Enter / click mounts (asks for a passphrase when needed) and opens it, ⏏ or Del unmounts / ejects; newly plugged devices are announced in the status bar, panels on a removed device move to Home
+- **Devices** — drive button left of the path bar (Alt+F1 left panel, Alt+F2 right panel), like Double / Total Commander: File System, Home, mounted devices and not-yet-mounted volumes (USB sticks, partitions, encrypted disks, phones); Enter / click mounts (asks for a passphrase when needed) and opens it, ⏏ or Del unmounts / ejects; newly plugged devices are announced in the command line, panels on a removed device move to Home
 - **Editable path** — path entry at the top of each panel, Enter loads directory, supports ~ and relative paths
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
 - **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
@@ -49,13 +49,14 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too; files up to 100 MB (larger remote files are refused without being downloaded)
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS); switched off automatically for files over 2 MB to keep large files fast
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
+- **Command line** — Midnight Commander style, above the F-key bar: typing in a panel goes there, Enter runs the command with `sh -c` in the active panel's directory without a terminal (on an SFTP panel it runs on the server over the same SSH connection); the result (`done` / `exit N` + the first output line) is shown in the command line and both panels are refreshed; `cd dir` changes the panel's directory; Ctrl+Enter / Ctrl+Shift+Enter insert the file name / full path under the cursor, Tab completes file names, Alt+P / Alt+N browse the history (saved in `~/.config/fm/cmd_history`); status messages appear in the empty command line
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — any number of named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; Save with a new name adds a connection, the same name updates it, New clears the form, Remove deletes the selected one; custom private key path per connection
 - **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates (add/remove/update individual files, no full reload)
 - **Compare / synchronize directories** — Alt+C marks in both panels the files that are missing on the other side or newer (2 s tolerance for FAT); then copy left → right, right → left or both ways in one step (local and SFTP); files with the same time but a different size are reported, not marked
 - **Compare files** — Alt+D on two marked files or the cursor file of each panel: opens meld / kdiff3 / kompare / diffuse (or the program set in Settings → System → Compare tool), otherwise a built-in coloured unified diff
 - **Quick view** — Ctrl+Q shows the file under the cursor in the other panel: text (first 512 KB), images, directory summary; follows the cursor
-- **Background operations** — local copy / move / delete can be sent to the background ("Background" button in the progress window); further operations queue up behind it, the status bar shows the progress, Ctrl+J shows the window again; closing the main window waits for running jobs
+- **Background operations** — local copy / move / delete can be sent to the background ("Background" button in the progress window); further operations queue up behind it, the command line shows the progress, Ctrl+J shows the window again; closing the main window waits for running jobs
 - **Checksums** — Alt+K creates MD5 / SHA-1 / SHA-256 / SHA-512 sums of the marked files (directories recursively), copy them or save as `.sha256` …; Alt+Shift+K verifies a checksum file (GNU and BSD format) and lists failed / missing files first
 - **Network locations** — Ctrl+N connects to `smb://`, `ftp://`, `dav(s)://`, `sftp://`, `nfs://` … through GIO/gvfs (password dialog, keyring); the panel opens the gvfs FUSE path, so every operation works there; last 10 addresses remembered; ⏏ in the device picker disconnects (needs gvfs + gvfs-fuse, standard on GNOME/Xfce/Cinnamon)
 - **Remembered window size** — the main window opens with the size (and maximized state) it had when it was last closed
@@ -116,6 +117,17 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Alt+K / Alt+Shift+K | Create / verify checksums |
 | Ctrl+N | Connect to server (SMB, FTP, WebDAV …) |
 | Ctrl+J | Show background jobs |
+
+### Command line
+| Key | Action |
+|-----|--------|
+| Typing in a panel | Goes to the command line (`+ - *` and Space keep their panel meaning while it is empty) |
+| Enter | Run the command (in the background, also on SFTP); `cd dir` changes directory |
+| Ctrl+Enter / Ctrl+Shift+Enter | Insert file name / full path under the cursor |
+| Tab | Complete file name |
+| Alt+P / Alt+N | Previous / next command from the history |
+| ↑ ↓ PgUp PgDn Insert | Still move / mark in the panel |
+| Esc | Clear the command line |
 
 ### Editor / Viewer
 | Key | Action |
@@ -197,6 +209,7 @@ src/main.c          — window, panels, CSS, filter, application start
 src/tabs.c          — panel tabs
 src/menus.c         — hamburger menu, context menu, "Open with", file mask
 src/keys.c          — F-key toolbar, global key handler
+src/cmdline.c       — command line (run, cd, history, Tab completion)
 src/compare.c       — compare / synchronize directories, compare files
 src/quickview.c     — quick view (Ctrl+Q)
 src/checksum.c      — create / verify checksums
