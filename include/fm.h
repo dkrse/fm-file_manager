@@ -318,6 +318,7 @@ void      panel_context_menu_attach(Panel *p, const char *grp);
 GtkWidget *create_toolbar(FM *fm);
 GtkWidget *create_cmdline(FM *fm);
 void      cmdline_update_prompt(FM *fm);
+void      cmdline_apply_css(FM *fm);
 void      cmdline_insert(FM *fm, const char *text);
 gboolean  cmdline_handle_key(FM *fm, guint keyval, GdkModifierType state);
 gboolean  on_window_key_press(GtkEventControllerKey *ctrl, guint keyval,

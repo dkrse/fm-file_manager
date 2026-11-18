@@ -280,6 +280,24 @@ static gboolean on_cmd_key(GtkEventControllerKey *c, guint kv, guint kc,
     return FALSE;
 }
 
+/* entry colours follow the light/dark appearance (mc look in light) */
+void cmdline_apply_css(FM *fm)
+{
+    static GtkCssProvider *css;
+    if (!css) {
+        css = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+            GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
+    }
+    gtk_css_provider_load_from_string(css, fm_dark(fm)
+        ? "entry.fm-cmdline-entry { background: #1e1e1e; color: #e0e0e0;"
+          " caret-color: #e0e0e0; }"
+          "entry.fm-cmdline-entry text placeholder { color: #808080; }"
+        : "entry.fm-cmdline-entry { background: #ffffff; color: #000000;"
+          " caret-color: #000000; }"
+          "entry.fm-cmdline-entry text placeholder { color: #808080; }");
+}
+
 GtkWidget *create_cmdline(FM *fm)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -288,15 +306,7 @@ GtkWidget *create_cmdline(FM *fm)
     gtk_widget_set_margin_end(box, 4);
     gtk_widget_set_margin_top(box, 2);
 
-    /* white entry (mc look), regardless of the theme */
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(css,
-        "entry.fm-cmdline-entry { background: #ffffff; color: #000000;"
-        " caret-color: #000000; }"
-        "entry.fm-cmdline-entry text placeholder { color: #808080; }");
-    gtk_style_context_add_provider_for_display(gdk_display_get_default(),
-        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 3);
-    g_object_unref(css);
+    cmdline_apply_css(fm);
 
     fm->cmdline = gtk_entry_new();
     gtk_widget_set_hexpand(fm->cmdline, TRUE);

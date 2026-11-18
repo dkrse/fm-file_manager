@@ -290,6 +290,7 @@ static void apply_font_css(FM *fm)
 /* Apply GUI font CSS (buttons, labels, entries, dialogs) */
 static void apply_gui_css(FM *fm)
 {
+    cmdline_apply_css(fm);
     if (!fm->css_provider) return;
 
     const char *gui_fam = fm->gui_font_family ? fm->gui_font_family : DEFAULT_GUI_FAMILY;
