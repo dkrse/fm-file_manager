@@ -308,6 +308,14 @@ GtkWidget *create_cmdline(FM *fm)
 
     cmdline_apply_css(fm);
 
+    /* shell-like "dir$" prompt so the bar reads as a command line */
+    fm->cmd_prompt = gtk_label_new("$");
+    gtk_widget_add_css_class(fm->cmd_prompt, "monospace");
+    gtk_widget_add_css_class(fm->cmd_prompt, "fm-cmdline-prompt");
+    gtk_label_set_ellipsize(GTK_LABEL(fm->cmd_prompt), PANGO_ELLIPSIZE_START);
+    gtk_label_set_max_width_chars(GTK_LABEL(fm->cmd_prompt), 40);
+    gtk_box_append(GTK_BOX(box), fm->cmd_prompt);
+
     fm->cmdline = gtk_entry_new();
     gtk_widget_set_hexpand(fm->cmdline, TRUE);
     gtk_widget_add_css_class(fm->cmdline, "monospace");

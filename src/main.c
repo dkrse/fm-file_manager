@@ -26,11 +26,6 @@ void fm_status(FM *fm, const char *fmt, ...)
     gchar *msg = g_strdup_vprintf(fmt, ap);
     va_end(ap);
     gtk_label_set_text(GTK_LABEL(fm->statusbar), msg);
-    /* no status bar – the last message shows in the empty command line */
-    if (fm->cmdline) {
-        gtk_entry_set_placeholder_text(GTK_ENTRY(fm->cmdline), msg);
-        gtk_widget_set_tooltip_text(fm->cmdline, msg);
-    }
     g_free(msg);
 }
 

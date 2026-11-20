@@ -982,6 +982,7 @@ static void test_content_extra(void)
     g_free(t); g_free(bin); g_free(root);
 }
 
+#ifdef HAVE_LIBARCHIVE
 static FsAnswer arc_skip(FsCtx *c, const char *s, const char *d)
 {
     (void)c; (void)s; (void)d;
@@ -1043,6 +1044,7 @@ static void test_arcfs_base_prefix(void)
     rm_rf(root);
     g_free(x); g_free(y); g_free(ab); g_free(tar); g_free(out); g_free(root);
 }
+#endif /* HAVE_LIBARCHIVE */
 
 int main(int argc, char **argv)
 {
@@ -1083,11 +1085,11 @@ int main(int argc, char **argv)
     g_test_add_func("/arcfs/extract",          test_arcfs_extract);
     g_test_add_func("/arcfs/symlink-escape",   test_arcfs_symlink_escape);
     g_test_add_func("/arcfs/base-prefix",      test_arcfs_base_prefix);
+#endif
     g_test_add_func("/fsops/worst-cancel",     test_worst_and_cancel);
     g_test_add_func("/fsops/calc-size",        test_calc_size);
     g_test_add_func("/util/checksum-names",    test_checksum_names);
     g_test_add_func("/util/local-exists",      test_local_exists);
     g_test_add_func("/util/content-extra",     test_content_extra);
-#endif
     return g_test_run();
 }
