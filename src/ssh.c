@@ -1,3 +1,4 @@
+#include <poll.h>
 #include "fm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -543,12 +544,37 @@ void ssh_panel_close(Panel *p)
 
 /* ── ssh_exec ─ run a shell command on the server (blocking; call it
  * from a worker thread).  Returns the exit status, -1 on failure. */
-static void chan_drain(LIBSSH2_CHANNEL *ch, int stream, GString *s)
+/* stdout and stderr are read together: draining stdout to EOF first
+ * deadlocks once the command fills the stderr window (server stops) */
+static void chan_drain_both(LIBSSH2_SESSION *sess, int sock,
+                            LIBSSH2_CHANNEL *ch, GString *o, GString *e)
 {
     char buf[16384];
-    ssize_t n;
-    while ((n = libssh2_channel_read_ex(ch, stream, buf, sizeof buf)) > 0)
-        if (s->len < 1024 * 1024) g_string_append_len(s, buf, n);
+    libssh2_session_set_blocking(sess, 0);
+    for (;;) {
+        gboolean got = FALSE;
+        for (int stream = 0; stream < 2; stream++) {
+            GString *s = stream ? e : o;
+            ssize_t n;
+            while ((n = libssh2_channel_read_ex(ch,
+                        stream ? SSH_EXTENDED_DATA_STDERR : 0, buf, sizeof buf)) > 0) {
+                got = TRUE;
+                if (s->len < 1024 * 1024) g_string_append_len(s, buf, n);
+            }
+            if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) goto out;
+        }
+        if (libssh2_channel_eof(ch)) break;
+        if (!got) {
+            struct pollfd pfd = { .fd = sock, .events = 0 };
+            int dir = libssh2_session_block_directions(sess);
+            if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)  pfd.events |= POLLIN;
+            if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) pfd.events |= POLLOUT;
+            if (!pfd.events) pfd.events = POLLIN;
+            if (poll(&pfd, 1, 60000) <= 0) break;   /* same as the session timeout */
+        }
+    }
+out:
+    libssh2_session_set_blocking(sess, 1);
 }
 
 int ssh_exec(SshConn *conn, const char *dir, const char *cmd,
@@ -564,8 +590,7 @@ int ssh_exec(SshConn *conn, const char *dir, const char *cmd,
     int code = -1;
     if (libssh2_channel_exec(ch, full) == 0) {
         GString *o = g_string_new(NULL), *e = g_string_new(NULL);
-        chan_drain(ch, 0, o);
-        chan_drain(ch, SSH_EXTENDED_DATA_STDERR, e);
+        chan_drain_both(conn->session, conn->sock, ch, o, e);
         libssh2_channel_send_eof(ch);
         libssh2_channel_wait_eof(ch);
         libssh2_channel_close(ch);
@@ -1161,6 +1186,16 @@ static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_d
     }
     connect_pending[idx] = FALSE;
 
+    if (conn && ctx->panel->busy) {
+        /* a search/job owns the panel (nested loop): retargeting it now
+         * would mix its results into the SFTP tab */
+        fm_status(ctx->fm, "Panel busy – connection to %s closed", conn->host);
+        ssh_conn_free(conn);
+        conn = NULL;
+        g_free(ctx->user);
+        g_free(ctx);
+        return;
+    }
     if (conn) {
         panel_tab_set_conn(ctx->panel, conn);
         gchar *start = g_strdup(conn->remote_path);   /* home, see thread */

@@ -43,18 +43,6 @@ FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st)
     return fi;
 }
 
-static gint store_find(Panel *p, const char *name)
-{
-    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
-    for (guint i = 0; i < n; i++) {
-        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
-        gboolean hit = fi && strcmp(fi->name, name) == 0;
-        if (fi) g_object_unref(fi);
-        if (hit) return (gint)i;
-    }
-    return -1;
-}
-
 /* Store changes shift rows: keep the cursor on the same file, or on the
  * row where it was when that file disappeared */
 static gchar *cursor_name_save(Panel *p)
@@ -84,35 +72,81 @@ static void cursor_name_restore(Panel *p, gchar *name, guint old_pos)
     p->inhibit_sel = FALSE;
 }
 
-static void monitor_remove(Panel *p, const char *name)
+static gint cmp_uint_desc(gconstpointer a, gconstpointer b)
 {
-    gint i = store_find(p, name);
-    if (i < 0) return;
-    p->inhibit_sel = TRUE;
-    g_list_store_remove(p->store, (guint)i);
-    p->inhibit_sel = FALSE;
-    if (p->marks) g_hash_table_remove(p->marks, name);
+    guint x = *(const guint *)a, y = *(const guint *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* Add a new entry or refresh an existing one (size/date/type changed) */
-static void monitor_upsert(Panel *p, const char *name, const struct stat *fst)
+/* Apply one batch of changed names with a single pass over the store:
+ * a name→position map replaces a linear search per name (64 × 100k
+ * entries per batch in a big directory).  Replacements keep positions,
+ * so they go first; removals then run from the highest position down,
+ * new entries are appended in one splice. */
+static void monitor_apply(Panel *p, GHashTable *pending)
 {
-    if (!p->fm->show_hidden && name[0] == '.') return;
-
-    FileItem *nfi = file_item_from_stat(p->fm, name, fst);
-    gint i = store_find(p, name);
-    p->inhibit_sel = TRUE;
-    if (i >= 0) {
-        FileItem *old = g_list_model_get_item(G_LIST_MODEL(p->store), (guint)i);
-        nfi->marked = old->marked;
-        g_object_unref(old);
-        g_list_store_splice(p->store, (guint)i, 1, (gpointer *)&nfi, 1);
-    } else {
-        nfi->marked = p->marks && g_hash_table_contains(p->marks, name);
-        g_list_store_append(p->store, nfi);
+    GListModel *m = G_LIST_MODEL(p->store);
+    guint n = g_list_model_get_n_items(m);
+    GHashTable *pos = g_hash_table_new(g_str_hash, g_str_equal);
+    for (guint i = 0; i < n; i++) {
+        FileItem *fi = g_list_model_get_item(m, i);
+        if (fi && g_hash_table_contains(pending, fi->name))
+            g_hash_table_insert(pos, fi->name, GUINT_TO_POINTER(i + 1));
+        if (fi) g_object_unref(fi);      /* the store keeps fi->name alive */
     }
+
+    GArray *gone = g_array_new(FALSE, FALSE, sizeof(guint));
+    GPtrArray *add = g_ptr_array_new_with_free_func(g_object_unref);
+    p->inhibit_sel = TRUE;
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, pending);
+    while (g_hash_table_iter_next(&it, &key, NULL)) {
+        const char *name = key;
+        guint at = GPOINTER_TO_UINT(g_hash_table_lookup(pos, name));
+        gchar *full = g_build_filename(p->cwd, name, NULL);
+        struct stat st;
+        gboolean exists = lstat(full, &st) == 0;
+        g_free(full);
+        if (!exists || (!p->fm->show_hidden && name[0] == '.')) {
+            if (at) g_array_append_val(gone, (guint){ at - 1 });
+            if (!exists && p->marks) g_hash_table_remove(p->marks, name);
+            continue;
+        }
+        FileItem *nfi = file_item_from_stat(p->fm, name, &st);
+        if (at) {
+            FileItem *old = g_list_model_get_item(m, at - 1);
+            nfi->marked = old->marked;
+            g_object_unref(old);
+            /* old item (and the map key) dies here: don't look it up again */
+            g_hash_table_remove(pos, name);
+            g_list_store_splice(p->store, at - 1, 1, (gpointer *)&nfi, 1);
+            g_object_unref(nfi);
+        } else {
+            nfi->marked = p->marks && g_hash_table_contains(p->marks, name);
+            g_ptr_array_add(add, nfi);
+        }
+    }
+    g_hash_table_destroy(pos);
+
+    /* runs of neighbours (a deleted batch usually is one) go in one
+     * splice: every store change re-sorts and re-filters the views */
+    g_array_sort(gone, (GCompareFunc)cmp_uint_desc);
+    for (guint i = 0; i < gone->len; ) {
+        guint hi = g_array_index(gone, guint, i), lo = hi, j = i + 1;
+        while (j < gone->len && g_array_index(gone, guint, j) == lo - 1) {
+            lo--;
+            j++;
+        }
+        g_list_store_splice(p->store, lo, hi - lo + 1, NULL, 0);
+        i = j;
+    }
+    if (add->len)
+        g_list_store_splice(p->store, g_list_model_get_n_items(m), 0,
+                            add->pdata, add->len);
     p->inhibit_sel = FALSE;
-    g_object_unref(nfi);
+    g_array_free(gone, TRUE);
+    g_ptr_array_unref(add);
 }
 
 /* Events are collected and applied in one batch: unpacking an archive
@@ -120,6 +154,7 @@ static void monitor_upsert(Panel *p, const char *name, const struct stat *fst)
  * one separately (linear lookup + status walk) froze the panel. */
 #define MON_BATCH_MS     150
 #define MON_RELOAD_LIMIT 64     /* more changes than this → one reload */
+#define MON_BUSY_MS      1000   /* batch delay right after such a reload */
 
 static gboolean monitor_flush(gpointer data)
 {
@@ -131,20 +166,13 @@ static gboolean monitor_flush(gpointer data)
 
     if (g_hash_table_size(pending) > MON_RELOAD_LIMIT) {
         panel_reload(p);                       /* keeps cursor and marks */
+        /* a mass copy keeps overflowing: back off instead of reloading
+         * the whole directory every batch */
+        p->mon_reload_at = g_get_monotonic_time();
     } else {
         guint old_pos = p->cursor_pos;
         gchar *cur = cursor_name_save(p);
-        GHashTableIter it;
-        gpointer key;
-        g_hash_table_iter_init(&it, pending);
-        while (g_hash_table_iter_next(&it, &key, NULL)) {
-            gchar *full = g_build_filename(p->cwd, key, NULL);
-            struct stat st;
-            gboolean exists = lstat(full, &st) == 0;
-            g_free(full);
-            if (exists) monitor_upsert(p, key, &st);
-            else        monitor_remove(p, key);
-        }
+        monitor_apply(p, pending);
         /* once per batch: each store change invalidates the item index,
          * so a per-event status update rebuilt it for every file */
         panel_update_status(p);
@@ -159,8 +187,12 @@ static void monitor_queue(Panel *p, const char *name)
     if (!p->mon_pending)
         p->mon_pending = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     g_hash_table_add(p->mon_pending, g_strdup(name));
-    if (!p->mon_flush_id)
-        p->mon_flush_id = g_timeout_add(MON_BATCH_MS, monitor_flush, p);
+    if (!p->mon_flush_id) {
+        gboolean busy = p->mon_reload_at &&
+            g_get_monotonic_time() - p->mon_reload_at < 2 * G_USEC_PER_SEC;
+        p->mon_flush_id = g_timeout_add(busy ? MON_BUSY_MS : MON_BATCH_MS,
+                                        monitor_flush, p);
+    }
 }
 
 static void on_dir_changed(GFileMonitor *monitor, GFile *file,
@@ -255,6 +287,7 @@ static gboolean sftp_poll_apply(gpointer data)
         if (!fi) continue;
         if (strcmp(fi->name, "..") != 0 &&
             !g_hash_table_contains(remote, fi->name)) {
+            if (p->marks) g_hash_table_remove(p->marks, fi->name);
             p->inhibit_sel = TRUE;
             g_list_store_remove(p->store, i - 1);
             p->inhibit_sel = FALSE;
@@ -292,6 +325,7 @@ static gboolean sftp_poll_apply(gpointer data)
         struct stat st;
         attrs_to_stat(val, &st);
         FileItem *fi = file_item_from_stat(p->fm, rname, &st);
+        fi->marked = p->marks && g_hash_table_contains(p->marks, rname);
         p->inhibit_sel = TRUE;
         g_list_store_append(p->store, fi);
         g_object_unref(fi);

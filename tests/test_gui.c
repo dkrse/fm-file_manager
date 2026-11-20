@@ -15,11 +15,13 @@
 #undef main
 #include "../src/ssh.c"
 #include "../src/devices.c"
+#include "../src/quickview.c"
 
 #include <sys/socket.h>
 #include <signal.h>
 #include <glib/gstdio.h>
 #include <utime.h>
+#include <math.h>
 #include "../include/job.h"
 
 static int failures, checks;
@@ -438,20 +440,468 @@ static void test_background_queue(FM *fm)
     g_print("ok background queue\n");
 }
 
+
+/* ── SFTP: editor save in a worker, ssh_exec with a flood of stderr ── */
+
+static void test_sftp_save_exec(FM *fm, const char *work)
+{
+    SshConn *c = connect_test();
+    CHECK(c != NULL);
+    if (!c) return;
+    ssh_conn_ref(c);            /* a tab owns it in the app (refs ≥ 1) */
+    gchar *rdir = g_build_filename(work, "save", NULL);
+    mk(work, "save");
+    gchar *rf = g_build_filename(rdir, "s.txt", NULL);
+
+    CHECK(fm_write_remote(fm, c, rf, "saved remotely\n", 15) == 1);
+    gchar *got = NULL;
+    CHECK(g_file_get_contents(rf, &got, NULL, NULL) && g_strcmp0(got, "saved remotely\n") == 0);
+    g_free(got);
+    gchar *bad = g_build_filename(rdir, "no", "such", "dir", "x", NULL);
+    CHECK(fm_write_remote(fm, c, bad, "x", 1) == 0);      /* error, no hang */
+    g_free(bad);
+
+    /* 3 MB on stderr: more than the channel window – reading stdout to
+     * EOF first used to block until the 60 s timeout */
+    gchar *out = NULL, *err = NULL;
+    double t0 = now_s();
+    int code = ssh_exec(c, rdir,
+        "head -c 3000000 /dev/zero | tr '\\0' e >&2; echo done", &out, &err);
+    CHECK(now_s() - t0 < 20.0);
+    CHECK(code == 0);
+    CHECK(g_strcmp0(out, "done\n") == 0);
+    CHECK(err && strlen(err) >= 1024 * 1024 && err[0] == 'e');   /* capped at 1 MB */
+    g_free(out); g_free(err);
+
+    /* plain stdout + exit code still come through */
+    CHECK(ssh_exec(c, rdir, "printf abc; echo oops >&2; exit 3", &out, &err) == 3);
+    CHECK(g_strcmp0(out, "abc") == 0 && g_strcmp0(err, "oops\n") == 0);
+    g_free(out); g_free(err);
+
+    ssh_conn_unref(c);
+    g_free(rf); g_free(rdir);
+    g_print("ok sftp save + exec\n");
+}
+
+/* ── directory monitor batches ─────────────────────────────────────── */
+
+static gboolean has_marked_item(Panel *p, const char *name)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+    for (guint i = 0; i < n; i++) {
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+        gboolean hit = strcmp(it->name, name) == 0 && it->marked;
+        g_object_unref(it);
+        if (hit) return TRUE;
+    }
+    return FALSE;
+}
+
+static gint64 item_size(Panel *p, const char *name)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+    for (guint i = 0; i < n; i++) {
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+        gint64 sz = strcmp(it->name, name) == 0 ? it->size_raw : -1;
+        g_object_unref(it);
+        if (sz >= 0) return sz;
+    }
+    return -1;
+}
+
+static guint store_count(Panel *p)
+{
+    return g_list_model_get_n_items(G_LIST_MODEL(p->store));
+}
+
+static void test_monitor(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "mon", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "keep.txt", "1");
+    write_in(d, "gone.txt", "1");
+    write_in(d, "grow.txt", "1");
+    gboolean prev_ar = fm->auto_refresh;
+    fm->auto_refresh = TRUE;            /* off in the default test settings */
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    pump(100);
+    guint base = store_count(p);
+    sel_mark_all(p, FALSE);
+    panel_select_name(p, "grow.txt");
+    sel_toggle_cursor(p, FALSE);
+    CHECK(has_marked_item(p, "grow.txt"));
+
+    /* one small batch: add, delete, modify together */
+    write_in(d, "new1.txt", "1");
+    write_in(d, "new2.txt", "1");
+    gchar *g = g_build_filename(d, "gone.txt", NULL);
+    g_unlink(g);
+    g_free(g);
+    write_in(d, "grow.txt", "123456");
+    gint64 end = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (g_get_monotonic_time() < end &&
+           !(store_has(p, "new2.txt") && !store_has(p, "gone.txt") &&
+             item_size(p, "grow.txt") == 6))
+        pump(50);
+    CHECK(store_has(p, "new1.txt") && store_has(p, "new2.txt"));
+    CHECK(!store_has(p, "gone.txt") && store_has(p, "keep.txt"));
+    CHECK(item_size(p, "grow.txt") == 6);
+    CHECK(has_marked_item(p, "grow.txt"));          /* mark kept across refresh */
+    CHECK(store_count(p) == base + 1);              /* +2 −1, no duplicates */
+
+    /* overflow (> MON_RELOAD_LIMIT names) → one reload, then backoff */
+    for (int i = 0; i < 100; i++) {
+        gchar n[32];
+        g_snprintf(n, sizeof n, "bulk%03d", i);
+        write_in(d, n, "x");
+    }
+    end = g_get_monotonic_time() + 8 * G_USEC_PER_SEC;
+    while (g_get_monotonic_time() < end && !store_has(p, "bulk099")) pump(50);
+    CHECK(store_has(p, "bulk000") && store_has(p, "bulk099"));
+    CHECK(store_count(p) == base + 1 + 100);
+    CHECK(p->mon_reload_at != 0);
+    write_in(d, "after.txt", "x");                  /* still picked up later */
+    CHECK(wait_has(p, "after.txt", 5));
+    sel_mark_all(p, FALSE);
+    fm->auto_refresh = prev_ar;
+    panel_monitor_start(p);
+    g_print("ok monitor batches\n");
+    g_free(d);
+}
+
+/* ── checksum verify: the stat of every listed file runs in the job ── */
+
+static void test_cks_verify(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "cks", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "a.txt", "abc");
+    /* sha256("abc") */
+    write_in(d, "sums.sha256",
+             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt\n"
+             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  missing.txt\n");
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    pump(100);
+    panel_focus(p);
+    panel_select_name(p, "sums.sha256");
+    cks_verify(fm);
+    pump(100);
+    const char *st = gtk_label_get_text(GTK_LABEL(fm->statusbar));
+    CHECK(g_strcmp0(st, "Verify: 1 OK, 0 failed, 1 missing") == 0);
+    if (g_strcmp0(st, "Verify: 1 OK, 0 failed, 1 missing")) g_printerr("status: %s\n", st);
+    /* close the result window */
+    GListModel *tl = gtk_window_get_toplevels();
+    for (guint i = g_list_model_get_n_items(tl); i > 0; i--) {
+        GtkWindow *w = g_list_model_get_item(tl, i - 1);
+        if (w != GTK_WINDOW(fm->window) &&
+            g_strcmp0(gtk_window_get_title(w), "Verify checksums") == 0)
+            gtk_window_destroy(w);
+        g_object_unref(w);
+    }
+    pump(50);
+    g_print("ok checksum verify\n");
+    g_free(d);
+}
+
+/* ── quick view images: decoded in a worker, stale results dropped ── */
+
+static void write_png(const char *path, int w, int h)
+{
+    GdkPixbuf *pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, w, h);
+    gdk_pixbuf_fill(pb, 0x3366ccff);
+    gdk_pixbuf_save(pb, path, "png", NULL, NULL);
+    g_object_unref(pb);
+}
+
+static void test_quickview_image(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "qvimg", NULL);
+    g_mkdir_with_parents(d, 0755);
+    gchar *small = g_build_filename(d, "a_small.png", NULL);
+    gchar *big   = g_build_filename(d, "b_big.png", NULL);
+    write_png(small, 40, 30);
+    write_png(big, 4000, 3000);
+    write_in(d, "c.txt", "text after the image\n");
+    gboolean prev = fm->viewer_image_preview;
+    fm->viewer_image_preview = TRUE;
+
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    pump(100);
+    panel_focus(p);
+    panel_select_name(p, "a_small.png");
+    qv_toggle(fm);
+    Panel *q = &fm->panels[1];
+    GtkPicture *pic = g_object_get_data(G_OBJECT(q->qv_box), "pic");
+    gint64 end = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (g_get_monotonic_time() < end && !gtk_picture_get_paintable(pic)) pump(30);
+    GdkPaintable *pt = gtk_picture_get_paintable(pic);
+    CHECK(pt != NULL);
+    if (pt) CHECK(gdk_paintable_get_intrinsic_width(pt) == 40);
+
+    /* big image is downscaled to QV_IMG_MAX_PX */
+    panel_select_name(p, "b_big.png");
+    end = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+    while (g_get_monotonic_time() < end &&
+           !((pt = gtk_picture_get_paintable(pic)) &&
+             gdk_paintable_get_intrinsic_width(pt) != 40))
+        pump(30);
+    CHECK(pt && gdk_paintable_get_intrinsic_width(pt) == QV_IMG_MAX_PX);
+    if (pt) CHECK(gdk_paintable_get_intrinsic_height(pt) == 1536);
+
+    /* leave an image while it is still decoding: the late result must
+     * not replace the text of the file now under the cursor */
+    panel_select_name(p, "a_small.png");
+    pump(QV_POLL_MS + 50);
+    panel_select_name(p, "c.txt");
+    pump(QV_POLL_MS * 3);
+    pump(500);
+    CHECK(!gtk_widget_get_visible(GTK_WIDGET(pic)));
+    CHECK(gtk_picture_get_paintable(pic) == NULL);
+    CHECK(!qv_img_busy && qv_img_next == NULL);
+
+    qv_toggle(fm);
+    pump(50);
+    fm->viewer_image_preview = prev;
+    g_print("ok quick view images\n");
+    g_free(small); g_free(big); g_free(d);
+}
+
+
+/* ── closing F3/F4 must not scroll the list when the cursor row is
+ * already on screen.  Headless broadway has no frame clock, so
+ * scroll_to itself never runs here: the visibility test that decides
+ * whether panel_focus may scroll is checked on a real adjustment. ── */
+
+static void test_focus_keeps_scroll(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "many", NULL);
+    g_mkdir_with_parents(d, 0755);
+    for (int i = 0; i < 400; i++) {
+        gchar n[32];
+        g_snprintf(n, sizeof n, "f%03d.txt", i);
+        write_in(d, n, "x");
+    }
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    panel_focus(p);
+    pump(200);
+    GtkAdjustment *va = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(p->column_view));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
+    for (int i = 0; i < 100 && gtk_adjustment_get_upper(va) <= gtk_adjustment_get_page_size(va); i++)
+        pump(50);                           /* wait for the first layout */
+    if (gtk_adjustment_get_upper(va) <= gtk_adjustment_get_page_size(va))
+        g_printerr("layout: n=%u upper=%.0f page=%.0f\n", n,
+                   gtk_adjustment_get_upper(va), gtk_adjustment_get_page_size(va));
+    double upper = gtk_adjustment_get_upper(va), page = gtk_adjustment_get_page_size(va);
+    CHECK(n == 401 && upper > page);           /* 400 files + ".." */
+    double h = upper / n;
+    guint rows = (guint)(page / h);
+    gtk_adjustment_set_value(va, 200 * h);     /* top row = 200 */
+    double v0 = gtk_adjustment_get_value(va);
+    guint top = (guint)(v0 / h + 0.5);
+    CHECK(panel_row_visible(p, top, n));                 /* first shown row */
+    CHECK(panel_row_visible(p, top + rows / 2, n));      /* middle */
+    CHECK(panel_row_visible(p, top + rows - 1, n));      /* last full row */
+    CHECK(!panel_row_visible(p, top - 1, n));            /* just above */
+    CHECK(!panel_row_visible(p, top + rows + 1, n));     /* just below */
+    CHECK(!panel_row_visible(p, 5, n));
+
+    /* focus with a visible cursor row: selected, view untouched */
+    p->cursor_pos = top + rows / 2;
+    panel_focus(p);
+    pump(200);
+    CHECK(fabs(gtk_adjustment_get_value(va) - v0) < 1.0);
+    GtkBitset *bs = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(p->selection));
+    CHECK(gtk_bitset_get_size(bs) == 1 && gtk_bitset_contains(bs, top + rows / 2));
+    gtk_bitset_unref(bs);
+
+    /* the window regaining focus after F3/F4 also runs these two:
+     * same row stays selected, list stays put */
+    restore_panel_cursor(fm);
+    p->inhibit_sel = TRUE;
+    on_focus_enter(NULL, p);
+    pump(200);
+    CHECK(!p->inhibit_sel);
+    CHECK(fabs(gtk_adjustment_get_value(va) - v0) < 1.0);
+    bs = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(p->selection));
+    CHECK(gtk_bitset_get_size(bs) == 1 && gtk_bitset_contains(bs, top + rows / 2));
+    gtk_bitset_unref(bs);
+    CHECK(p->cursor_pos == top + rows / 2);
+
+    /* F3/F4 round trip: offset saved before, something moves the list
+     * meanwhile (focus handlers), closing puts it back exactly with the
+     * cursor row selected – also after the delayed second pass */
+    double saved = panel_view_save(p);
+    CHECK(fabs(saved - v0) < 1.0);
+    gtk_adjustment_set_value(va, 0);
+    p->inhibit_sel = TRUE;
+    gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(p->selection));
+    p->inhibit_sel = FALSE;
+    panel_view_restore(p, saved);
+    CHECK(fabs(gtk_adjustment_get_value(va) - saved) < 1.0);
+    gtk_adjustment_set_value(va, 0);        /* a late handler scrolls again */
+    pump(300);                              /* > the 60 ms second pass */
+    CHECK(fabs(gtk_adjustment_get_value(va) - saved) < 1.0);
+    bs = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(p->selection));
+    CHECK(gtk_bitset_get_size(bs) == 1 && gtk_bitset_contains(bs, top + rows / 2));
+    gtk_bitset_unref(bs);
+
+    /* the panel moved on meanwhile (other cursor): no forced old view */
+    panel_view_restore(p, saved);
+    p->cursor_pos = 3;
+    gtk_adjustment_set_value(va, 0);
+    pump(300);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+
+    g_print("ok focus keeps scroll\n");
+    g_free(d);
+}
+
+
+/* ── benchmark (make bench): timings on a 50 000 file directory ───── */
+
+static double bench_ms(void) { return g_get_monotonic_time() / 1000.0; }
+
+static void bench(FM *fm)
+{
+    const int N = 50000;
+    gchar *d = g_build_filename(tmp, "bench", NULL);
+    g_mkdir_with_parents(d, 0755);
+    double t = bench_ms();
+    for (int i = 0; i < N; i++) {
+        gchar n[64];
+        g_snprintf(n, sizeof n, "file_%05d_%s.%s", i, i % 3 ? "data" : "Report",
+                   i % 5 ? "txt" : "c");
+        gchar *f = g_build_filename(d, n, NULL);
+        int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) close(fd);
+        g_free(f);
+    }
+    for (int i = 0; i < 500; i++) {
+        gchar n[32];
+        g_snprintf(n, sizeof n, "dir_%03d", i);
+        mk(d, n);
+    }
+    g_print("bench: created %d entries in %.0f ms\n", N + 500, bench_ms() - t);
+
+    Panel *p = &fm->panels[0];
+    local_panels(fm);
+    gboolean ar = fm->auto_refresh;
+    fm->auto_refresh = TRUE;
+
+    t = bench_ms(); panel_load(p, d);         double load = bench_ms() - t;
+    pump(50);
+    t = bench_ms(); panel_load(p, tmp);       double small = bench_ms() - t;
+    t = bench_ms(); panel_load(p, d);         double load2 = bench_ms() - t;
+    t = bench_ms(); panel_reload(p);          double reload = bench_ms() - t;
+    CHECK(g_list_model_get_n_items(G_LIST_MODEL(p->store)) >= (guint)N);
+
+    p->cursor_pos = N / 2;
+    t = bench_ms(); panel_focus(p);           double focus = bench_ms() - t;
+
+    t = bench_ms(); sel_mark_all(p, TRUE);    double markall = bench_ms() - t;
+    t = bench_ms(); panel_update_status(p);   double status = bench_ms() - t;
+    t = bench_ms(); sel_invert(p);            double invert = bench_ms() - t;
+    sel_mark_all(p, FALSE);
+
+    /* quick filter: typing three characters */
+    double filt = 0;
+    const char *steps[] = { "R", "Re", "Rep", "" };
+    for (int i = 0; i < 4; i++) {
+        t = bench_ms();
+        gtk_editable_set_text(GTK_EDITABLE(p->filter_entry), steps[i]);
+        pump(0);
+        filt += bench_ms() - t;
+    }
+
+    /* 60 changed files: one monitor batch (below the reload limit) */
+    t = bench_ms();
+    for (int i = 0; i < 60; i++) {
+        gchar n[32];
+        g_snprintf(n, sizeof n, "zz_new_%02d", i);
+        write_in(d, n, "x");
+    }
+    while (!store_has(p, "zz_new_59") && bench_ms() - t < 10000) pump(5);
+    double batch = bench_ms() - t;   /* includes the 150 ms batch delay + rate limit */
+
+    /* main-loop stall while the batch is applied: longest gap between ticks */
+    t = bench_ms();
+    for (int i = 0; i < 60; i++) {
+        gchar *f = g_strdup_printf("%s/zz_new_%02d", d, i);
+        g_unlink(f);
+        g_free(f);
+    }
+    double worst = 0, last = bench_ms();
+    while (store_has(p, "zz_new_00") && bench_ms() - t < 10000) {
+        g_main_context_iteration(NULL, FALSE);
+        double now = bench_ms();
+        if (now - last > worst) worst = now - last;
+        last = now;
+    }
+
+    /* memory across repeated loads of the big directory: steady = no leak */
+    long rss[11];
+    for (int i = 0; i <= 10; i++) {
+        panel_load(p, tmp);
+        panel_load(p, d);
+        pump(0);
+        FILE *f = fopen("/proc/self/statm", "r");
+        long sz = 0, res = 0;
+        if (f) { if (fscanf(f, "%ld %ld", &sz, &res) != 2) res = 0; fclose(f); }
+        rss[i] = res * (sysconf(_SC_PAGESIZE) / 1024);
+    }
+    g_print("bench: RSS 50k dir     %ld MB after 1 load, %ld MB after 11 (%+ld MB)\n",
+            rss[0] / 1024, rss[10] / 1024, (rss[10] - rss[0]) / 1024);
+    g_print("bench: RSS per 5 loads %ld, %ld, %ld MB\n", rss[0] / 1024, rss[5] / 1024, rss[10] / 1024);
+
+    g_print("bench: load 50k        %7.1f ms (again %.1f, small dir %.1f)\n", load, load2, small);
+    g_print("bench: reload          %7.1f ms\n", reload);
+    g_print("bench: focus mid-list  %7.1f ms\n", focus);
+    g_print("bench: mark all        %7.1f ms, status %.1f ms, invert %.1f ms\n",
+            markall, status, invert);
+    g_print("bench: filter 4 keys   %7.1f ms\n", filt);
+    g_print("bench: 60-file batch   %7.1f ms until shown (incl. delays)\n", batch);
+    g_print("bench: worst UI stall  %7.1f ms during a 60-file batch\n", worst);
+
+    fm->auto_refresh = ar;
+    panel_load(p, tmp);
+    gchar *cmd = g_strdup_printf("rm -rf '%s'", d);
+    if (system(cmd) != 0) { /* ignore */ }
+    g_free(cmd);
+    g_free(d);
+}
+
 /* ── driver ───────────────────────────────────────────────────────── */
 
 static gboolean run_tests(gpointer data)
 {
     FM *fm = data;
     pump(200);
+    if (g_getenv("FM_BENCH")) {
+        bench(fm);
+        g_application_quit(G_APPLICATION(fm->app));
+        return G_SOURCE_REMOVE;
+    }
     test_local_tabs(fm);
     const char *work = g_getenv("FM_SFTP_DIR");
     if (work && g_getenv("FM_SFTP_PORT")) test_sftp_tabs(fm, work);
     else g_print("skip sftp tabs (no test sshd)\n");
+    if (work && g_getenv("FM_SFTP_PORT")) test_sftp_save_exec(fm, work);
     test_devices(fm);
     test_compare_dirs(fm);
     test_quickview(fm);
     test_background_queue(fm);
+    test_monitor(fm);
+    test_cks_verify(fm);
+    test_quickview_image(fm);
+    test_focus_keeps_scroll(fm);
     g_application_quit(G_APPLICATION(fm->app));
     return G_SOURCE_REMOVE;
 }

@@ -538,6 +538,43 @@ gchar *fm_read_file(FM *fm, SshConn *conn, const char *path, gsize max_len,
     return data;
 }
 
+/* ── remote save in a worker (editor F2): a slow link must not freeze
+ * every window for the whole upload ── */
+typedef struct { SshConn *conn; gchar *path; gchar *data; gsize len; } WriteReq;
+
+static void write_req_free(gpointer d)
+{
+    WriteReq *q = d;
+    ssh_conn_unref(q->conn);
+    g_free(q->path);
+    g_free(q->data);
+    g_free(q);
+}
+
+static gpointer write_file_thread(gpointer d)
+{
+    WriteReq *q = d;
+    /* never NULL: NULL from fm_wait_work means "cancelled" */
+    return GINT_TO_POINTER(ssh_write_file(q->conn, q->path, q->data, q->len) ? 2 : 1);
+}
+
+int fm_write_remote(FM *fm, SshConn *conn, const char *path,
+                    const gchar *data, gsize len)
+{
+    WriteReq *q = g_new0(WriteReq, 1);
+    q->conn = ssh_conn_ref(conn);
+    q->path = g_strdup(path);
+    q->data = g_memdup2(data, len);
+    q->len  = len;
+    gchar *base = g_path_get_basename(path);
+    gboolean cancelled;
+    gpointer r = fm_wait_work(fm, "Saving file", base, write_file_thread, q,
+                              write_req_free, NULL, NULL, &cancelled);
+    g_free(base);
+    if (cancelled) return -1;
+    return GPOINTER_TO_INT(r) == 2 ? 1 : 0;
+}
+
 /* Directory-specific part */
 typedef struct {
     struct stat st;
@@ -799,6 +836,9 @@ void panel_reload(Panel *p)
     }
     p->inhibit_sel = FALSE;
     g_free(saved);
+    /* panel_load remembered the offset: keep the view where it was
+     * instead of jumping to put the cursor row at an edge */
+    panel_scroll_restore(p);
 }
 
 void panel_go_up(Panel *p)
@@ -1394,6 +1434,78 @@ void set_active_panel(FM *fm, int idx)
  * signal never comes – fm->active then disagreed with the real focus
  * and inhibit_sel stayed TRUE, so Tab kept jumping into the same panel
  * and clicks were ignored. */
+/* Is row `pos` fully inside the visible part of the list?  Rows have one
+ * height, so it follows from the adjustment (upper = n rows). */
+static gboolean panel_row_visible(Panel *p, guint pos, guint n)
+{
+    GtkAdjustment *va = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(p->column_view));
+    if (!va || n == 0) return FALSE;
+    double upper = gtk_adjustment_get_upper(va), page = gtk_adjustment_get_page_size(va);
+    double v = gtk_adjustment_get_value(va);
+    if (upper <= 0 || page <= 0) return FALSE;      /* not laid out yet */
+    if (upper <= page) return TRUE;                 /* everything fits */
+    double h = upper / n;
+    return pos * h >= v && (pos + 1) * h <= v + page;
+}
+
+/* Select + focus the cursor row.  When it is already on screen (back
+ * from F3/F4 or any dialog) the list must not move: a plain scroll_to
+ * shifted it, and the focused row widget could be recycled so the
+ * cursor vanished.  Off screen → scrolled into view as usual. */
+static void panel_cursor_show(Panel *p, guint n)
+{
+    GtkScrollInfo *si = NULL;
+    if (panel_row_visible(p, p->cursor_pos, n)) {
+        si = gtk_scroll_info_new();
+        gtk_scroll_info_set_enable_vertical(si, FALSE);
+        gtk_scroll_info_set_enable_horizontal(si, FALSE);
+    }
+    gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), p->cursor_pos,
+                              NULL, GTK_LIST_SCROLL_SELECT | GTK_LIST_SCROLL_FOCUS,
+                              si);   /* takes ownership */
+}
+
+/* ── exact view around F3/F4: the list must look the same afterwards ── */
+double panel_view_save(Panel *p)
+{
+    GtkAdjustment *va = p->column_view
+        ? gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(p->column_view)) : NULL;
+    return va ? gtk_adjustment_get_value(va) : -1;
+}
+
+typedef struct { Panel *p; double value; guint cursor; gchar *dir; } ViewRestore;
+
+static void view_apply(Panel *p, double value)
+{
+    GtkAdjustment *va = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(p->column_view));
+    if (va && value >= 0) gtk_adjustment_set_value(va, value);
+    panel_focus(p);              /* row now visible → selected, no scroll */
+}
+
+static gboolean view_restore_idle(gpointer d)
+{
+    ViewRestore *r = d;
+    const char *dir = panel_dir(r->p);
+    /* only if nothing else changed the panel meanwhile */
+    if (dir && g_strcmp0(dir, r->dir) == 0 && r->p->cursor_pos == r->cursor)
+        view_apply(r->p, r->value);
+    g_free(r->dir);
+    g_free(r);
+    return G_SOURCE_REMOVE;
+}
+
+void panel_view_restore(Panel *p, double value)
+{
+    view_apply(p, value);
+    /* the main window gets focus back asynchronously and its handlers
+     * (plus the list's own focus scroll) run after this: apply again
+     * once they are done */
+    ViewRestore *r = g_new0(ViewRestore, 1);
+    r->p = p; r->value = value; r->cursor = p->cursor_pos;
+    r->dir = g_strdup(panel_dir(p));
+    g_timeout_add(60, view_restore_idle, r);
+}
+
 void panel_focus(Panel *p)
 {
     FM *fm = p->fm;
@@ -1410,9 +1522,7 @@ void panel_focus(Panel *p)
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (n > 0) {
         if (p->cursor_pos >= n) p->cursor_pos = n - 1;
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), p->cursor_pos,
-                                  NULL, GTK_LIST_SCROLL_SELECT | GTK_LIST_SCROLL_FOCUS,
-                                  NULL);
+        panel_cursor_show(p, n);
     }
     p->inhibit_sel = FALSE;
 }
@@ -1464,6 +1574,12 @@ static void on_selection_changed(GtkSelectionModel *model, guint position,
 static void on_focus_leave(GtkEventControllerFocus *ctrl, Panel *p)
 {
     (void)ctrl;
+    /* only the window lost focus (F3/F4, a dialog, another app): keep the
+     * cursor – clearing it left the panel with no visible cursor after
+     * the viewer/editor closed.  Focus moving to another widget of this
+     * window still hides it. */
+    GtkRoot *root = gtk_widget_get_root(p->column_view);
+    if (GTK_IS_WINDOW(root) && !gtk_window_is_active(GTK_WINDOW(root))) return;
     p->inhibit_sel = TRUE;
     gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(p->selection));
     p->inhibit_sel = FALSE;
@@ -1483,9 +1599,7 @@ static void on_focus_enter(GtkEventControllerFocus *ctrl, Panel *p)
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     if (n > 0) {
         if (p->cursor_pos >= n) p->cursor_pos = 0;
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
-                                  p->cursor_pos, NULL,
-                                  GTK_LIST_SCROLL_SELECT, NULL);
+        panel_cursor_show(p, n);
     }
     p->inhibit_sel = FALSE;
 }
@@ -2062,14 +2176,9 @@ void panel_setup(Panel *p, FM *fm, int idx)
 
 static void restore_panel_cursor(FM *fm)
 {
-    Panel *p = active_panel(fm);
-    panel_focus(p);
-    if (g_list_model_get_n_items(G_LIST_MODEL(p->filter_model)) > 0) {
-        p->inhibit_sel = TRUE;
-        gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view),
-                                  p->cursor_pos, NULL, GTK_LIST_SCROLL_SELECT, NULL);
-        p->inhibit_sel = FALSE;
-    }
+    /* panel_focus already selects + focuses the cursor row (without
+     * moving a visible one); a second plain scroll_to here jumped */
+    panel_focus(active_panel(fm));
 }
 
 static void on_window_focus_in(GtkEventControllerFocus *ctrl, FM *fm)

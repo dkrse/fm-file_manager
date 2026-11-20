@@ -26,11 +26,40 @@ static void cks_item_free(gpointer d)
 typedef struct {
     GPtrArray *items;  /* CksItem* */
     gint64     total;
+    /* create: what to scan in the worker (a big tree / slow mount froze
+     * the UI with no cancel when this ran on the main thread) */
+    GPtrArray *roots;  /* CksItem*: path + name of each selected entry */
+    GChecksumType type;
+    gboolean   verify; /* items need a stat (missing / size) first */
 } CksJob;
+
+static void collect(Job *job, GPtrArray *items, gint64 *total, const char *path,
+                    const char *name, GChecksumType type, guint depth);
+
+/* scanning part of the worker (job may be NULL: no cancel) */
+static void cks_scan_job(Job *job, CksJob *cj)
+{
+    if (cj->roots)
+        for (guint i = 0; i < cj->roots->len && !(job && job_cancelled(job)); i++) {
+            CksItem *r = g_ptr_array_index(cj->roots, i);
+            collect(job, cj->items, &cj->total, r->path, r->name, cj->type, 0);
+        }
+    if (cj->verify)
+        for (guint i = 0; i < cj->items->len && !(job && job_cancelled(job)); i++) {
+            CksItem *c = g_ptr_array_index(cj->items, i);
+            struct stat st;
+            if (!c->path || stat(c->path, &st) != 0 || !S_ISREG(st.st_mode)) c->missing = TRUE;
+            else cj->total += st.st_size;
+        }
+}
 
 static void cks_worker(Job *job, gpointer d)
 {
     CksJob *cj = d;
+    job_set_phase(job, "Scanning…");
+    cks_scan_job(job, cj);
+    if (job_cancelled(job)) return;
+    job_set_phase(job, "Hashing…");
     job_set_total(job, cj->total);
     for (guint i = 0; i < cj->items->len && !job_cancelled(job); i++) {
         CksItem *c = g_ptr_array_index(cj->items, i);
@@ -200,11 +229,11 @@ static gint cmp_names(gconstpointer a, gconstpointer b)
 }
 
 /* Files below `path`, named relative to the panel directory */
-static void collect(GPtrArray *items, gint64 *total, const char *path,
+static void collect(Job *job, GPtrArray *items, gint64 *total, const char *path,
                     const char *name, GChecksumType type, guint depth)
 {
     struct stat st;
-    if (lstat(path, &st) != 0 || depth > 64) return;
+    if ((job && job_cancelled(job)) || lstat(path, &st) != 0 || depth > 64) return;
     if (S_ISREG(st.st_mode)) {
         CksItem *c = g_new0(CksItem, 1);
         c->path = g_strdup(path);
@@ -224,7 +253,7 @@ static void collect(GPtrArray *items, gint64 *total, const char *path,
             const char *sub = g_ptr_array_index(names, i);
             gchar *fp = g_build_filename(path, sub, NULL);
             gchar *fn = g_build_filename(name, sub, NULL);
-            collect(items, total, fp, fn, type, depth + 1);
+            collect(job, items, total, fp, fn, type, depth + 1);
             g_free(fp); g_free(fn);
         }
         g_ptr_array_unref(names);
@@ -248,27 +277,26 @@ void cks_create(FM *fm)
     if (a < 0) { g_list_free_full(paths, g_free); return; }
     GChecksumType type = types[a];
 
-    CksJob cj = { g_ptr_array_new_with_free_func(cks_item_free), 0 };
+    CksJob cj = { g_ptr_array_new_with_free_func(cks_item_free), 0,
+                  g_ptr_array_new_with_free_func(cks_item_free), type, FALSE };
     const char *dir = p->search_mode ? p->search_prev_cwd : p->cwd;
     for (GList *l = paths; l; l = l->next) {
         const char *full = l->data;
+        CksItem *r = g_new0(CksItem, 1);
+        r->path = g_strdup(full);
         /* search results: names relative to the search start if inside it */
-        gchar *name = fs_path_is_inside(full, dir) && strlen(full) > strlen(dir)
-                      ? g_strdup(full + strlen(dir) + (dir[strlen(dir) - 1] == '/' ? 0 : 1))
-                      : g_path_get_basename(full);
-        collect(cj.items, &cj.total, full, name, type, 0);
-        g_free(name);
+        r->name = fs_path_is_inside(full, dir) && strlen(full) > strlen(dir)
+                  ? g_strdup(full + strlen(dir) + (dir[strlen(dir) - 1] == '/' ? 0 : 1))
+                  : g_path_get_basename(full);
+        g_ptr_array_add(cj.roots, r);
     }
     gchar *first = paths->next ? NULL : g_path_get_basename(paths->data);
     g_list_free_full(paths, g_free);
-    if (!cj.items->len) {
-        fm_status(fm, "No regular files to checksum");
-        g_ptr_array_unref(cj.items);
-        g_free(first);
-        return;
-    }
 
-    if (run_job(fm, "Calculating checksums", &cj)) {
+    gboolean ran = run_job(fm, "Calculating checksums", &cj);
+    if (ran && !cj.items->len) {
+        fm_status(fm, "No regular files to checksum");
+    } else if (ran) {
         GString *out = g_string_new(NULL);
         guint fail = 0;
         for (guint i = 0; i < cj.items->len; i++) {
@@ -294,6 +322,7 @@ void cks_create(FM *fm)
         g_string_free(out, TRUE);
     }
     g_free(first);
+    g_ptr_array_unref(cj.roots);
     g_ptr_array_unref(cj.items);
 }
 
@@ -320,7 +349,7 @@ void cks_verify(FM *fm)
         return;
     }
     gchar *dir = g_path_get_dirname(file);
-    CksJob cj = { g_ptr_array_new_with_free_func(cks_item_free), 0 };
+    CksJob cj = { g_ptr_array_new_with_free_func(cks_item_free), 0, NULL, 0, TRUE };
     guint bad_lines = 0;
     gchar **lines = g_strsplit(data, "\n", -1);
     g_free(data);
@@ -339,9 +368,7 @@ void cks_verify(FM *fm)
         const char *rel = g_str_has_prefix(name, "./") ? name + 2 : name;
         if (g_path_is_absolute(name)) c->path = g_strdup(name);
         else if (fs_relpath_is_safe(rel)) c->path = g_build_filename(dir, rel, NULL);
-        struct stat st;
-        if (!c->path || stat(c->path, &st) != 0 || !S_ISREG(st.st_mode)) c->missing = TRUE;
-        else cj.total += st.st_size;
+        /* stat (missing / size) happens in the worker */
         g_ptr_array_add(cj.items, c);
     }
     g_strfreev(lines);

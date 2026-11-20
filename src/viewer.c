@@ -30,6 +30,7 @@ typedef struct {
     int            current_match;
     int            total_matches;
     int            total_lines;
+    guint          search_idle;     /* debounced search-as-you-type */
 } ViewerCtx;
 
 /* ── search functions ────────────────────────────────────────────── */
@@ -112,8 +113,29 @@ static void viewer_search_goto_match(ViewerCtx *ctx, int index)
     }
 }
 
+static gboolean viewer_search_idle_cb(gpointer user_data)
+{
+    ViewerCtx *ctx = user_data;
+    ctx->search_idle = 0;
+    viewer_search_highlight_all(ctx,
+        gtk_editable_get_text(GTK_EDITABLE(ctx->search_entry)));
+    if (ctx->total_matches > 0)
+        viewer_search_goto_match(ctx, 1);
+    return G_SOURCE_REMOVE;
+}
+
+/* Enter / F3 right after typing: run the pending search first */
+static void viewer_search_flush(ViewerCtx *ctx)
+{
+    if (ctx->search_idle) {
+        g_source_remove(ctx->search_idle);
+        viewer_search_idle_cb(ctx);
+    }
+}
+
 static void viewer_search_next(ViewerCtx *ctx)
 {
+    viewer_search_flush(ctx);
     if (ctx->total_matches == 0) return;
     int next = ctx->current_match + 1;
     if (next > ctx->total_matches) next = 1;
@@ -122,6 +144,7 @@ static void viewer_search_next(ViewerCtx *ctx)
 
 static void viewer_search_prev(ViewerCtx *ctx)
 {
+    viewer_search_flush(ctx);
     if (ctx->total_matches == 0) return;
     int prev = ctx->current_match - 1;
     if (prev < 1) prev = ctx->total_matches;
@@ -130,11 +153,11 @@ static void viewer_search_prev(ViewerCtx *ctx)
 
 static void on_viewer_search_changed(GtkEditable *editable, gpointer user_data)
 {
+    (void)editable;
     ViewerCtx *ctx = user_data;
-    const gchar *needle = gtk_editable_get_text(editable);
-    viewer_search_highlight_all(ctx, needle);
-    if (ctx->total_matches > 0)
-        viewer_search_goto_match(ctx, 1);
+    /* whole-buffer scan (up to 50 MB): wait for a typing pause */
+    if (ctx->search_idle) g_source_remove(ctx->search_idle);
+    ctx->search_idle = g_timeout_add(SEARCH_DEBOUNCE_MS, viewer_search_idle_cb, ctx);
 }
 
 static void on_viewer_search_next_clicked(GtkButton *btn, gpointer user_data)
@@ -293,6 +316,9 @@ static gboolean quit_on_close(GtkWindow *w, gpointer loop)
 }
 
 /* Image viewer — simple window with GtkPicture + close/key handling */
+/* list offset when F3 was pressed: closing puts the panel back there */
+static double view_saved = -1;
+
 static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
 {
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
@@ -338,8 +364,7 @@ static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
     g_main_loop_unref(loop);
     gtk_window_destroy(GTK_WINDOW(win));
 
-    Panel *ap = active_panel(fm);
-    panel_focus(ap);
+    panel_view_restore(active_panel(fm), view_saved);
 }
 
 void viewer_show(FM *fm)
@@ -353,6 +378,7 @@ void viewer_show(FM *fm)
 void viewer_show_path(FM *fm, const char *path, const char *shown_name)
 {
     Panel *p = active_panel(fm);
+    view_saved = panel_view_save(p);
 
     gchar *name = path ? g_strdup(shown_name) : panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) {
@@ -597,12 +623,12 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
 
     g_main_loop_run(ctx.loop);
     g_main_loop_unref(ctx.loop);
+    if (ctx.search_idle) g_source_remove(ctx.search_idle);
     g_array_free(ctx.match_lines, TRUE);
     g_array_free(ctx.match_offs, TRUE);
     gtk_window_destroy(GTK_WINDOW(ctx.window));
 
-    Panel *ap = active_panel(fm);
-    panel_focus(ap);
+    panel_view_restore(active_panel(fm), view_saved);
 
     g_free(name);
 }

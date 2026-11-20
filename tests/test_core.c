@@ -1044,7 +1044,84 @@ static void test_arcfs_base_prefix(void)
     rm_rf(root);
     g_free(x); g_free(y); g_free(ab); g_free(tar); g_free(out); g_free(root);
 }
+
+/* existing destination dirs keep their own mode/mtime; new ones get the
+ * archive's */
+static void test_arcfs_existing_dir_untouched(void)
+{
+    gchar *root = tmp_root(), *tar = J(root, "t.tar"), *out = J(root, "out");
+    static const TarItem items[] = {
+        { "a",   NULL, NULL, TRUE  },
+        { "a/x", "X",  NULL, FALSE },
+        { "b",   NULL, NULL, TRUE  },
+        { "b/y", "Y",  NULL, FALSE },
+        { NULL, NULL, NULL, FALSE }
+    };
+    make_tar(tar, items);
+    gchar *a = J(out, "a"), *b = J(out, "b");
+    g_assert_cmpint(g_mkdir_with_parents(a, 0700), ==, 0);
+    chmod(a, 0700);
+
+    FsCtx c = { .conflict = arc_overwrite };
+    const char *sel[] = { "a", "b" };
+    g_assert_cmpint(arcfs_extract(&c, tar, "", sel, 2, out), ==, FS_OK);
+    fs_ctx_clear(&c);
+
+    struct stat st;
+    g_assert_cmpint(lstat(a, &st), ==, 0);
+    g_assert_cmpint(st.st_mode & 07777, ==, 0700);   /* not the archive's 0755 */
+    g_assert_cmpint(lstat(b, &st), ==, 0);
+    g_assert_cmpint((gint64)st.st_mtime, ==, 1000000000);
+
+    rm_rf(root);
+    g_free(a); g_free(b); g_free(tar); g_free(out); g_free(root);
+}
+
+/* streamed zip entries carry no size in the header: the written data
+ * must survive (it used to be truncated to 0 bytes) */
+static void test_arcfs_zip_no_size(void)
+{
+    gchar *root = tmp_root(), *zip = J(root, "t.zip"), *out = J(root, "out");
+    struct archive *w = archive_write_new();
+    archive_write_set_format_zip(w);
+    g_assert_cmpint(archive_write_open_filename(w, zip), ==, ARCHIVE_OK);
+    struct archive_entry *e = archive_entry_new();
+    archive_entry_set_pathname(e, "s.txt");
+    archive_entry_set_filetype(e, AE_IFREG);
+    archive_entry_set_perm(e, 0644);
+    archive_entry_unset_size(e);
+    archive_write_header(w, e);
+    archive_write_data(w, "streamed", 8);
+    archive_entry_free(e);
+    archive_write_close(w);
+    archive_write_free(w);
+
+    g_mkdir_with_parents(out, 0755);
+    FsCtx c = { .conflict = arc_overwrite };
+    const char *sel[] = { "s.txt" };
+    g_assert_cmpint(arcfs_extract(&c, zip, "", sel, 1, out), ==, FS_OK);
+    fs_ctx_clear(&c);
+    gchar *s = J(out, "s.txt"), *d = read_file(s);
+    g_assert_cmpstr(d, ==, "streamed");
+    g_free(d); g_free(s);
+    rm_rf(root);
+    g_free(zip); g_free(out); g_free(root);
+}
 #endif /* HAVE_LIBARCHIVE */
+
+/* a cancelled walk stops at once (move_any's progress size uses it) */
+static void test_calc_size_cancelled(void)
+{
+    gchar *root = tmp_root(), *f = J(root, "f");
+    write_file(f, "12345");
+    FsCtx c = { 0 };
+    g_assert_cmpint(fs_calc_size(&c, root), ==, 5);
+    fs_cancel(&c);
+    g_assert_cmpint(fs_calc_size(&c, root), ==, 0);
+    fs_ctx_clear(&c);
+    rm_rf(root);
+    g_free(f); g_free(root);
+}
 
 int main(int argc, char **argv)
 {
@@ -1085,11 +1162,14 @@ int main(int argc, char **argv)
     g_test_add_func("/arcfs/extract",          test_arcfs_extract);
     g_test_add_func("/arcfs/symlink-escape",   test_arcfs_symlink_escape);
     g_test_add_func("/arcfs/base-prefix",      test_arcfs_base_prefix);
+    g_test_add_func("/arcfs/existing-dir",     test_arcfs_existing_dir_untouched);
+    g_test_add_func("/arcfs/zip-no-size",      test_arcfs_zip_no_size);
 #endif
     g_test_add_func("/fsops/worst-cancel",     test_worst_and_cancel);
     g_test_add_func("/fsops/calc-size",        test_calc_size);
     g_test_add_func("/util/checksum-names",    test_checksum_names);
     g_test_add_func("/util/local-exists",      test_local_exists);
     g_test_add_func("/util/content-extra",     test_content_extra);
+    g_test_add_func("/fsops/calc-size-cancel", test_calc_size_cancelled);
     return g_test_run();
 }

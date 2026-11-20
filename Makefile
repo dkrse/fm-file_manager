@@ -96,6 +96,13 @@ ifeq ($(SAN),1)
               -fsanitize=address,undefined
   LDSAN    := -fsanitize=address,undefined
 endif
+# `make test-gui SAN=thread` → ThreadSanitizer (data races between workers)
+ifeq ($(SAN),thread)
+  BUILDDIR := build-tsan
+  CFLAGS   := $(filter-out -O2,$(CFLAGS)) -O1 -g -fno-omit-frame-pointer \
+              -fsanitize=thread
+  LDSAN    := -fsanitize=thread
+endif
 
 OBJS   := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 
@@ -107,7 +114,7 @@ ifneq ($(strip $(_SV_LIBS)),)
 endif
 BIN    := $(BUILDDIR)/$(TARGET)
 
-.PHONY: all clean install user-install uninstall debug test test-asan test-sftp test-gui
+.PHONY: bench all clean install user-install uninstall debug test test-asan test-sftp test-gui
 
 all: $(BIN)
 
@@ -162,9 +169,9 @@ endif
 # GUI integration tests (tabs, SFTP tabs, devices) – headless on broadway,
 # against the throwaway sshd when available.  `make test-gui SAN=1` = ASan.
 GUI_TEST_BIN := $(BUILDDIR)/test_gui
-GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/devices.o,$(OBJS))
+GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/devices.o $(BUILDDIR)/quickview.o,$(OBJS))
 
-$(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(GUI_TEST_OBJS) $(HDRS)
+$(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(SRCDIR)/quickview.c $(GUI_TEST_OBJS) $(HDRS)
 	$(CC) $(CFLAGS) tests/test_gui.c $(GUI_TEST_OBJS) -o $@ $(LIBS) $(LDSAN)
 
 # SAN=1: full stacks so tests/lsan.supp can match library caches by frame
@@ -173,8 +180,12 @@ test-gui: $(GUI_TEST_BIN)
 	LSAN_OPTIONS="suppressions=$(CURDIR)/tests/lsan.supp:print_suppressions=0:$$LSAN_OPTIONS" \
 	tests/gui_test.sh $(GUI_TEST_BIN)
 
+# timings on a 50 000 file directory (headless, same harness as test-gui)
+bench: $(GUI_TEST_BIN)
+	FM_BENCH=1 tests/gui_test.sh $(GUI_TEST_BIN)
+
 clean:
-	rm -rf build build-debug
+	rm -rf build build-debug build-tsan
 
 PREFIX  ?= /usr/local
 DATADIR ?= $(PREFIX)/share

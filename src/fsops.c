@@ -497,7 +497,7 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
     start_file(c, src, dst, 0);
     if (rename(src, dst) == 0) {
         gint64 bytes = S_ISDIR(st.st_mode)
-                       ? (c && c->progress ? fs_calc_size(NULL, dst) : 0)
+                       ? (c && c->progress ? fs_calc_size(c, dst) : 0)   /* cancellable */
                        : st.st_size;
         report(c, name, bytes);
         count_file(c);

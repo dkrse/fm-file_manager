@@ -1,6 +1,7 @@
 /* Midnight Commander style command line above the F-key bar */
 #include "fm.h"
 #include <string.h>
+#include <unistd.h>
 
 static Panel *cmd_panel(FM *fm) { return active_panel(fm); }
 
@@ -15,17 +16,20 @@ static const char *cmd_dir(Panel *p)
 void cmdline_update_prompt(FM *fm)
 {
     if (!fm->cmd_prompt) return;
+    /* "user@host$" like a shell prompt in mc; no directory, so the width is fixed */
     Panel *p = cmd_panel(fm);
-    const char *dir = cmd_dir(p);
-    const char *home = g_get_home_dir();
     gchar *txt;
     if (p->ssh_conn)
-        txt = g_strdup_printf("%s@%s:%s$", p->ssh_conn->user, p->ssh_conn->host, dir);
-    else if (home && g_str_has_prefix(dir, home) &&
-             (dir[strlen(home)] == '\0' || dir[strlen(home)] == '/'))
-        txt = g_strdup_printf("~%s$", dir + strlen(home));
-    else
-        txt = g_strdup_printf("%s$", dir);
+        txt = g_strdup_printf("%s@%s$", p->ssh_conn->user ? p->ssh_conn->user
+                              : g_get_user_name(), p->ssh_conn->host);
+    else {
+        gchar *host = g_strdup(g_get_host_name());
+        char *dot = strchr(host, '.');
+        if (dot) *dot = '\0';
+        txt = g_strdup_printf("%s@%s%s", g_get_user_name(), host,
+                              geteuid() == 0 ? "#" : "$");
+        g_free(host);
+    }
     gtk_label_set_text(GTK_LABEL(fm->cmd_prompt), txt);
     g_free(txt);
 }
@@ -132,7 +136,9 @@ static void hist_add(const char *cmd)
     }
     gchar *path = hist_file(), *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
-    g_file_set_contents(path, g->str, g->len, NULL);
+    /* commands may hold secrets: owner-only like the settings file */
+    g_file_set_contents_full(path, g->str, g->len,
+                             G_FILE_SET_CONTENTS_CONSISTENT, 0600, NULL);
     g_free(dir); g_free(path);
     g_string_free(g, TRUE);
 }

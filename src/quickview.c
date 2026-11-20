@@ -97,6 +97,102 @@ static gchar *dir_summary(const char *path)
                            dirs, files, dirs + files >= QV_DIR_MAX ? " (or more)" : "");
 }
 
+/* ── images decode in a worker ──────────────────────────────────────
+ * A big photo took hundreds of ms on the main thread at every cursor
+ * move.  One decode runs at a time; a request made meanwhile replaces
+ * the queued one, so holding an arrow key decodes only where it stops.
+ * Results for a file the cursor has already left are dropped. */
+#define QV_IMG_MAX_PX 2048          /* downscale bigger images on load */
+
+typedef struct { FM *fm; gchar *path; } QvImg;
+
+static gboolean qv_img_busy;
+static QvImg   *qv_img_next;
+
+static void qv_img_free(QvImg *r)
+{
+    if (!r) return;
+    g_free(r->path);
+    g_free(r);
+}
+
+static void qv_img_thread(GTask *t, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    QvImg *r = data;
+    GError *e = NULL;
+    int w = 0, h = 0;
+    GdkPixbuf *pb;
+    if (gdk_pixbuf_get_file_info(r->path, &w, &h) &&
+        (w > QV_IMG_MAX_PX || h > QV_IMG_MAX_PX))
+        pb = gdk_pixbuf_new_from_file_at_scale(r->path, QV_IMG_MAX_PX,
+                                               QV_IMG_MAX_PX, TRUE, &e);
+    else
+        pb = gdk_pixbuf_new_from_file(r->path, &e);
+    if (!pb) { g_task_return_error(t, e); return; }
+    GdkPixbuf *o = gdk_pixbuf_apply_embedded_orientation(pb);
+    g_object_unref(pb);
+    g_task_return_pointer(t, o, g_object_unref);
+}
+
+static void qv_img_start(QvImg *r);
+
+static void qv_img_done(GObject *src, GAsyncResult *res, gpointer data)
+{
+    (void)src;
+    QvImg *r = data;
+    FM *fm = r->fm;
+    GError *e = NULL;
+    GdkPixbuf *pb = g_task_propagate_pointer(G_TASK(res), &e);
+    qv_img_busy = FALSE;
+    /* still showing this file? */
+    if (fm->qv_on && g_strcmp0(fm->qv_path, r->path) == 0) {
+        Panel *q = &fm->panels[fm->qv_panel];
+        if (pb) {
+            GdkTexture *tx = gdk_texture_new_for_pixbuf(pb);
+            gtk_picture_set_paintable(GTK_PICTURE(qv_pic(q)), GDK_PAINTABLE(tx));
+            g_object_unref(tx);
+        } else {
+            gchar *base = g_path_get_basename(r->path);
+            gchar *msg = g_strdup_printf("Cannot show the image: %s",
+                                         e ? e->message : "unknown error");
+            show_text(q, base, msg);
+            g_free(msg); g_free(base);
+        }
+    }
+    if (pb) g_object_unref(pb);
+    g_clear_error(&e);
+    qv_img_free(r);
+    if (qv_img_next) {
+        QvImg *n = qv_img_next;
+        qv_img_next = NULL;
+        if (fm->qv_on && g_strcmp0(fm->qv_path, n->path) == 0) qv_img_start(n);
+        else qv_img_free(n);
+    }
+}
+
+static void qv_img_start(QvImg *r)
+{
+    qv_img_busy = TRUE;
+    GTask *t = g_task_new(NULL, NULL, qv_img_done, r);
+    g_task_set_task_data(t, r, NULL);
+    g_task_run_in_thread(t, qv_img_thread);
+    g_object_unref(t);
+}
+
+static void qv_img_request(FM *fm, const char *path)
+{
+    QvImg *r = g_new0(QvImg, 1);
+    r->fm = fm;
+    r->path = g_strdup(path);
+    if (qv_img_busy) {
+        qv_img_free(qv_img_next);
+        qv_img_next = r;
+    } else {
+        qv_img_start(r);
+    }
+}
+
 static void qv_render(FM *fm, Panel *q, const char *path)
 {
     gchar *base = g_path_get_basename(path);
@@ -116,13 +212,14 @@ static void qv_render(FM *fm, Panel *q, const char *path)
     gchar *size = fmt_size(st.st_size);
     gchar *title = g_strdup_printf("%s  —  %s", base, size);
 
-    /* images decode synchronously on every cursor move: skip huge ones */
+    /* decoded in a worker (and downscaled): see qv_img_request */
     if (fm->viewer_image_preview && viewer_is_image(base) &&
-        st.st_size <= 32 * 1024 * 1024) {
+        S_ISREG(st.st_mode) && st.st_size <= 64 * 1024 * 1024) {
         gtk_label_set_text(GTK_LABEL(qv_title(q)), title);
         gtk_widget_set_visible(qv_tscroll(q), FALSE);
+        gtk_picture_set_paintable(GTK_PICTURE(qv_pic(q)), NULL);
         gtk_widget_set_visible(qv_pic(q), TRUE);
-        gtk_picture_set_filename(GTK_PICTURE(qv_pic(q)), path);
+        qv_img_request(fm, path);
         goto out;
     }
     if (!S_ISREG(st.st_mode)) {
@@ -203,8 +300,21 @@ void qv_close(FM *fm)
     gtk_widget_set_visible(q->list_scroll, TRUE);
 }
 
+/* pin the divider where it is now; an unset GtkPaned position follows the
+ * children's natural widths, so swapping list <-> quick view would move it */
+static void qv_pin_paned(FM *fm)
+{
+    if (!fm->paned) return;
+    gboolean set = FALSE;
+    g_object_get(fm->paned, "position-set", &set, NULL);
+    if (!set)
+        gtk_paned_set_position(GTK_PANED(fm->paned),
+                               gtk_paned_get_position(GTK_PANED(fm->paned)));
+}
+
 void qv_toggle(FM *fm)
 {
+    qv_pin_paned(fm);
     if (qv_active(fm)) {
         qv_close(fm);
         panel_focus(active_panel(fm));

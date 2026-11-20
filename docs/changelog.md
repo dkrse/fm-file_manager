@@ -1,5 +1,44 @@
 # Changelog
 
+## [3.6.0] - 2026-11-20
+
+**Changed:**
+- Command line looks like a shell prompt: `user@host$` in front of it (`#` as root, remote user and host on an SFTP panel), in the normal text colour; no directory, so its width never changes
+- The command line shows only what you type – status messages and hints are no longer written into it
+- Quick view: images are decoded in a worker and downscaled to 2048 px (EXIF orientation applied); holding an arrow key decodes only the image where the cursor stops
+- Checksums (Alt+K / Alt+Shift+K): scanning directories and checking the listed files run inside the progress window ("Scanning…", Cancel works) instead of freezing the UI first
+- Editor: saving over SFTP runs in a worker with a "Saving…" window, a slow link no longer freezes every window
+- Command history file is created owner-only (0600)
+
+**Fixed:**
+- Closing F3 / F4 deep in a long list moved the list and the cursor vanished until an arrow key was pressed; the list now comes back exactly as it was
+- Quick view changed the width of the panels (divider followed the content); the divider now stays put
+- Editor: closing it again (Esc / X) while the "Save changes?" question was open freed it under the question (crash)
+- Archives: unmounting the device during an extract or while an archive was read crashed the archive panel
+- Devices: unmount could use the mount after it had been freed
+- Clipboard: after another application took the clipboard, Ctrl+V could still paste old remote files
+- Extracting into an existing directory gave it the archive's permissions and date (e.g. `~/Documents`)
+- Zip entries without a size in the header could be extracted as empty files
+- SFTP: marks were not updated when a remote file disappeared; a remote command with a lot of error output hung for 60 s and blocked the connection
+- Cancelling a `.tar.xz` / `.tar.gz` pack left `xz` / `gzip` running; the last error line of tar / unzip was often lost
+- Copy between two SFTP servers: no reason shown when the local temporary directory could not be created
+- Search: in very deep directories a path too long for the buffer was cut off and the wrong path searched; such entries are now skipped
+- An SFTP connection finishing during a search mixed the results into the SFTP tab
+- Moving a directory on the same disk: the size walk afterwards could not be cancelled
+- CI: the minimal build (no libarchive) did not compile the tests
+
+**Performance:**
+- Viewer / editor search waits for a 200 ms typing pause instead of scanning the whole file (up to 50–100 MB) on every key; Enter / F3 still search at once
+- Auto-refresh: a batch of changed files is applied in one pass over the list (a name → position map instead of a search per file), neighbouring removals in one step; after a full reload caused by a mass copy, updates back off to 1 s
+- Reload (Ctrl+R) keeps the scroll position
+- Syntax highlighting no longer copies files that are too big to highlight
+
+**Tests:**
+- Unit tests: extracting into an existing directory, streamed zip without sizes, cancelled size walk; the minimal build compiles them
+- GUI tests (249 checks): SFTP save in a worker, `ssh_exec` with 3 MB on stderr, monitor batches (add / delete / modify, marks, overflow reload), checksum verify, quick view images (async, downscaled, stale results dropped), cursor and scroll after F3 / F4
+- `make bench`: timings on a 50 000-file directory (load, reload, marking, filter, monitor batch, memory over repeated loads)
+- `make test-gui SAN=thread` (and `test SAN=thread`): ThreadSanitizer build in `build-tsan/`
+
 ## [3.5.1] - 2026-11-18
 
 **New:**

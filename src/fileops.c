@@ -144,8 +144,13 @@ static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
         }
     }
     job->src_remote = FALSE;           /* upload reads the local temp copy */
-    gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", NULL);
-    if (!tmpdir) return FS_ERR;
+    GError *te = NULL;
+    gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", &te);
+    if (!tmpdir) {
+        if (!c->error) c->error = g_strdup_printf("temporary copy: %s", te->message);
+        g_clear_error(&te);
+        return FS_ERR;
+    }
     gchar *base = g_path_get_basename(src);
     gchar *tmp  = g_build_filename(tmpdir, base, NULL);
     r = fs_sftp_download(c, x->sconn->sftp, src, tmp);

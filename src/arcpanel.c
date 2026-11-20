@@ -177,6 +177,11 @@ gboolean arc_panel_enter(Panel *p, const char *archive)
         g_free(error); g_free(file); g_free(dir);
         return cancelled;            /* error → caller opens it as a file */
     }
+    if (p->ssh_conn || p->busy) {    /* panel retargeted during the wait */
+        g_ptr_array_unref(entries);
+        g_free(file); g_free(dir);
+        return TRUE;
+    }
 
     /* found by a search: the results stay reachable via Alt+Left */
     gboolean was_search = p->search_mode;
@@ -267,6 +272,13 @@ void arc_panel_reload(Panel *p)
         gchar *error;
         gboolean cancelled;
         GPtrArray *entries = arc_read(p->fm, p->arc_file, &error, &cancelled);
+        /* the nested wait can leave the archive (e.g. its mount went away) */
+        if (!p->arc_file) {
+            if (entries) g_ptr_array_unref(entries);
+            g_free(error);
+            g_free(cur);
+            return;
+        }
         if (!entries && !cancelled) {
             fm_status(p->fm, "Cannot read the archive: %s", error);
             g_free(error);
@@ -454,9 +466,11 @@ void arc_panel_copy_out(FM *fm)
     GPtrArray *inner = g_ptr_array_new_with_free_func(g_free);
     for (GList *l = names; l; l = l->next)
         g_ptr_array_add(inner, arc_inner(src, l->data));
+    /* own copies: the nested job loop may leave the archive (unmount) */
+    gchar *arc_file = g_strdup(src->arc_file), *arc_dir = g_strdup(src->arc_dir);
     ArcCopy c = {
-        .archive = src->arc_file,
-        .base    = src->arc_dir,
+        .archive = arc_file,
+        .base    = arc_dir,
         .dest    = dest,
         .inner   = (const char *const *)inner->pdata,
         .n       = inner->len,
@@ -481,9 +495,12 @@ void arc_panel_copy_out(FM *fm)
         if (!q->ssh_conn && !q->arc_file && !q->search_mode && strcmp(q->cwd, dest) == 0)
             panel_reload(q);
     }
-    if (src->marks) g_hash_table_remove_all(src->marks);
-    arc_panel_reload(src);
+    if (src->arc_file) {
+        if (src->marks) g_hash_table_remove_all(src->marks);
+        arc_panel_reload(src);
+    }
 
+    g_free(arc_file); g_free(arc_dir);
     g_ptr_array_unref(inner);
     g_list_free_full(names, g_free);
     g_free(dest);

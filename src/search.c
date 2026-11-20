@@ -167,8 +167,10 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
                     int line = 0;
                     if (!is_link && S_ISREG(st.st_mode)) {
                         char full[4096];
-                        g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-                        ml = fs_file_contains(full, ctx->content, &line, &ctx->cancelled);
+                        /* too deep for the buffer: skip, never a truncated path */
+                        if ((gsize)g_snprintf(full, sizeof(full), "%s/%s", base,
+                                              de->d_name) < sizeof(full))
+                            ml = fs_file_contains(full, ctx->content, &line, &ctx->cancelled);
                     }
                     if (ml) add_result(ctx, base_interned, de->d_name, &st, ml, line);
                 } else {
@@ -179,8 +181,9 @@ static void search_dir(SearchCtx *ctx, const char *base, int depth)
 
         if (is_dir && !is_link) {
             char full[4096];
-            g_snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
-            search_dir(ctx, full, depth + 1);
+            if ((gsize)g_snprintf(full, sizeof(full), "%s/%s", base,
+                                  de->d_name) < sizeof(full))
+                search_dir(ctx, full, depth + 1);
         }
     }
     closedir(dir);

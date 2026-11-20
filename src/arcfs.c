@@ -339,7 +339,9 @@ static int extract_entry(Ex *x, struct archive *a, struct archive_entry *ae,
             r = ex_fail(c, "%s: %s", dst, "exists and is not a directory");
         } else if (!exists && mkdir(dst, 0755) != 0) {
             r = ex_fail(c, "%s: %s", dst, g_strerror(errno));
-        } else {
+        } else if (!exists) {
+            /* only directories we created: an existing ~/Documents must
+             * not get the archive's mode and mtime */
             DirStamp *d = g_new(DirStamp, 1);
             d->path  = g_strdup(dst);
             d->mtime = archive_entry_mtime(ae);
@@ -382,7 +384,10 @@ static int extract_entry(Ex *x, struct archive *a, struct archive_entry *ae,
             r = ex_fail(c, "%s: %s", dst, g_strerror(errno));
         } else {
             r = write_data(x, a, fd, rel);
-            if (r == FS_OK && ftruncate(fd, size) != 0)
+            /* no size in the header (streamed zip) → archive_entry_size
+             * is 0: truncating would empty the file we just wrote */
+            if (r == FS_OK && archive_entry_size_is_set(ae) &&
+                ftruncate(fd, size) != 0)
                 r = ex_fail(c, "%s: %s", dst, g_strerror(errno));
             if (r == FS_OK)
                 fchmod(fd, archive_entry_perm(ae) & 0777);

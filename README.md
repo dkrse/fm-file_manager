@@ -46,18 +46,18 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **File mask** — glob pattern display filter on active panel (files only, e.g. `*.c`)
 - **File search** — F2, recursive search with content grep, size filter, MC-style grouped results in panel. Results are kept: Enter opens a file in its default app, Ctrl+PgDn / Ctrl+Enter jumps to the file's directory, Alt+← (or the 🔍 button) returns to the results, Shift+F2 lists the last 10 searches. Content search shows `:line  matching text` next to each file; F3 opens the viewer on that match with the text highlighted (F3 / Shift+F3 = next / previous)
 - **File viewer** — F3, displays text (only the first 50 MB of larger files are read, also over SFTP, so even multi-GB files open instantly) with configurable font and search (Ctrl+F); image preview for PNG/JPG/GIF/SVG/WebP/BMP/TIFF (toggleable in Settings)
-- **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too; files up to 100 MB (larger remote files are refused without being downloaded)
+- **Text editor** — F4, built-in editor with menu bar, find/replace (Ctrl+F/H), syntax highlighting; works on SFTP panel too (saving runs in the background with a "Saving…" window); files up to 100 MB (larger remote files are refused without being downloaded)
 - **Syntax highlighting** — GtkSourceView (hundreds of languages) or built-in highlighter (C/Python/Shell/JS); switched off automatically for files over 2 MB to keep large files fast
 - **Content-type icons** — files and folders shown with freedesktop standard icons based on extension (~80 types)
-- **Command line** — Midnight Commander style, above the F-key bar: typing in a panel goes there, Enter runs the command with `sh -c` in the active panel's directory without a terminal (on an SFTP panel it runs on the server over the same SSH connection); the result (`done` / `exit N` + the first output line) is shown in the command line and both panels are refreshed; `cd dir` changes the panel's directory; Ctrl+Enter / Ctrl+Shift+Enter insert the file name / full path under the cursor, Tab completes file names, Alt+P / Alt+N browse the history (saved in `~/.config/fm/cmd_history`); status messages appear in the empty command line
+- **Command line** — Midnight Commander style, above the F-key bar: typing in a panel goes there, Enter runs the command with `sh -c` in the active panel's directory without a terminal (on an SFTP panel it runs on the server over the same SSH connection); both panels are refreshed afterwards; `cd dir` changes the panel's directory; a `user@host$` prompt (`#` as root, the server's user and host on an SFTP panel) stands in front of it and the line itself shows only what you type; Ctrl+Enter / Ctrl+Shift+Enter insert the file name / full path under the cursor, Tab completes file names, Alt+P / Alt+N browse the history (saved owner-only in `~/.config/fm/cmd_history`)
 - **SSH terminal** — open terminal directly in the current directory (local and SSH)
 - **Saved SSH connections** — any number of named connections (name/host/user/port/key) in settings.ini, selectable via dropdown; Save with a new name adds a connection, the same name updates it, New clears the form, Remove deletes the selected one; custom private key path per connection
-- **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates (add/remove/update individual files, no full reload)
+- **Auto-refresh panels** — automatic directory monitoring via inotify (local) or polling (SFTP, interval 1–300 s in Settings, default 5 s); incremental updates in batches (add/remove/update individual files in one pass, no full reload); a mass copy into the shown directory causes one reload, then updates back off to 1 s
 - **Compare / synchronize directories** — Alt+C marks in both panels the files that are missing on the other side or newer (2 s tolerance for FAT); then copy left → right, right → left or both ways in one step (local and SFTP); files with the same time but a different size are reported, not marked
 - **Compare files** — Alt+D on two marked files or the cursor file of each panel: opens meld / kdiff3 / kompare / diffuse (or the program set in Settings → System → Compare tool), otherwise a built-in coloured unified diff
-- **Quick view** — Ctrl+Q shows the file under the cursor in the other panel: text (first 512 KB), images, directory summary; follows the cursor
+- **Quick view** — Ctrl+Q shows the file under the cursor in the other panel: text (first 512 KB), images (decoded in the background, downscaled to 2048 px), directory summary; follows the cursor, the panel widths stay as they were
 - **Background operations** — local copy / move / delete can be sent to the background ("Background" button in the progress window); further operations queue up behind it, the command line shows the progress, Ctrl+J shows the window again; closing the main window waits for running jobs
-- **Checksums** — Alt+K creates MD5 / SHA-1 / SHA-256 / SHA-512 sums of the marked files (directories recursively), copy them or save as `.sha256` …; Alt+Shift+K verifies a checksum file (GNU and BSD format) and lists failed / missing files first
+- **Checksums** — Alt+K creates MD5 / SHA-1 / SHA-256 / SHA-512 sums of the marked files (directories recursively, scanned inside the progress window with Cancel), copy them or save as `.sha256` …; Alt+Shift+K verifies a checksum file (GNU and BSD format) and lists failed / missing files first
 - **Network locations** — Ctrl+N connects to `smb://`, `ftp://`, `dav(s)://`, `sftp://`, `nfs://` … through GIO/gvfs (password dialog, keyring); the panel opens the gvfs FUSE path, so every operation works there; last 10 addresses remembered; ⏏ in the device picker disconnects (needs gvfs + gvfs-fuse, standard on GNOME/Xfce/Cinnamon)
 - **Remembered window size** — the main window opens with the size (and maximized state) it had when it was last closed
 - **Per-panel hamburger menu** — New/Close tab, SSH/SFTP, Create/Extract archive, File mask, Search, Filter — in each panel's path bar
@@ -193,7 +193,9 @@ make clean            # clean build artifacts
 make test             # unit tests of the core: file operations, archives, content search, size parsing (no display needed)
 make test-asan        # the same under AddressSanitizer + UBSan
 make test-sftp        # SFTP tests against a private throwaway sshd (skipped without sshd)
-make test-gui         # GUI tests (tabs, SFTP tabs, devices, compare, quick view, job queue) headless on broadway; SAN=1 for ASan (library caches suppressed via tests/lsan.supp)
+make test-gui         # GUI tests (tabs, SFTP tabs + save + remote commands, devices, compare, quick view + images, job queue, auto-refresh, checksums, cursor/scroll after F3/F4) headless on broadway; SAN=1 for ASan (library caches suppressed via tests/lsan.supp)
+make test-gui SAN=thread  # GUI tests under ThreadSanitizer (build-tsan/; races inside GLib are false positives)
+make bench            # timings on a 50 000-file directory: load, reload, marking, filter, auto-refresh batch, memory
 make debug            # debug build with sanitizers (build-debug/fm)
 ```
 
@@ -229,6 +231,8 @@ src/clipboard.c     — system clipboard copy/cut/paste
 src/monitor.c       — auto-refresh (inotify / SFTP polling)
 src/icons.c         — content-type icons
 tests/test_core.c   — unit tests (GLib test framework)
+tests/test_sftp.c   — SFTP tests against a throwaway sshd (tests/sftp_test.sh)
+tests/test_gui.c    — GUI tests + `make bench`, headless on broadway (tests/gui_test.sh)
 src/search.c        — file search
 src/ssh.c           — SSH/SFTP connection and browsing
 src/devices.c       — device picker (mount / unmount / eject, hot-plug)

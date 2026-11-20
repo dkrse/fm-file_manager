@@ -29,6 +29,8 @@ static void rclip_clear(void)
     g_list_free_full(rclip.paths, g_free);
     rclip.paths = NULL;
     rclip.serial = 0;
+    if (rclip.owner)
+        g_object_remove_weak_pointer(G_OBJECT(rclip.owner), (gpointer *)&rclip.owner);
     rclip.owner = NULL;
 }
 
@@ -62,12 +64,15 @@ static void clip_copy_remote(FM *fm, Panel *p, gboolean cut)
     }
     GdkContentProvider *cp = gdk_content_provider_new_typed(G_TYPE_STRING, s->str);
     gdk_clipboard_set_content(clipboard(fm), cp);
-    g_object_unref(cp);
-    g_string_free(s, TRUE);
     rclip.serial = p->ssh_conn->serial;
     rclip.paths  = paths;
     rclip.cut    = cut;
-    rclip.owner  = cp;          /* clipboard keeps it alive while ours */
+    /* weak pointer: NULLed when another app takes the clipboard and the
+     * provider dies, so a reused address can never match */
+    rclip.owner  = cp;
+    g_object_add_weak_pointer(G_OBJECT(cp), (gpointer *)&rclip.owner);
+    g_object_unref(cp);
+    g_string_free(s, TRUE);
     fm_status(fm, "%s %d item%s to clipboard", cut ? "Cut" : "Copied",
               n, n == 1 ? "" : "s");
 }

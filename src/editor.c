@@ -36,6 +36,14 @@ typedef struct {
     gboolean       read_only;     /* binary file (NUL bytes): never saved */
     gchar         *encoding;      /* original charset, NULL = UTF-8 */
     guint          hl_idle;
+    guint          search_idle;   /* debounced search-as-you-type */
+    gboolean       closing;       /* close prompt already open */
+    gboolean       saving;        /* remote save waiting in a nested loop */
+    /* panel view when F4 was pressed (restored on close if unchanged) */
+    int            view_panel;
+    guint          view_cursor;
+    double         view_value;
+    gchar         *view_dir;
     gboolean       word_wrap;
     /* search/replace */
     GtkWidget     *search_bar;
@@ -202,6 +210,7 @@ static SshConn *editor_conn(EditorCtx *ctx)
 
 static void editor_save(EditorCtx *ctx)
 {
+    if (ctx->saving) return;            /* F2 again while uploading */
     if (ctx->read_only) {
         fm_status(ctx->fm, "Editor: binary file is read-only, not saved");
         return;
@@ -235,9 +244,14 @@ static void editor_save(EditorCtx *ctx)
     if (ctx->ssh_conn) {
         display_path = ctx->remote_path;
         SshConn *conn = editor_conn(ctx);
-        ok = conn && ssh_write_file(conn, ctx->remote_path, text, len);
+        ctx->saving = TRUE;
+        int wr = conn ? fm_write_remote(ctx->fm, conn, ctx->remote_path, text, len) : 0;
+        ctx->saving = FALSE;
+        ok = wr == 1;
         if (!conn)
             fm_status(ctx->fm, "Not saved: the SFTP connection was closed");
+        else if (wr < 0)
+            fm_status(ctx->fm, "Save not confirmed (stopped waiting): %s", ctx->remote_path);
         else if (!ok)
             fm_status(ctx->fm, "SFTP save error: %s", ctx->remote_path);
     } else if (ctx->filepath) {
@@ -433,8 +447,28 @@ static void search_goto_match(EditorCtx *ctx, int index)
     }
 }
 
+static gboolean search_idle_cb(gpointer user_data)
+{
+    EditorCtx *ctx = user_data;
+    ctx->search_idle = 0;
+    search_highlight_all(ctx, gtk_editable_get_text(GTK_EDITABLE(ctx->search_entry)));
+    if (ctx->total_matches > 0)
+        search_goto_match(ctx, 1);
+    return G_SOURCE_REMOVE;
+}
+
+/* Enter / F3 right after typing: run the pending search first */
+static void search_flush(EditorCtx *ctx)
+{
+    if (ctx->search_idle) {
+        g_source_remove(ctx->search_idle);
+        search_idle_cb(ctx);
+    }
+}
+
 static void search_next(EditorCtx *ctx)
 {
+    search_flush(ctx);
     if (ctx->total_matches == 0) return;
     int next = ctx->current_match + 1;
     if (next > ctx->total_matches) next = 1;
@@ -443,20 +477,20 @@ static void search_next(EditorCtx *ctx)
 
 static void search_prev(EditorCtx *ctx)
 {
+    search_flush(ctx);
     if (ctx->total_matches == 0) return;
     int prev = ctx->current_match - 1;
     if (prev < 1) prev = ctx->total_matches;
     search_goto_match(ctx, prev);
 }
 
+/* whole-buffer scan: wait for a typing pause instead of per keystroke */
 static void on_search_changed(GtkEditable *editable, gpointer user_data)
 {
+    (void)editable;
     EditorCtx *ctx = user_data;
-    const gchar *needle = gtk_editable_get_text(editable);
-    search_highlight_all(ctx, needle);
-    if (ctx->total_matches > 0) {
-        search_goto_match(ctx, 1);
-    }
+    if (ctx->search_idle) g_source_remove(ctx->search_idle);
+    ctx->search_idle = g_timeout_add(SEARCH_DEBOUNCE_MS, search_idle_cb, ctx);
 }
 
 static void on_search_next_clicked(GtkButton *btn, gpointer user_data)
@@ -927,6 +961,9 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
 {
     (void)win;
     EditorCtx *ctx = user_data;
+    /* ask_choice spins a nested loop; a second close (Esc, X) must not
+     * free ctx under the outer prompt */
+    if (ctx->closing || ctx->saving) return TRUE;
     if (ctx->modified && !ctx->read_only) {
         const gchar *dp = ctx->remote_path ? ctx->remote_path
                         : ctx->filepath   ? ctx->filepath : "untitled";
@@ -934,13 +971,16 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
         gchar *q = g_markup_printf_escaped("Save changes to <b>%s</b>?", base);
         g_free(base);
         static const char *const b[] = { "Cancel", "Discard", "Save", NULL };
+        ctx->closing = TRUE;
         int r = ask_choice(ctx->fm, "Close editor", q, NULL, b, 1);
+        ctx->closing = FALSE;
         g_free(q);
         if (r == 2) editor_save(ctx);
         if (r <= 0 || (ctx->modified && r == 2))
             return TRUE;                /* cancelled or save failed: keep open */
     }
     if (ctx->hl_idle) g_source_remove(ctx->hl_idle);
+    if (ctx->search_idle) g_source_remove(ctx->search_idle);
     /* the window (and with it buffer/adjustment) dies after this returns */
     g_signal_handlers_disconnect_by_data(ctx->buffer, ctx);
     if (ctx->vadj) g_signal_handlers_disconnect_by_data(ctx->vadj, ctx);
@@ -949,9 +989,16 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
     g_free(ctx->filepath);
     g_free(ctx->remote_path);
     g_free(ctx->encoding);
-    g_free(ctx);
     Panel *ap = active_panel(fm);
-    panel_focus(ap);
+    /* the editor is not modal: restore the old view only if the panel is
+     * still where F4 was pressed */
+    if (ap->idx == ctx->view_panel && ap->cursor_pos == ctx->view_cursor &&
+        g_strcmp0(panel_dir(ap), ctx->view_dir) == 0)
+        panel_view_restore(ap, ctx->view_value);
+    else
+        panel_focus(ap);
+    g_free(ctx->view_dir);
+    g_free(ctx);
     return FALSE;
 }
 
@@ -968,6 +1015,7 @@ void editor_show(FM *fm)
 void editor_show_path(FM *fm, const char *path)
 {
     Panel *p = active_panel(fm);
+    double view_value = panel_view_save(p);   /* before the "Reading…" wait */
 
     gchar *name = path ? g_path_get_basename(path) : panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) { g_free(name); return; }
@@ -1059,6 +1107,10 @@ void editor_show_path(FM *fm, const char *path)
     }
 
     EditorCtx *ctx = g_new0(EditorCtx, 1);
+    ctx->view_panel  = p->idx;
+    ctx->view_cursor = p->cursor_pos;
+    ctx->view_value  = view_value;
+    ctx->view_dir    = g_strdup(panel_dir(p));
     ctx->fm          = fm;
     ctx->filepath    = filepath;
     ctx->remote_path = remote_path;

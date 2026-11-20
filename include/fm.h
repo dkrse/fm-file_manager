@@ -16,6 +16,7 @@
 
 #define APP_ID   "sk.km.fm"
 #define APP_NAME "FM"
+#define SEARCH_DEBOUNCE_MS 200   /* viewer/editor search-as-you-type */
 
 /* ── FileItem GObject – replaces GtkListStore columns ────────────── */
 
@@ -146,6 +147,7 @@ typedef struct {
     GFileMonitor       *dir_monitor;   /* local: inotify watcher             */
     GHashTable         *mon_pending;   /* names changed since the last flush */
     guint               mon_flush_id;  /* batches monitor events (150 ms)    */
+    gint64              mon_reload_at; /* last overflow reload (monotonic µs) */
     guint               poll_id;       /* SFTP: periodic poll timer (0=off)  */
     GThread            *poll_thread;   /* SFTP: listing in progress          */
     guint               poll_gen;      /* bumped on stop – drops stale lists */
@@ -331,6 +333,8 @@ const char *panel_dir(Panel *p);             /* cwd or remote cwd */
 void   panel_update_status(Panel *p);
 void   fm_refocus_if_lost(FM *fm);                  /* after a modal window closed */
 void   panel_focus(Panel *p);                      /* make active + keyboard cursor */
+double panel_view_save(Panel *p);                  /* scroll offset before F3/F4 */
+void   panel_view_restore(Panel *p, double value); /* … back exactly, cursor shown */
 void   panel_select_name(Panel *p, const char *name);  /* move cursor to item */
 FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st);
 /* Run fn(arg) in a worker; after 150 ms a modal "Reading <what>…" window
@@ -474,6 +478,10 @@ int       ssh_exec(SshConn *conn, const char *dir, const char *cmd,
 gchar    *ssh_read_file (SshConn *conn, const char *path, gsize max_len,
                           gsize *out_len);   /* max_len 0 = no limit */
 gboolean  ssh_write_file(SshConn *conn, const char *path, const gchar *data, gsize len);
+/* ssh_write_file in a worker with the "Saving…" window: 1 ok, 0 error,
+ * -1 the user stopped waiting (the upload may still finish) */
+int       fm_write_remote(FM *fm, SshConn *conn, const char *path,
+                          const gchar *data, gsize len);
 
 /* ── shared callbacks ─────────────────────────────────────────────── */
 /* Folder-chooser button – reused by fileops and search */

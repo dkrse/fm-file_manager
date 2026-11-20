@@ -39,6 +39,13 @@ static void arg(ArcJob *a, const char *s)
     g_ptr_array_add(a->argv, g_strdup(s));
 }
 
+/* own process group: cancel must also stop the compressor tar forks */
+static void arc_child_setup(gpointer u)
+{
+    (void)u;
+    setpgid(0, 0);
+}
+
 static void arc_worker(Job *job, gpointer d)
 {
     ArcJob *a = d;
@@ -51,7 +58,7 @@ static void arc_worker(Job *job, gpointer d)
     if (!g_spawn_async_with_pipes(a->cwd, (gchar **)a->argv->pdata, NULL,
             G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD |
             G_SPAWN_STDOUT_TO_DEV_NULL,
-            NULL, NULL, &pid, NULL, NULL, &err_fd, &e)) {
+            arc_child_setup, NULL, &pid, NULL, NULL, &err_fd, &e)) {
         a->error = g_strdup(e ? e->message : "spawn failed");
         g_clear_error(&e);
         return;
@@ -70,11 +77,20 @@ static void arc_worker(Job *job, gpointer d)
         }
         if (waitpid(pid, &status, WNOHANG) > 0) { done = TRUE; break; }
         if (job_cancelled(job)) {
-            kill(pid, SIGTERM);
+            kill(-pid, SIGTERM);
             waitpid(pid, &status, 0);
             break;
         }
         g_usleep(50000);
+    }
+    /* the last message is often written just before exit */
+    if (done) {
+        char buf[1024];
+        ssize_t n;
+        while ((n = read(err_fd, buf, sizeof(buf))) > 0) {
+            g_string_append_len(err, buf, n);
+            if (err->len > 4096) g_string_erase(err, 0, err->len - 4096);
+        }
     }
     close(err_fd);
     g_spawn_close_pid(pid);

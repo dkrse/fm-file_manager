@@ -272,6 +272,8 @@ void highlight_apply(GtkTextBuffer *buf, const char *filepath, gboolean enabled)
     Language lang = detect_lang(filepath);
     if (lang == LANG_NONE) return;
 
+    /* chars <= bytes: skip the full copy when it is certainly too big */
+    if (gtk_text_buffer_get_char_count(buf) > 512 * 1024) return;
     gchar *text = gtk_text_buffer_get_text(buf, &ts, &te, FALSE);
     gsize  tlen = strlen(text);
     if (tlen > 512 * 1024) { g_free(text); return; }

@@ -180,9 +180,11 @@ static void on_row_activated(GtkListBox *lb, GtkListBoxRow *row, Panel *p)
 
 static void on_unmount_clicked(GtkButton *b, Panel *p)
 {
+    /* the button holds the only ref and may be destroyed during unmount */
     GMount *m = g_object_get_data(G_OBJECT(b), "fm-mount");
+    if (m) g_object_ref(m);
     popdown(p);
-    if (m) mount_unmount(p, m);
+    if (m) { mount_unmount(p, m); g_object_unref(m); }
 }
 
 static void add_row(Panel *p, GIcon *icon, const char *icon_name,
