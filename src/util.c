@@ -331,7 +331,9 @@ gchar *fs_file_contains(const char *path, const char *needle_lower,
     gboolean cont = FALSE;      /* previous piece stopped mid-line */
 
     while (fgets(buf + keep, FC_CHUNK + 1, fp)) {
-        if ((line & 1023) == 0 && cancelled && g_atomic_int_get(cancelled)) break;
+        /* every piece, not every 1024th line: one huge line with no
+         * newline would otherwise never see the cancel */
+        if (cancelled && g_atomic_int_get(cancelled)) break;
         size_t len = keep + strlen(buf + keep);
         gboolean whole = len > 0 && buf[len - 1] == '\n';
         if (!cont) line++;

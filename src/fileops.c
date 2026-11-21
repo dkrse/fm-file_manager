@@ -108,6 +108,82 @@ static gint64 item_size(Job *job, SshConn *conn, const char *path)
     return fs_calc_size(&job->ctx, path);
 }
 
+#ifdef HAVE_LIBSSH2
+/* remote → remote: one file at a time through the local temp dir
+ * (staging the whole tree first needed its full size in /tmp – often
+ * RAM).  Directories are walked here and created on the target. */
+static int r2r_file(Job *job, Xfer *x, const char *tmpdir,
+                    const char *src, const char *dst)
+{
+    FsCtx *c = &job->ctx;
+    gchar *base = g_path_get_basename(src);
+    gchar *tmp  = g_build_filename(tmpdir, base, NULL);
+    job->src_remote = TRUE;
+    int r = fs_sftp_download(c, x->sconn->sftp, src, tmp);
+    job->src_remote = FALSE;           /* upload reads the local temp copy */
+    if (r == FS_OK) r = fs_sftp_upload(c, x->dconn->sftp, tmp, dst);
+    if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+    fs_delete(NULL, tmp);
+    g_free(base); g_free(tmp);
+    return r;
+}
+
+static int r2r_any(Job *job, Xfer *x, const char *tmpdir,
+                   const char *src, const char *dst)
+{
+    FsCtx *c = &job->ctx;
+    if (fs_cancelled(c)) return FS_CANCELLED;
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    if (libssh2_sftp_lstat(x->sconn->sftp, src, &a) != 0 ||
+        !(a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) ||
+        !LIBSSH2_SFTP_S_ISDIR(a.permissions))
+        return r2r_file(job, x, tmpdir, src, dst);   /* file, link, unknown */
+
+    gboolean ddir = FALSE;
+    if (fs_sftp_exists(x->dconn->sftp, dst, &ddir)) {
+        if (!ddir) return r2r_file(job, x, tmpdir, src, dst);  /* conflict path */
+    } else if (libssh2_sftp_mkdir(x->dconn->sftp, dst,
+                                  (long)(a.permissions & 0777) | 0700) != 0) {
+        if (!c->error) c->error = g_strdup_printf("Cannot create %s", dst);
+        return FS_ERR;
+    }
+    LIBSSH2_SFTP_HANDLE *h = libssh2_sftp_opendir(x->sconn->sftp, src);
+    if (!h) {
+        if (!c->error) c->error = g_strdup_printf("Cannot read %s", src);
+        return FS_ERR;
+    }
+    int r = FS_OK, rc;
+    char nm[1024], longentry[1024];
+    LIBSSH2_SFTP_ATTRIBUTES at;
+    /* read the names first: the walk must not interleave with writes
+     * when source and target are the same session/directory tree */
+    GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+    while ((rc = libssh2_sftp_readdir_ex(h, nm, sizeof nm, longentry,
+                                         sizeof longentry, &at)) > 0) {
+        if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+        if (!fs_name_is_safe(nm)) { r = fs_worst(r, FS_SKIPPED); continue; }
+        g_ptr_array_add(names, g_strdup(nm));
+    }
+    libssh2_sftp_closedir(h);
+    if (rc < 0) {                       /* never treat an error as the end */
+        if (!c->error) c->error = g_strdup_printf("Error reading %s", src);
+        r = fs_worst(r, FS_ERR);
+    }
+    for (guint i = 0; i < names->len && r != FS_CANCELLED; i++) {
+        gchar *sp = fs_remote_join(src, names->pdata[i]);
+        gchar *dp = fs_remote_join(dst, names->pdata[i]);
+        r = fs_worst(r, r2r_any(job, x, tmpdir, sp, dp));
+        g_free(sp); g_free(dp);
+    }
+    g_ptr_array_unref(names);
+    if (x->move && r == FS_OK && libssh2_sftp_rmdir(x->sconn->sftp, src) != 0) {
+        if (!c->error) c->error = g_strdup_printf("Cannot remove %s", src);
+        r = FS_ERR;
+    }
+    return r;
+}
+#endif
+
 static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
 {
     FsCtx *c = &job->ctx;
@@ -143,7 +219,6 @@ static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
             return FS_ERR;
         }
     }
-    job->src_remote = FALSE;           /* upload reads the local temp copy */
     GError *te = NULL;
     gchar *tmpdir = g_dir_make_tmp("fm-r2r-XXXXXX", &te);
     if (!tmpdir) {
@@ -151,13 +226,9 @@ static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
         g_clear_error(&te);
         return FS_ERR;
     }
-    gchar *base = g_path_get_basename(src);
-    gchar *tmp  = g_build_filename(tmpdir, base, NULL);
-    r = fs_sftp_download(c, x->sconn->sftp, src, tmp);
-    if (r == FS_OK) r = fs_sftp_upload(c, x->dconn->sftp, tmp, dst);
-    if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+    r = r2r_any(job, x, tmpdir, src, dst);
     fs_delete(NULL, tmpdir);
-    g_free(base); g_free(tmp); g_free(tmpdir);
+    g_free(tmpdir);
     return r;
 #else
     (void)job; (void)src; (void)dst;
@@ -173,11 +244,22 @@ static void xfer_worker(Job *job, gpointer d)
 
     job_set_phase(job, "Calculating size…");
     gint64 total = 0;
+    /* a local move within one filesystem is a rename(): walking the
+     * tree for its size (1M files = 1M lstat) would cost more than the
+     * move itself – such an item counts as its own inode size, the
+     * same that fs_move reports for it */
+    struct stat dst_st;
+    gboolean local_move = x->move && !x->sconn && !x->dconn &&
+                          stat(x->dest, &dst_st) == 0;
     for (GList *l = x->srcs; l && !job_cancelled(job); l = l->next) {
         gchar *base = g_path_get_basename(l->data);
         job_set_file(job, base);
         g_free(base);
-        total += item_size(job, x->sconn, l->data);
+        struct stat st;
+        if (local_move && lstat(l->data, &st) == 0 && st.st_dev == dst_st.st_dev)
+            total += st.st_size;
+        else
+            total += item_size(job, x->sconn, l->data);
     }
     if (x->sconn && x->dconn) total *= 2;     /* download + upload */
 
@@ -239,6 +321,10 @@ static Panel *panel_of_conn(FM *fm, SshConn *c)
 
 static void run_transfer(FM *fm, Xfer *x)
 {
+    /* the job's nested loop may let the panels drop their connections
+     * (tab closed, disconnect): keep them alive until the end */
+    if (x->sconn) ssh_conn_ref(x->sconn);
+    if (x->dconn) ssh_conn_ref(x->dconn);
     Job *job = job_new(fm, x->move ? "Moving" : "Copying");
     job->allow_background = !x->sconn && !x->dconn;
     job_run(job, xfer_worker, x);
@@ -253,6 +339,8 @@ static void run_transfer(FM *fm, Xfer *x)
         if (sp) conn_alive(sp);
         if (dp && dp != sp) conn_alive(dp);
     }
+    if (x->sconn) ssh_conn_unref(x->sconn);
+    if (x->dconn) ssh_conn_unref(x->dconn);
     reload_both(fm);
 }
 

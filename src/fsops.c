@@ -218,6 +218,39 @@ static gchar *tmp_sibling(const char *path)
     return t;
 }
 
+/* Replacing where a directory is on either side: the old target is
+ * renamed aside first (same directory, atomic) and only deleted once
+ * the new one is complete; on failure the partial copy goes and the
+ * old target is put back. */
+static int aside_begin(FsCtx *c, const char *dst, gchar **aside)
+{
+    *aside = tmp_sibling(dst);
+    if (rename(dst, *aside) == 0) return FS_OK;
+    int r = fail(c, dst, errno);
+    g_clear_pointer(aside, g_free);
+    return r;
+}
+
+/* move = TRUE: a partial destination may already hold moved files
+ * (gone from the source) – it is kept, and so is the old target under
+ * its hidden name, reported to the user. */
+static int aside_end(FsCtx *c, const char *dst, gchar *aside, int r, gboolean move)
+{
+    struct stat st;
+    gboolean have_dst = lstat(dst, &st) == 0;
+    if (r == FS_OK) {
+        r = delete_r(c, aside, FALSE);
+    } else if (move && have_dst) {
+        r = fs_worst(r, fail_msg(c, "Move incomplete: the previous '%s' was kept as '%s'",
+                                 dst, aside));
+    } else {
+        if (have_dst) delete_r(c, dst, FALSE);               /* partial copy */
+        if (rename(aside, dst) != 0) r = fs_worst(r, fail(c, aside, errno));
+    }
+    g_free(aside);
+    return r;
+}
+
 /* Would replacing the directory `dst` destroy `src`?  (src lies inside
  * it – e.g. moving /x/foo/foo onto /x/foo).  The last component of src
  * is not resolved: a symlink inside dst is still inside it. */
@@ -380,6 +413,7 @@ static int copy_any(FsCtx *c, const char *src, const char *dst, gboolean confirm
     report(c, name, 0);
     int r = FS_OK;
     gboolean replace = FALSE;
+    gchar *aside = NULL;
 
     if (lstat(dst, &dt) == 0) {
         if (st.st_dev == dt.st_dev && st.st_ino == dt.st_ino) {
@@ -399,9 +433,9 @@ static int copy_any(FsCtx *c, const char *src, const char *dst, gboolean confirm
         if (!confirmed) r = ask_conflict(c, src, dst);
         if (r != FS_OK) goto out;
         /* file over file: written beside it and renamed over on success;
-         * a directory on either side has to be removed first */
+         * a directory on either side: the old one is set aside */
         if (S_ISDIR(st.st_mode) || S_ISDIR(dt.st_mode)) {
-            r = delete_r(c, dst, FALSE);
+            r = aside_begin(c, dst, &aside);
             if (r != FS_OK) goto out;
         } else {
             replace = TRUE;
@@ -426,6 +460,7 @@ static int copy_any(FsCtx *c, const char *src, const char *dst, gboolean confirm
     }
 
 out:
+    if (aside) r = aside_end(c, dst, aside, r, FALSE);
     g_free(name);
     return r;
 }
@@ -453,6 +488,7 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
     report(c, name, 0);
     int r = FS_OK;
     gboolean confirmed = FALSE;
+    gchar *aside = NULL;
 
     if (lstat(dst, &dt) == 0) {
         if (st.st_dev == dt.st_dev && st.st_ino == dt.st_ino) {
@@ -485,9 +521,9 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
         r = ask_conflict(c, src, dst);
         if (r != FS_OK) goto out;
         /* rename() replaces a file atomically; a directory on either
-         * side has to be removed first */
+         * side: the old one is set aside until the move succeeded */
         if (S_ISDIR(st.st_mode) || S_ISDIR(dt.st_mode)) {
-            r = delete_r(c, dst, FALSE);
+            r = aside_begin(c, dst, &aside);
             if (r != FS_OK) goto out;
         } else {
             confirmed = TRUE;
@@ -496,21 +532,46 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
 
     start_file(c, src, dst, 0);
     if (rename(src, dst) == 0) {
-        gint64 bytes = S_ISDIR(st.st_mode)
-                       ? (c && c->progress ? fs_calc_size(c, dst) : 0)   /* cancellable */
-                       : st.st_size;
-        report(c, name, bytes);
+        /* no tree walk for a renamed directory: the caller counted it
+         * as its inode size (see xfer_worker) */
+        report(c, name, st.st_size);
         count_file(c);
         goto out;
     }
     if (errno != EXDEV) { r = fail(c, src, errno); goto out; }
 
-    /* different filesystem: copy, then delete the source – only when
-     * everything was copied */
+    /* different filesystem.  A directory moves child by child and is
+     * removed only once empty: deleting the whole source tree after the
+     * copy would also take files that appeared in it meanwhile (never
+     * copied).  A file: copy, then delete it. */
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(dst, 0700) != 0) { r = fail(c, dst, errno); goto out; }
+        DIR *dir = opendir(src);
+        if (!dir) { r = fail(c, src, errno); goto out; }
+        int err;
+        struct dirent *de;
+        while ((de = read_dir(dir, &err)) != NULL) {
+            if (is_dot(de->d_name)) continue;
+            gchar *sp = g_build_filename(src, de->d_name, NULL);
+            gchar *dp = g_build_filename(dst, de->d_name, NULL);
+            r = fs_worst(r, move_any(c, sp, dp));
+            g_free(sp); g_free(dp);
+            if (r == FS_CANCELLED) break;
+        }
+        if (!de && err) r = fs_worst(r, fail(c, src, err));
+        closedir(dir);
+        apply_attrs(dst, &st);
+        if (r == FS_OK && rmdir(src) != 0)
+            r = errno == ENOTEMPTY || errno == EEXIST
+                ? fail_msg(c, "%s: new files appeared during the move – left in place", src)
+                : fail(c, src, errno);
+        goto out;
+    }
     r = copy_any(c, src, dst, confirmed);
     if (r == FS_OK) r = delete_r(c, src, FALSE);
 
 out:
+    if (aside) r = aside_end(c, dst, aside, r, TRUE);
     g_free(name);
     return r;
 }
@@ -733,7 +794,10 @@ static int upload_file(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
     }
     g_free(buf);
     close(fin);
-    libssh2_sftp_close(fout);
+    /* the server reports a failed final flush (quota, full disk) here;
+     * ignoring it let a move delete the local original */
+    if (libssh2_sftp_close(fout) != 0 && r == FS_OK)
+        r = sftp_fail(c, sftp, remote);
 
     if (r == FS_OK) {
         LIBSSH2_SFTP_ATTRIBUTES a = { 0 };
@@ -793,6 +857,7 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
     report(c, name, 0);
     int r = FS_OK;
     gboolean replace = FALSE;
+    gchar *aside = NULL;
 
     gboolean rdir = FALSE;
     gboolean need_mkdir = S_ISDIR(st.st_mode);
@@ -804,8 +869,15 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
             if (r != FS_OK) goto out;
             /* file over file: replaced only after a complete upload */
             if (S_ISDIR(st.st_mode) || rdir) {
-                r = sftp_delete_r(c, sftp, remote, FALSE);
-                if (r != FS_OK) goto out;
+                /* old one set aside, deleted only after a full upload */
+                aside = tmp_sibling(remote);
+                if (libssh2_sftp_rename_ex(sftp, remote, (unsigned)strlen(remote),
+                        aside, (unsigned)strlen(aside), LIBSSH2_SFTP_RENAME_ATOMIC |
+                        LIBSSH2_SFTP_RENAME_NATIVE) != 0) {
+                    g_clear_pointer(&aside, g_free);
+                    r = sftp_fail(c, sftp, remote);
+                    goto out;
+                }
             } else {
                 replace = TRUE;
             }
@@ -843,6 +915,19 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
     }
 
 out:
+    if (aside) {
+        if (r == FS_OK) {
+            r = sftp_delete_r(c, sftp, aside, FALSE);
+        } else {
+            gboolean d;
+            if (fs_sftp_exists(sftp, remote, &d)) sftp_delete_r(c, sftp, remote, FALSE);
+            if (libssh2_sftp_rename_ex(sftp, aside, (unsigned)strlen(aside),
+                    remote, (unsigned)strlen(remote), LIBSSH2_SFTP_RENAME_ATOMIC |
+                    LIBSSH2_SFTP_RENAME_NATIVE) != 0)
+                r = fs_worst(r, sftp_fail(c, sftp, aside));
+        }
+        g_free(aside);
+    }
     g_free(name);
     return r;
 }
@@ -923,6 +1008,7 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
     int r = FS_OK;
     gboolean is_dir = attr_is_dir(&a);
     gboolean replace = FALSE;
+    gchar *aside = NULL;
 
     struct stat lt;
     gboolean need_mkdir = is_dir;
@@ -934,7 +1020,7 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
             if (r != FS_OK) goto out;
             /* file over file: replaced only after a complete download */
             if (is_dir || S_ISDIR(lt.st_mode)) {
-                r = delete_r(c, local, FALSE);
+                r = aside_begin(c, local, &aside);
                 if (r != FS_OK) goto out;
             } else {
                 replace = TRUE;
@@ -983,6 +1069,7 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
     }
 
 out:
+    if (aside) r = aside_end(c, local, aside, r, FALSE);
     g_free(name);
     return r;
 }

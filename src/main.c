@@ -1154,6 +1154,55 @@ static void view_tmpdirs_cleanup(void)
 #endif
 }
 
+/* ── Enter → external application: when fm becomes active again (the
+ * app closed or the user switched back) the list must look exactly as
+ * before, cursor visible – same as after F3/F4 ── */
+static struct { gboolean set, left; int panel; guint cursor; double value; gchar *dir; } ext_view;
+
+void ext_view_remember(Panel *p)
+{
+    g_free(ext_view.dir);
+    ext_view.set    = TRUE;
+    ext_view.left   = FALSE;   /* armed only once fm really loses focus */
+    ext_view.panel  = p->idx;
+    ext_view.cursor = p->cursor_pos;
+    ext_view.value  = panel_view_save(p);
+    ext_view.dir    = g_strdup(panel_dir(p));
+}
+
+void ext_view_forget(void)
+{
+    ext_view.set = FALSE;
+    g_clear_pointer(&ext_view.dir, g_free);
+}
+
+static void ext_view_apply(FM *fm)
+{
+    if (!ext_view.set) return;
+    ext_view.set = FALSE;
+    Panel *ap = active_panel(fm);
+    if (ap->idx == ext_view.panel && ap->cursor_pos == ext_view.cursor &&
+        g_strcmp0(panel_dir(ap), ext_view.dir) == 0)
+        panel_view_restore(ap, ext_view.value);
+    g_clear_pointer(&ext_view.dir, g_free);
+}
+
+static void ext_view_on_active(FM *fm, gboolean active)
+{
+    if (!ext_view.set) return;
+    if (!active) { ext_view.left = TRUE; return; }
+    /* the app never took focus (launch failed, focus stealing
+     * prevented): a later dialog must not force the old view back */
+    if (!ext_view.left) { ext_view.set = FALSE; return; }
+    ext_view_apply(fm);
+}
+
+static void on_window_active(GObject *win, GParamSpec *ps, FM *fm)
+{
+    (void)ps;
+    ext_view_on_active(fm, gtk_window_is_active(GTK_WINDOW(win)));
+}
+
 static void activate_item(Panel *p)
 {
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
@@ -1177,6 +1226,22 @@ static void activate_item(Panel *p)
         } else {
 #ifdef HAVE_LIBSSH2
             gchar *remote_path = fs_remote_join(p->ssh_conn->remote_path, name);
+            /* a link whose target was not resolved in the listing (too
+             * many links): a directory behind it opens like one */
+            LIBSSH2_SFTP_ATTRIBUTES ta;
+            gboolean link_dir = FALSE;
+            if (ssh_conn_trylock(p->ssh_conn)) {
+                link_dir = libssh2_sftp_stat(p->ssh_conn->sftp, remote_path, &ta) == 0 &&
+                           (ta.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                           LIBSSH2_SFTP_S_ISDIR(ta.permissions);
+                ssh_conn_unlock(p->ssh_conn);
+            }
+            if (link_dir) {
+                panel_load_remote(p, remote_path);
+                g_free(remote_path);
+                g_free(name);
+                return;
+            }
             gsize len = 0;
             gboolean canc = FALSE;
             gchar *data = fm_read_file(p->fm, p->ssh_conn, remote_path, 0, &len,
@@ -1195,6 +1260,7 @@ static void activate_item(Panel *p)
                     if (g_file_set_contents(tmp, data, (gssize)len, NULL)) {
                         gchar *uri = g_filename_to_uri(tmp, NULL, NULL);
                         if (uri) {
+                            ext_view_remember(p);
                             gtk_show_uri(GTK_WINDOW(p->fm->window),
                                 uri, GDK_CURRENT_TIME);
                             g_free(uri);
@@ -1244,6 +1310,7 @@ static void activate_item(Panel *p)
             }
             gchar *uri = full ? g_filename_to_uri(full, NULL, NULL) : NULL;
             if (uri) {
+                ext_view_remember(p);
                 gtk_show_uri(GTK_WINDOW(p->fm->window), uri, GDK_CURRENT_TIME);
                 fm_status(p->fm, "Opened: %s", full);
             }
@@ -1268,6 +1335,7 @@ static void activate_item(Panel *p)
         gchar *uri = arc_panel_enter(p, fullpath) ? NULL
                    : g_filename_to_uri(fullpath, NULL, NULL);
         if (uri) {
+            ext_view_remember(p);
             gtk_show_uri(GTK_WINDOW(p->fm->window), uri, GDK_CURRENT_TIME);
             g_free(uri);
         }
@@ -2324,6 +2392,7 @@ static void on_activate(GtkApplication *app, gpointer data)
     /* Restore cursor when window regains focus (e.g. after Alt-Tab, taskbar click) */
     GtkEventController *win_focus = gtk_event_controller_focus_new();
     g_signal_connect(win_focus, "enter", G_CALLBACK(on_window_focus_in), fm);
+    g_signal_connect(fm->window, "notify::is-active", G_CALLBACK(on_window_active), fm);
     gtk_widget_add_controller(fm->window, win_focus);
 
     devices_init(fm);
@@ -2388,6 +2457,11 @@ int main(int argc, char *argv[])
 {
     setlocale(LC_ALL, "");
     memset(&g_fm, 0, sizeof(g_fm));
+#ifdef HAVE_LIBSSH2
+    /* global crypto init once, before any worker: libssh2 would do it
+     * lazily (not thread-safe) in whichever connect runs first */
+    libssh2_init(0);
+#endif
 
 #ifdef HAVE_LIBADWAITA
     adw_init();
@@ -2405,5 +2479,8 @@ int main(int argc, char *argv[])
     view_tmpdirs_cleanup();
     arc_panel_cleanup();
     g_object_unref(app);
+#ifdef HAVE_LIBSSH2
+    libssh2_exit();
+#endif
     return status;
 }

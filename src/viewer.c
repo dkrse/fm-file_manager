@@ -61,7 +61,10 @@ static void viewer_search_highlight_all(ViewerCtx *ctx, const gchar *needle)
     gtk_text_buffer_get_start_iter(ctx->buffer, &start);
 
     int count = 0;
-    while (gtk_text_iter_forward_search(&start, needle,
+    /* capped: typing one letter in a 50–100 MB file made millions of
+     * tags on the main thread (seconds of freeze, memory balloon) */
+    while (count < SEARCH_MAX_MATCHES &&
+           gtk_text_iter_forward_search(&start, needle,
                 GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         gtk_text_buffer_apply_tag(ctx->buffer, ctx->match_tag, &match_start, &match_end);
         int line = gtk_text_iter_get_line(&match_start);
@@ -78,7 +81,8 @@ static void viewer_search_highlight_all(ViewerCtx *ctx, const gchar *needle)
 
     if (ctx->match_lbl) {
         if (count > 0) {
-            gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
+            gchar *txt = g_strdup_printf("%d of %d%s", ctx->current_match, ctx->total_matches,
+                ctx->total_matches >= SEARCH_MAX_MATCHES ? "+" : "");
             gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
             g_free(txt);
         } else {
@@ -107,7 +111,8 @@ static void viewer_search_goto_match(ViewerCtx *ctx, int index)
                                  0.2, FALSE, 0, 0);
     ctx->current_match = index;
     if (ctx->match_lbl) {
-        gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
+        gchar *txt = g_strdup_printf("%d of %d%s", ctx->current_match, ctx->total_matches,
+                ctx->total_matches >= SEARCH_MAX_MATCHES ? "+" : "");
         gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
         g_free(txt);
     }
@@ -316,10 +321,11 @@ static gboolean quit_on_close(GtkWindow *w, gpointer loop)
 }
 
 /* Image viewer — simple window with GtkPicture + close/key handling */
-/* list offset when F3 was pressed: closing puts the panel back there */
-static double view_saved = -1;
-
-static void viewer_show_image(FM *fm, const char *name, const char *fullpath)
+/* view_saved: list offset when F3 was pressed, closing puts the panel
+ * back there.  Per call, not static: the viewer is not modal and F3 in
+ * the main window can open a second one inside this one's loop. */
+static void viewer_show_image(FM *fm, const char *name, const char *fullpath,
+                              double view_saved)
 {
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
 
@@ -378,7 +384,7 @@ void viewer_show(FM *fm)
 void viewer_show_path(FM *fm, const char *path, const char *shown_name)
 {
     Panel *p = active_panel(fm);
-    view_saved = panel_view_save(p);
+    double view_saved = panel_view_save(p);
 
     gchar *name = path ? g_strdup(shown_name) : panel_cursor_name(p);
     if (!name || strcmp(name, "..") == 0) {
@@ -393,7 +399,7 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
         if (fullpath) {
             struct stat st;
             if (lstat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
-                viewer_show_image(fm, name, fullpath);
+                viewer_show_image(fm, name, fullpath, view_saved);
                 g_free(fullpath);
                 g_free(name);
                 return;
@@ -611,7 +617,8 @@ void viewer_show_path(FM *fm, const char *path, const char *shown_name)
         if (it) { want_line = it->line; g_object_unref(it); }
 
         gtk_widget_set_visible(ctx.search_bar, TRUE);
-        gtk_editable_set_text(GTK_EDITABLE(ctx.search_entry), needle);  /* → match 1 */
+        gtk_editable_set_text(GTK_EDITABLE(ctx.search_entry), needle);
+        viewer_search_flush(&ctx);      /* debounced: run now → match 1 */
         for (guint i = 0; want_line > 0 && i < ctx.match_lines->len; i++) {
             if (g_array_index(ctx.match_lines, int, i) >= want_line - 1) {
                 viewer_search_goto_match(&ctx, (int)i + 1);

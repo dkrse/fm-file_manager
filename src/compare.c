@@ -220,83 +220,116 @@ static gboolean on_diff_key(GtkEventControllerKey *k, guint keyval, guint code,
     return FALSE;
 }
 
-/* Byte-for-byte equality when `diff` is missing (files ≤ 256 MB) */
+/* Byte-for-byte equality when `diff` is missing.  Sizes first (two
+ * different 4 GB ISOs answer at once), then streamed in 1 MB pieces;
+ * runs in the diff worker, never on the main thread. */
 static int same_bytes(const char *a, const char *b)
 {
-    GMappedFile *ma = g_mapped_file_new(a, FALSE, NULL);
-    GMappedFile *mb = g_mapped_file_new(b, FALSE, NULL);
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return -1;
+    if (sa.st_size != sb.st_size) return 0;
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
     int r = -1;
-    if (ma && mb) {
-        gsize la = g_mapped_file_get_length(ma), lb = g_mapped_file_get_length(mb);
-        r = la == lb && (la == 0 || memcmp(g_mapped_file_get_contents(ma),
-                                           g_mapped_file_get_contents(mb), la) == 0);
+    if (fa && fb) {
+        enum { CH = 1 << 20 };
+        char *ba = g_malloc(CH), *bb = g_malloc(CH);
+        r = 1;
+        for (;;) {
+            size_t na = fread(ba, 1, CH, fa), nb = fread(bb, 1, CH, fb);
+            if (na != nb || memcmp(ba, bb, na) != 0) { r = 0; break; }
+            if (na < CH) { if (ferror(fa) || ferror(fb)) r = -1; break; }
+        }
+        g_free(ba); g_free(bb);
     }
-    if (ma) g_mapped_file_unref(ma);
-    if (mb) g_mapped_file_unref(mb);
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
     return r;
 }
 
 #define DIFF_MAX_SHOW (8 * 1024 * 1024)
 
-/* diff runs asynchronously – a big pair of files must not freeze the UI */
-typedef struct { FM *fm; gchar *f1, *f2; } DiffCtx;
+/* diff runs in a worker – a big pair of files must not freeze the UI,
+ * and only what is shown is kept: two large, very different dumps made
+ * communicate() collect gigabytes */
+typedef struct {
+    FM *fm; gchar *f1, *f2;
+    int    code;          /* diff exit, -1 failed to run, -2 no diff (same = result) */
+    int    same;
+    gchar *out, *err;
+} DiffCtx;
 
 static void diff_show(FM *fm, const char *f1, const char *f2, gchar *out);
 
+static void diff_thread(GTask *t, gpointer src, gpointer data, GCancellable *c)
+{
+    (void)src; (void)c;
+    DiffCtx *dc = data;
+    GError *e = NULL;
+    GSubprocess *sp = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+                                       G_SUBPROCESS_FLAGS_STDERR_PIPE, &e,
+                                       "diff", "-u", "--", dc->f1, dc->f2, NULL);
+    if (!sp) {
+        g_clear_error(&e);
+        dc->code = -2;
+        dc->same = same_bytes(dc->f1, dc->f2);
+        g_task_return_boolean(t, TRUE);
+        return;
+    }
+    GInputStream *so = g_subprocess_get_stdout_pipe(sp);
+    GString *out = g_string_new(NULL);
+    char buf[65536];
+    gssize n;
+    while (out->len <= DIFF_MAX_SHOW &&
+           (n = g_input_stream_read(so, buf, sizeof buf, NULL, NULL)) > 0)
+        g_string_append_len(out, buf, n);
+    gboolean cut = out->len > DIFF_MAX_SHOW;
+    if (cut) g_subprocess_force_exit(sp);          /* the rest is never shown */
+    GInputStream *se = g_subprocess_get_stderr_pipe(sp);
+    GString *err = g_string_new(NULL);
+    while (err->len < 4096 &&
+           (n = g_input_stream_read(se, buf, sizeof buf, NULL, NULL)) > 0)
+        g_string_append_len(err, buf, n);
+    g_subprocess_wait(sp, NULL, NULL);
+    dc->code = cut ? 1
+             : g_subprocess_get_if_exited(sp) ? g_subprocess_get_exit_status(sp) : -1;
+    g_object_unref(sp);
+    dc->out = g_string_free(out, FALSE);
+    dc->err = g_string_free(err, FALSE);
+    g_task_return_boolean(t, TRUE);
+}
+
 static void on_diff_done(GObject *src, GAsyncResult *res, gpointer d)
 {
+    (void)src; (void)res;
     DiffCtx *dc = d;
-    GSubprocess *sp = G_SUBPROCESS(src);
-    GBytes *bout = NULL, *berr = NULL;
-    GError *e = NULL;
-    gboolean ok = g_subprocess_communicate_finish(sp, res, &bout, &berr, &e);
-    int code = ok && g_subprocess_get_if_exited(sp) ? g_subprocess_get_exit_status(sp) : -1;
-    gsize lo = 0, le = 0;
-    const char *po = bout ? g_bytes_get_data(bout, &lo) : NULL;
-    const char *pe = berr ? g_bytes_get_data(berr, &le) : NULL;
-    gchar *out = po ? g_strndup(po, lo) : NULL;
-    gchar *err = pe ? g_strndup(pe, le) : NULL;
-    if (bout) g_bytes_unref(bout);
-    if (berr) g_bytes_unref(berr);
-
-    if (!ok) {
-        fm_status(dc->fm, "Compare files: %s", e ? e->message : "diff failed");
-        g_clear_error(&e);
-        g_free(out);
-    } else if (code == 0) {
+    if (dc->code == -2) {
+        fm_status(dc->fm, dc->same == 1 ? "Files are identical" :
+                          dc->same == 0 ? "Files differ (install diffutils for a line-by-line view)"
+                                        : "Compare files: cannot read the files");
+    } else if (dc->code == 0) {
         fm_status(dc->fm, "Files are identical");
-        g_free(out);
-    } else if (code != 1 || !out || !out[0]) {
-        fm_status(dc->fm, "Compare files: %s", err && err[0] ? g_strstrip(err) : "diff failed");
-        g_free(out);
+    } else if (dc->code != 1 || !dc->out || !dc->out[0]) {
+        fm_status(dc->fm, "Compare files: %s",
+                  dc->err && dc->err[0] ? g_strstrip(dc->err) : "diff failed");
     } else {
         fm_status(dc->fm, "%s", "");
-        diff_show(dc->fm, dc->f1, dc->f2, out);     /* takes out */
+        diff_show(dc->fm, dc->f1, dc->f2, dc->out);     /* takes out */
+        dc->out = NULL;
     }
-    g_free(err);
+    g_free(dc->out); g_free(dc->err);
     g_free(dc->f1); g_free(dc->f2);
     g_free(dc);
 }
 
 static void builtin_diff(FM *fm, const char *f1, const char *f2)
 {
-    GError *e = NULL;
-    GSubprocess *sp = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                       G_SUBPROCESS_FLAGS_STDERR_PIPE, &e,
-                                       "diff", "-u", "--", f1, f2, NULL);
-    if (!sp) {
-        g_clear_error(&e);
-        int same = same_bytes(f1, f2);
-        fm_status(fm, same == 1 ? "Files are identical" :
-                      same == 0 ? "Files differ (install diffutils for a line-by-line view)"
-                                : "Compare files: cannot read the files");
-        return;
-    }
     DiffCtx *dc = g_new0(DiffCtx, 1);
     dc->fm = fm; dc->f1 = g_strdup(f1); dc->f2 = g_strdup(f2);
     fm_status(fm, "Comparing…");
-    g_subprocess_communicate_async(sp, NULL, NULL, on_diff_done, dc);
-    g_object_unref(sp);
+    GTask *t = g_task_new(NULL, NULL, on_diff_done, dc);
+    g_task_set_task_data(t, dc, NULL);
+    g_task_run_in_thread(t, diff_thread);
+    g_object_unref(t);
 }
 
 static void diff_show(FM *fm, const char *f1, const char *f2, gchar *out)

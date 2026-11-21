@@ -335,6 +335,9 @@ void   fm_refocus_if_lost(FM *fm);                  /* after a modal window clos
 void   panel_focus(Panel *p);                      /* make active + keyboard cursor */
 double panel_view_save(Panel *p);                  /* scroll offset before F3/F4 */
 void   panel_view_restore(Panel *p, double value); /* … back exactly, cursor shown */
+#define SEARCH_MAX_MATCHES 10000                 /* viewer / editor highlight cap */
+void   ext_view_remember(Panel *p);                /* before opening in an external app */
+void   ext_view_forget(void);                      /* … the launch failed */
 void   panel_select_name(Panel *p, const char *name);  /* move cursor to item */
 FileItem *file_item_from_stat(FM *fm, const char *name, const struct stat *st);
 /* Run fn(arg) in a worker; after 150 ms a modal "Reading <what>…" window

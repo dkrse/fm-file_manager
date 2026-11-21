@@ -3,6 +3,7 @@ fm
 build/*.o
 build/
 build-debug/
+build-tsan/
 
 # Editor files
 *.swp

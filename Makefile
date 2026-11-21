@@ -169,9 +169,9 @@ endif
 # GUI integration tests (tabs, SFTP tabs, devices) – headless on broadway,
 # against the throwaway sshd when available.  `make test-gui SAN=1` = ASan.
 GUI_TEST_BIN := $(BUILDDIR)/test_gui
-GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/devices.o $(BUILDDIR)/quickview.o,$(OBJS))
+GUI_TEST_OBJS := $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/ssh.o $(BUILDDIR)/devices.o $(BUILDDIR)/quickview.o $(BUILDDIR)/tabs.o $(BUILDDIR)/monitor.o $(BUILDDIR)/cmdline.o $(BUILDDIR)/editor.o $(BUILDDIR)/compare.o $(BUILDDIR)/multirename.o,$(OBJS))
 
-$(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(SRCDIR)/quickview.c $(GUI_TEST_OBJS) $(HDRS)
+$(GUI_TEST_BIN): tests/test_gui.c $(SRCDIR)/main.c $(SRCDIR)/ssh.c $(SRCDIR)/devices.c $(SRCDIR)/quickview.c $(SRCDIR)/tabs.c $(SRCDIR)/monitor.c $(SRCDIR)/cmdline.c $(SRCDIR)/editor.c $(SRCDIR)/compare.c $(SRCDIR)/multirename.c $(GUI_TEST_OBJS) $(HDRS)
 	$(CC) $(CFLAGS) tests/test_gui.c $(GUI_TEST_OBJS) -o $@ $(LIBS) $(LDSAN)
 
 # SAN=1: full stacks so tests/lsan.supp can match library caches by frame

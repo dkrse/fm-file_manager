@@ -265,6 +265,15 @@ guint job_running_count(void)
     return g_list_length(running_jobs);
 }
 
+/* A job with its (modal) window shown runs a nested main loop: async
+ * results (mount, SFTP connect) must not retarget panels meanwhile. */
+gboolean job_foreground_running(void)
+{
+    for (GList *l = running_jobs; l; l = l->next)
+        if (!((Job *)l->data)->background) return TRUE;
+    return FALSE;
+}
+
 void job_show_background(FM *fm)
 {
     guint n = 0;
@@ -531,7 +540,16 @@ static gpointer job_thread(gpointer d)
         gchar *title = g_strdup(job->phase);
         g_mutex_unlock(&job->lock);
         job_set_phase(job, "Waiting for the previous job…");
-        g_mutex_lock(&queue_lock);
+        /* poll, not a blocking lock: Cancel must work while waiting
+         * (the window is modal, a long background copy could take hours) */
+        gboolean held = FALSE;
+        while (!(held = g_mutex_trylock(&queue_lock)) && !fs_cancelled(&job->ctx))
+            g_usleep(50000);
+        if (!held) {
+            g_free(title);
+            g_idle_add(job_finished_idle, job);
+            return NULL;
+        }
         job_set_phase(job, title);
         g_free(title);
         g_mutex_lock(&job->lock);

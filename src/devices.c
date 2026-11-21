@@ -12,6 +12,7 @@
  * plugged devices are announced in the status bar. */
 
 #include "fm.h"
+#include "job.h"
 #include <string.h>
 
 static GVolumeMonitor *vmon;
@@ -60,6 +61,12 @@ static void panels_leave(FM *fm, const char *root)
 
 static void open_in_panel(Panel *p, const char *path)
 {
+    /* mounted while a copy/move runs: switching the tab now would drop
+     * the SFTP connection the job is using */
+    if (job_foreground_running()) {
+        fm_status(p->fm, "Mounted at %s (panel busy, not opened)", path);
+        return;
+    }
     if (p->ssh_conn) panel_tab_set_conn(p, NULL);   /* this tab goes local */
     panel_load(p, path);
     panel_focus(p);

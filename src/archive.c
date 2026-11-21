@@ -57,7 +57,7 @@ static void arc_worker(Job *job, gpointer d)
     GError *e = NULL;
     if (!g_spawn_async_with_pipes(a->cwd, (gchar **)a->argv->pdata, NULL,
             G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD |
-            G_SPAWN_STDOUT_TO_DEV_NULL,
+            G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDIN_FROM_DEV_NULL,
             arc_child_setup, NULL, &pid, NULL, NULL, &err_fd, &e)) {
         a->error = g_strdup(e ? e->message : "spawn failed");
         g_clear_error(&e);
@@ -78,7 +78,12 @@ static void arc_worker(Job *job, gpointer d)
         if (waitpid(pid, &status, WNOHANG) > 0) { done = TRUE; break; }
         if (job_cancelled(job)) {
             kill(-pid, SIGTERM);
-            waitpid(pid, &status, 0);
+            /* a tool that ignores TERM (or sits on a dead mount) must
+             * not hang the job forever: KILL after 2 s */
+            int w = 0;
+            for (int i = 0; i < 40 && (w = waitpid(pid, &status, WNOHANG)) == 0; i++)
+                g_usleep(50000);
+            if (w == 0) { kill(-pid, SIGKILL); waitpid(pid, &status, 0); }
             break;
         }
         g_usleep(50000);

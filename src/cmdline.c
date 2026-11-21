@@ -178,8 +178,10 @@ static void cmd_report(FM *fm, const char *cmd, int code, gchar *out, gchar *err
             fm_status(fm, "%s – exit %d%s%s", cmd, code, line ? ": " : "", line ? line : "");
         g_free(line);
     }
-    panel_reload(&fm->panels[0]);
-    panel_reload(&fm->panels[1]);
+    /* a watched local panel gets the changes from its monitor anyway;
+     * a full reload of two big directories after every `echo` was waste */
+    for (int i = 0; i < 2; i++)
+        if (!fm->panels[i].dir_monitor) panel_reload(&fm->panels[i]);
 }
 
 static void on_cmd_done(GObject *src, GAsyncResult *res, gpointer data)

@@ -1,5 +1,6 @@
 #include <poll.h>
 #include "fm.h"
+#include "job.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -94,9 +95,16 @@ static gboolean known_hosts_append(LIBSSH2_KNOWNHOSTS *kh,
     g_free(dir);
 
     gchar *path = known_hosts_path();
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     g_free(path);
     if (fd < 0) return FALSE;
+    /* a hand-edited file without a final newline: don't glue the new
+     * entry onto its last line (both would become unparseable) */
+    struct stat st;
+    char last = '\n';
+    if (fstat(fd, &st) == 0 && st.st_size > 0 &&
+        pread(fd, &last, 1, st.st_size - 1) == 1 && last != '\n' &&
+        write(fd, "\n", 1) != 1) { close(fd); return FALSE; }
     gboolean ok = write(fd, line, len) == (ssize_t)len;
     close(fd);
     return ok;
@@ -370,6 +378,35 @@ static gboolean authenticate(LIBSSH2_SESSION *session, const char *user,
 /* ── SshConn lifecycle ────────────────────────────────────────────── */
 
 /* Try every address (IPv6 and IPv4) like ssh(1) does */
+/* A blocking connect() to a black-holed host waits ~2 min (SYN
+ * retries) and cannot be cancelled: connect non-blocking, wait at most
+ * `ms`, then make the socket blocking again for libssh2. */
+#define TCP_CONNECT_MS 15000
+static int connect_timeout(int sock, const struct sockaddr *a, socklen_t len, int ms)
+{
+    int fl = fcntl(sock, F_GETFL);
+    if (fl < 0 || fcntl(sock, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
+    int r = connect(sock, a, len);
+    if (r < 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = sock, .events = POLLOUT };
+        int pr;
+        do pr = poll(&pfd, 1, ms); while (pr < 0 && errno == EINTR);
+        if (pr == 0) { errno = ETIMEDOUT; return -1; }
+        if (pr < 0) return -1;
+        int soerr = 0;
+        socklen_t sl = sizeof soerr;
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0) return -1;
+        if (soerr) { errno = soerr; return -1; }
+        r = 0;
+    }
+    if (r < 0) return -1;
+    if (fcntl(sock, F_SETFL, fl) < 0) return -1;
+    /* a link that dies later is noticed instead of hanging forever */
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    return 0;
+}
+
 static int tcp_connect(const char *host, int port, gchar **err)
 {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
@@ -385,7 +422,7 @@ static int tcp_connect(const char *host, int port, gchar **err)
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         sock = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
         if (sock < 0) { last_errno = errno; continue; }
-        if (connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (connect_timeout(sock, ai->ai_addr, ai->ai_addrlen, TCP_CONNECT_MS) == 0) break;
         last_errno = errno;
         close(sock);
         sock = -1;
@@ -619,18 +656,22 @@ gchar *ssh_read_file(SshConn *conn, const char *path, gsize max_len,
     if (!fh) { ssh_conn_unlock(conn); return NULL; }
 
     GByteArray *ba = g_byte_array_new();
-    char buf[32768];
+    /* libssh2 pipelines read requests up to the buffer size: 32 KB was
+     * one request per round trip, 1 MB keeps the link busy */
+    enum { RD_BUF = 1 << 20 };
+    char *buf = g_malloc(RD_BUF);
     ssize_t n;
     /* session is blocking: no EAGAIN, any negative value is an error */
     /* max_len > 0: stop after max_len bytes (callers pass limit+1 to
      * detect an oversized file without downloading all of it) */
-    while ((n = libssh2_sftp_read(fh, buf, sizeof(buf))) > 0) {
+    while ((n = libssh2_sftp_read(fh, buf, RD_BUF)) > 0) {
         gsize take = (gsize)n;
         if (max_len && ba->len + take > max_len) take = max_len - ba->len;
         g_byte_array_append(ba, (guint8 *)buf, (guint)take);
         if (max_len && ba->len >= max_len) { n = 0; break; }
-        if (ba->len > G_MAXUINT - sizeof(buf)) { n = -1; break; } /* >4 GB */
+        if (ba->len > G_MAXUINT - RD_BUF) { n = -1; break; } /* >4 GB */
     }
+    g_free(buf);
     libssh2_sftp_close(fh);
     ssh_conn_unlock(conn);
     if (n < 0) {                        /* never return a truncated file */
@@ -751,6 +792,7 @@ static void rem_req_free(gpointer d)
     g_free(r);
 }
 
+#define SFTP_LINK_STAT_MAX 256
 static gpointer rem_list_thread(gpointer d)
 {
     RemReq *q = d;
@@ -767,6 +809,10 @@ static gpointer rem_list_thread(gpointer d)
     char longentry[4096];
     LIBSSH2_SFTP_ATTRIBUTES attrs;
     int rc;
+    /* each link target costs a full round trip under the conn lock:
+     * /usr/lib with thousands of links took a minute on a slow link.
+     * Beyond the cap a link shows as a file; Enter still checks it. */
+    int link_stats = 0;
     while ((rc = libssh2_sftp_readdir_ex(handle, name_buf, sizeof(name_buf),
                                          longentry, sizeof(longentry), &attrs)) > 0) {
         if (strcmp(name_buf, ".") == 0 || strcmp(name_buf, "..") == 0)
@@ -776,7 +822,7 @@ static gpointer rem_list_thread(gpointer d)
         e->name    = g_strdup(name_buf);
         e->is_dir  = perm && LIBSSH2_SFTP_S_ISDIR(attrs.permissions);
         e->is_link = perm && LIBSSH2_SFTP_S_ISLNK(attrs.permissions);
-        if (e->is_link) {               /* a link to a directory opens like one */
+        if (e->is_link && link_stats++ < SFTP_LINK_STAT_MAX) {   /* a link to a directory opens like one */
             gchar *lp = fs_remote_join(q->path, name_buf);
             LIBSSH2_SFTP_ATTRIBUTES ta;
             if (libssh2_sftp_stat(conn->sftp, lp, &ta) == 0 &&
@@ -1186,7 +1232,7 @@ static void ssh_connect_done(GObject *source, GAsyncResult *res, gpointer user_d
     }
     connect_pending[idx] = FALSE;
 
-    if (conn && ctx->panel->busy) {
+    if (conn && (ctx->panel->busy || job_foreground_running())) {
         /* a search/job owns the panel (nested loop): retargeting it now
          * would mix its results into the SFTP tab */
         fm_status(ctx->fm, "Panel busy – connection to %s closed", conn->host);

@@ -57,6 +57,13 @@ static void cursor_name_restore(Panel *p, gchar *name, guint old_pos)
 {
     guint n = g_list_model_get_n_items(G_LIST_MODEL(p->filter_model));
     gint found = -1;
+    /* fast path: the cursor row still holds the name (most batches only
+     * touch other files) – no O(n) scan */
+    if (name && old_pos < n) {
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), old_pos);
+        if (fi && strcmp(fi->name, name) == 0) found = (gint)old_pos;
+        if (fi) g_object_unref(fi);
+    }
     for (guint i = 0; name && i < n && found < 0; i++) {
         FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->filter_model), i);
         if (fi && strcmp(fi->name, name) == 0) found = (gint)i;
@@ -67,8 +74,16 @@ static void cursor_name_restore(Panel *p, gchar *name, guint old_pos)
     guint pos = found >= 0 ? (guint)found : MIN(old_pos, n - 1);
     p->cursor_pos = pos;
     p->inhibit_sel = TRUE;
+    /* same row: keep the view where the user scrolled it (scroll_to
+     * would pull it back to the cursor on every write) */
+    GtkScrollInfo *si = NULL;
+    if (pos == old_pos) {
+        si = gtk_scroll_info_new();
+        gtk_scroll_info_set_enable_vertical(si, FALSE);
+        gtk_scroll_info_set_enable_horizontal(si, FALSE);
+    }
     gtk_column_view_scroll_to(GTK_COLUMN_VIEW(p->column_view), pos, NULL,
-        p->fm->active == p->idx ? GTK_LIST_SCROLL_SELECT : GTK_LIST_SCROLL_NONE, NULL);
+        p->fm->active == p->idx ? GTK_LIST_SCROLL_SELECT : GTK_LIST_SCROLL_NONE, si);
     p->inhibit_sel = FALSE;
 }
 
@@ -260,6 +275,78 @@ static void attrs_to_stat(const LIBSSH2_SFTP_ATTRIBUTES *a, struct stat *st)
     if (a->flags & LIBSSH2_SFTP_ATTR_ACMODTIME)   st->st_mtime = (time_t)a->mtime;
 }
 
+/* Count the differences; above SFTP_POLL_BULK replace the whole store
+ * in one splice (kept items reused, so marks and order survive).
+ * Returns TRUE when it did. */
+#define SFTP_POLL_BULK 64
+static gboolean sftp_poll_rebuild(Panel *p, GHashTable *remote)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+    guint diff = 0, kept = 0;
+    for (guint i = 0; i < n && diff <= SFTP_POLL_BULK; i++) {
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+        if (fi && strcmp(fi->name, "..") != 0) {
+            const LIBSSH2_SFTP_ATTRIBUTES *a = g_hash_table_lookup(remote, fi->name);
+            if (!a) diff++;
+            else {
+                kept++;
+                struct stat st;
+                attrs_to_stat(a, &st);
+                if (!fi->is_dir && !S_ISDIR(st.st_mode) &&
+                    (fi->size_raw != (gint64)st.st_size ||
+                     fi->date_raw != (gint64)st.st_mtime)) diff++;
+            }
+        }
+        if (fi) g_object_unref(fi);
+    }
+    if (diff <= SFTP_POLL_BULK)
+        diff += g_hash_table_size(remote) - MIN(kept, g_hash_table_size(remote));
+    if (diff <= SFTP_POLL_BULK) return FALSE;
+
+    GPtrArray *items = g_ptr_array_new_full(g_hash_table_size(remote) + 1, g_object_unref);
+    GHashTable *have = g_hash_table_new(g_str_hash, g_str_equal);
+    for (guint i = 0; i < n; i++) {
+        FileItem *fi = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+        if (!fi) continue;
+        const LIBSSH2_SFTP_ATTRIBUTES *a = strcmp(fi->name, "..") == 0 ? NULL
+                                         : g_hash_table_lookup(remote, fi->name);
+        if (strcmp(fi->name, "..") == 0) { g_ptr_array_add(items, fi); continue; }
+        if (!a) {
+            if (p->marks) g_hash_table_remove(p->marks, fi->name);
+            g_object_unref(fi);
+            continue;
+        }
+        struct stat st;
+        attrs_to_stat(a, &st);
+        if (!fi->is_dir && !S_ISDIR(st.st_mode) &&
+            (fi->size_raw != (gint64)st.st_size || fi->date_raw != (gint64)st.st_mtime)) {
+            FileItem *nfi = file_item_from_stat(p->fm, fi->name, &st);
+            nfi->marked = fi->marked;
+            g_object_unref(fi);
+            fi = nfi;
+        }
+        g_hash_table_add(have, fi->name);
+        g_ptr_array_add(items, fi);
+    }
+    GHashTableIter it;
+    gpointer key, val;
+    g_hash_table_iter_init(&it, remote);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+        if (g_hash_table_contains(have, key)) continue;
+        struct stat st;
+        attrs_to_stat(val, &st);
+        FileItem *fi = file_item_from_stat(p->fm, key, &st);
+        fi->marked = p->marks && g_hash_table_contains(p->marks, key);
+        g_ptr_array_add(items, fi);
+    }
+    p->inhibit_sel = TRUE;
+    g_list_store_splice(p->store, 0, n, items->pdata, items->len);
+    p->inhibit_sel = FALSE;
+    g_hash_table_destroy(have);       /* names owned by the items */
+    g_ptr_array_unref(items);
+    return TRUE;
+}
+
 static gboolean sftp_poll_apply(gpointer data)
 {
     SftpPoll *sp = data;
@@ -278,6 +365,15 @@ static gboolean sftp_poll_apply(gpointer data)
     gboolean changed = FALSE;
     guint old_pos = p->cursor_pos;
     gchar *cur = cursor_name_save(p);
+
+    /* Many changes (another client deleted / created thousands): one
+     * splice of the rebuilt list instead of an items-changed per entry
+     * through sort, filter and selection – that was O(n²) */
+    if (sftp_poll_rebuild(p, remote)) {
+        panel_update_status(p);
+        cursor_name_restore(p, cur, old_pos);
+        goto out;
+    }
 
     /* Pass 1: remove items no longer on remote; note the ones we have */
     GHashTable *present = g_hash_table_new(g_str_hash, g_str_equal);

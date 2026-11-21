@@ -39,6 +39,7 @@ typedef struct {
     guint          search_idle;   /* debounced search-as-you-type */
     gboolean       closing;       /* close prompt already open */
     gboolean       saving;        /* remote save waiting in a nested loop */
+    guint          edits;         /* bumped on every buffer change */
     /* panel view when F4 was pressed (restored on close if unchanged) */
     int            view_panel;
     guint          view_cursor;
@@ -54,6 +55,7 @@ typedef struct {
     GtkWidget     *match_lbl;     /* "X of Y" label */
     GtkTextTag    *match_tag;
     GArray        *match_lines;   /* line numbers of matches (for scrollbar) */
+    GArray        *match_offs;    /* char offsets of matches, NULL = stale */
     int            current_match;
     int            total_matches;
     int            total_lines;
@@ -155,6 +157,9 @@ static void on_buffer_changed(GtkTextBuffer *buf, gpointer user_data)
 {
     (void)buf;
     EditorCtx *ctx = user_data;
+    ctx->edits++;
+    if (ctx->match_offs) g_array_free(ctx->match_offs, TRUE);
+    ctx->match_offs = NULL;                 /* offsets shift with edits */
     if (!ctx->modified) {
         ctx->modified = TRUE;
         const gchar *dp = ctx->remote_path ? ctx->remote_path
@@ -218,6 +223,7 @@ static void editor_save(EditorCtx *ctx)
 
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(ctx->buffer, &start, &end);
+    guint edits_at_save = ctx->edits;      /* what this save contains */
     gchar *text = gtk_text_buffer_get_text(ctx->buffer, &start, &end, FALSE);
     gsize  len  = strlen(text);         /* buffer text never contains NUL */
 
@@ -273,7 +279,11 @@ static void editor_save(EditorCtx *ctx)
 
     g_free(text);
 
-    if (ok) {
+    /* typed while a slow remote save waited: those edits are not in the
+     * file – stay modified so closing still asks */
+    if (ok && ctx->edits != edits_at_save) {
+        fm_status(ctx->fm, "Saved: %s (changed meanwhile – not saved yet)", display_path);
+    } else if (ok) {
         ctx->modified = FALSE;
         gtk_window_set_title(GTK_WINDOW(ctx->window), display_path);
         fm_status(ctx->fm, "Saved: %s", display_path);
@@ -364,6 +374,7 @@ static void search_clear_highlights(EditorCtx *ctx)
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(ctx->buffer, &start, &end);
     gtk_text_buffer_remove_tag(ctx->buffer, ctx->match_tag, &start, &end);
+    if (ctx->match_offs) g_array_set_size(ctx->match_offs, 0);
     if (ctx->match_lines) {
         g_array_set_size(ctx->match_lines, 0);
     }
@@ -385,12 +396,17 @@ static void search_highlight_all(EditorCtx *ctx, const gchar *needle)
     gtk_text_buffer_get_start_iter(ctx->buffer, &start);
 
     int count = 0;
-
-    while (gtk_text_iter_forward_search(&start, needle,
+    /* capped: typing one letter in a 100 MB file made millions of tags
+     * on the main thread (seconds of freeze, memory balloon) */
+    while (count < SEARCH_MAX_MATCHES &&
+           gtk_text_iter_forward_search(&start, needle,
                 GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         gtk_text_buffer_apply_tag(ctx->buffer, ctx->match_tag, &match_start, &match_end);
         int line = gtk_text_iter_get_line(&match_start);
+        int off  = gtk_text_iter_get_offset(&match_start);
         g_array_append_val(ctx->match_lines, line);
+        if (!ctx->match_offs) ctx->match_offs = g_array_new(FALSE, FALSE, sizeof(int));
+        g_array_append_val(ctx->match_offs, off);
         count++;
         start = match_end;
     }
@@ -401,7 +417,8 @@ static void search_highlight_all(EditorCtx *ctx, const gchar *needle)
     /* Update match count label */
     if (ctx->match_lbl) {
         if (count > 0) {
-            gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
+            gchar *txt = g_strdup_printf("%d of %d%s", ctx->current_match, ctx->total_matches,
+                ctx->total_matches >= SEARCH_MAX_MATCHES ? "+" : "");
             gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
             g_free(txt);
         } else {
@@ -425,7 +442,14 @@ static void search_goto_match(EditorCtx *ctx, int index)
     GtkTextIter start, match_start, match_end;
     gtk_text_buffer_get_start_iter(ctx->buffer, &start);
 
+    /* offsets cached by highlight_all (dropped on every edit): start
+     * the search right at the match – F3 used to rescan from the top */
     int count = 0;
+    if (ctx->match_offs && (guint)index <= ctx->match_offs->len) {
+        gtk_text_buffer_get_iter_at_offset(ctx->buffer, &start,
+            g_array_index(ctx->match_offs, int, index - 1));
+        count = index - 1;
+    }
     while (gtk_text_iter_forward_search(&start, needle,
                 GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         count++;
@@ -437,7 +461,8 @@ static void search_goto_match(EditorCtx *ctx, int index)
             ctx->current_match = index;
 
             if (ctx->match_lbl) {
-                gchar *txt = g_strdup_printf("%d of %d", ctx->current_match, ctx->total_matches);
+                gchar *txt = g_strdup_printf("%d of %d%s", ctx->current_match, ctx->total_matches,
+                ctx->total_matches >= SEARCH_MAX_MATCHES ? "+" : "");
                 gtk_label_set_text(GTK_LABEL(ctx->match_lbl), txt);
                 g_free(txt);
             }
@@ -985,6 +1010,7 @@ static gboolean on_editor_close(GtkWindow *win, gpointer user_data)
     g_signal_handlers_disconnect_by_data(ctx->buffer, ctx);
     if (ctx->vadj) g_signal_handlers_disconnect_by_data(ctx->vadj, ctx);
     if (ctx->match_lines) g_array_free(ctx->match_lines, TRUE);
+    if (ctx->match_offs) g_array_free(ctx->match_offs, TRUE);
     FM *fm = ctx->fm;
     g_free(ctx->filepath);
     g_free(ctx->remote_path);

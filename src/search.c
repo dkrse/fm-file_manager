@@ -886,8 +886,9 @@ void search_run(FM *fm)
     }
 
     /* Phase 2: sort + build grouped FileItem list */
+    /* no event pumping here: the busy guards and the close handler are
+     * already gone, a queued close / second search would run under us */
     gtk_label_set_text(GTK_LABEL(p->status_label), "Building list...");
-    while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
 
     GPtrArray *grouped = build_grouped_list(ctx.results, fm);
 

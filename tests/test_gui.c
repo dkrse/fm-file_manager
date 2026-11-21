@@ -16,8 +16,15 @@
 #include "../src/ssh.c"
 #include "../src/devices.c"
 #include "../src/quickview.c"
+#include "../src/tabs.c"
+#include "../src/monitor.c"
+#include "../src/cmdline.c"
+#include "../src/editor.c"
+#include "../src/compare.c"
+#include "../src/multirename.c"
 
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <glib/gstdio.h>
 #include <utime.h>
@@ -760,8 +767,782 @@ static void test_focus_keeps_scroll(FM *fm)
     pump(300);
     CHECK(gtk_adjustment_get_value(va) < 1.0);
 
+    /* Enter / Open with → external app: fm active again restores the
+     * view once, cursor row selected */
+    p->cursor_pos = top + rows / 2;
+    panel_view_restore(p, saved);
+    pump(300);
+    ext_view_remember(p);
+    CHECK(ext_view.set && fabs(ext_view.value - saved) < 1.0);
+    gtk_adjustment_set_value(va, 0);        /* focus return moved the list */
+    p->inhibit_sel = TRUE;
+    gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(p->selection));
+    p->inhibit_sel = FALSE;
+    ext_view_apply(fm);
+    CHECK(!ext_view.set && ext_view.dir == NULL);
+    CHECK(fabs(gtk_adjustment_get_value(va) - saved) < 1.0);
+    gtk_adjustment_set_value(va, 0);
+    pump(300);                              /* delayed second pass */
+    CHECK(fabs(gtk_adjustment_get_value(va) - saved) < 1.0);
+    bs = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(p->selection));
+    CHECK(gtk_bitset_get_size(bs) == 1 && gtk_bitset_contains(bs, top + rows / 2));
+    gtk_bitset_unref(bs);
+
+    /* only once: a later activation (user scrolled meanwhile) leaves it */
+    gtk_adjustment_set_value(va, 0);
+    ext_view_apply(fm);
+    pump(100);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+
+    /* cursor moved while the app was open: no forced old view */
+    ext_view_remember(p);
+    p->cursor_pos = 3;
+    gtk_adjustment_set_value(va, 0);
+    ext_view_apply(fm);
+    pump(300);
+    CHECK(!ext_view.set);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+
+    /* another directory meanwhile: likewise */
+    p->cursor_pos = top + rows / 2;
+    ext_view_remember(p);
+    g_free(ext_view.dir);
+    ext_view.dir = g_strdup("/elsewhere");
+    ext_view_apply(fm);
+    pump(300);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+
+    /* app never took focus (launch failed / focus stealing prevented):
+     * fm stays active, a later dialog's re-activation must not force
+     * the old view – the first "active" without a "left" disarms it */
+    p->cursor_pos = top + rows / 2;
+    gtk_adjustment_set_value(va, saved);
+    ext_view_remember(p);
+    gtk_adjustment_set_value(va, 0);        /* user wheel-scrolled */
+    ext_view_on_active(fm, TRUE);
+    pump(300);
+    CHECK(!ext_view.set);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+    ext_view_on_active(fm, FALSE);          /* a dialog later … */
+    ext_view_on_active(fm, TRUE);
+    pump(300);
+    CHECK(gtk_adjustment_get_value(va) < 1.0);
+
+    /* the real round trip through the handler: left, then back */
+    gtk_adjustment_set_value(va, saved);
+    ext_view_remember(p);
+    ext_view_on_active(fm, FALSE);
+    gtk_adjustment_set_value(va, 0);
+    ext_view_on_active(fm, TRUE);
+    pump(300);
+    CHECK(!ext_view.set);
+    CHECK(fabs(gtk_adjustment_get_value(va) - saved) < 1.0);
+
+    /* failed "Open with" launch forgets it */
+    ext_view_remember(p);
+    ext_view_forget();
+    CHECK(!ext_view.set && ext_view.dir == NULL);
+
     g_print("ok focus keeps scroll\n");
     g_free(d);
+}
+
+
+/* ── middle click on a tab that is not shown: only that tab goes, the
+ * visible one stays (it used to switch there, then close it) ───────── */
+
+static void middle_click_tab(Panel *p, guint i)
+{
+    GtkWidget *b = gtk_button_new();
+    g_object_ref_sink(b);
+    g_object_set_data(G_OBJECT(b), "fm-tab-idx", GUINT_TO_POINTER(i));
+    GtkGesture *g = gtk_gesture_click_new();
+    gtk_widget_add_controller(b, GTK_EVENT_CONTROLLER(g));
+    on_tab_middle(GTK_GESTURE_CLICK(g), 1, 0, 0, p);
+    g_object_unref(b);
+}
+
+static void test_tab_middle_close(FM *fm)
+{
+    local_panels(fm);
+    Panel *p = &fm->panels[0];
+    gchar *a = g_build_filename(tmp, "ta", NULL);
+    gchar *b = g_build_filename(tmp, "tb", NULL);
+    gchar *c = g_build_filename(tmp, "tc", NULL);
+    mk(tmp, "ta"); mk(tmp, "tb"); mk(tmp, "tc");
+    while (p->tabs->len > 1) panel_tab_close(p);
+    panel_load(p, a);
+    panel_tab_new(p, b);
+    panel_tab_new(p, c);
+    CHECK(p->tabs->len == 3);
+    panel_tab_cycle(p, -(int)p->tab_active);          /* show A */
+    CHECK(p->tab_active == 0 && strcmp(p->cwd, a) == 0);
+
+    middle_click_tab(p, 2);                           /* close C */
+    CHECK(p->tabs->len == 2);
+    CHECK(p->tab_active == 0 && strcmp(p->cwd, a) == 0);
+
+    panel_tab_cycle(p, 1);                            /* show B */
+    CHECK(p->tab_active == 1 && strcmp(p->cwd, b) == 0);
+    middle_click_tab(p, 0);                           /* close A, left of it */
+    CHECK(p->tabs->len == 1);
+    CHECK(p->tab_active == 0 && strcmp(p->cwd, b) == 0);
+
+    middle_click_tab(p, 0);                           /* the last one stays */
+    CHECK(p->tabs->len == 1);
+    g_free(a); g_free(b); g_free(c);
+    g_print("ok tab middle close\n");
+}
+
+
+/* ── a job queued behind a background job can be cancelled while it
+ * waits (its window is modal; it used to block until the first ended) ── */
+
+static gboolean queued_ran;
+static gint64 queued_back;
+
+static void long_worker(Job *job, gpointer d)
+{
+    (void)d;
+    for (int i = 0; i < 40 && !job_cancelled(job); i++) g_usleep(50000);  /* 2 s */
+    job1_end = g_get_monotonic_time();
+}
+
+static void mark_worker(Job *job, gpointer d) { (void)job; (void)d; queued_ran = TRUE; }
+
+static gboolean cancel_job(gpointer job) { fs_cancel(&((Job *)job)->ctx); return G_SOURCE_REMOVE; }
+
+static gboolean start_queued(gpointer fm)
+{
+    Job *j2 = job_new(fm, "Queued");
+    g_timeout_add(150, cancel_job, j2);
+    job_run(j2, mark_worker, NULL);
+    queued_back = g_get_monotonic_time();
+    job_free(j2);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean bg_then_queue(gpointer job)
+{
+    Job *j = job;
+    g_signal_emit_by_name(j->bg_btn, "clicked");
+    g_timeout_add(50, start_queued, j->fm);
+    return G_SOURCE_REMOVE;
+}
+
+static void test_queued_cancel(FM *fm)
+{
+    job1_end = 0; queued_ran = FALSE; queued_back = 0;
+    Job *j1 = job_new(fm, "Long");
+    j1->allow_background = TRUE;
+    g_timeout_add(50, bg_then_queue, j1);
+    job_run(j1, long_worker, NULL);
+    job_free(j1);
+    CHECK(!queued_ran);                         /* cancelled before its turn */
+    CHECK(queued_back > 0 && queued_back < job1_end);   /* did not wait */
+    CHECK(job_running_count() == 0);
+    g_print("ok queued job cancel\n");
+}
+
+
+/* ── known_hosts: a file without a final newline (hand edited) must not
+ * get the new entry glued onto its last line ─────────────────────── */
+
+static void test_known_hosts_append(void)
+{
+    gchar *path = known_hosts_path();
+    gchar *orig = NULL; gsize olen = 0;
+    gboolean had = g_file_get_contents(path, &orig, &olen, NULL);
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+
+    LIBSSH2_SESSION *s = libssh2_session_init();
+    LIBSSH2_KNOWNHOSTS *kh = s ? libssh2_knownhost_init(s) : NULL;
+    CHECK(kh != NULL);
+    struct libssh2_knownhost *e = NULL;
+    const char *key = "AAAAB3NzaC1yc2EAAAADAQABAAAAgQC7dGVzdGtleQ==";
+    if (kh)
+        libssh2_knownhost_addc(kh, "edited.invalid", NULL, key, strlen(key), NULL, 0,
+            LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_BASE64 |
+            LIBSSH2_KNOWNHOST_KEY_SSHRSA, &e);
+    CHECK(e != NULL);
+
+    const char *old = "old.invalid ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC7b2xk";
+    for (int round = 0; round < 2 && e; round++) {
+        /* round 0: no final newline; round 1: normal file */
+        gchar *init = g_strconcat(old, round ? "\n" : "", NULL);
+        CHECK(g_file_set_contents(path, init, -1, NULL));
+        CHECK(known_hosts_append(kh, e));
+        gchar *got = NULL;
+        CHECK(g_file_get_contents(path, &got, NULL, NULL));
+        gchar **lines = got ? g_strsplit(got, "\n", -1) : NULL;
+        CHECK(lines && g_strv_length(lines) == 3);        /* 2 lines + "" */
+        CHECK(lines && g_strcmp0(lines[0], old) == 0);
+        CHECK(lines && lines[1] && g_str_has_prefix(lines[1], "edited.invalid "));
+        g_strfreev(lines);
+        g_free(got); g_free(init);
+    }
+
+    if (kh) libssh2_knownhost_free(kh);
+    if (s) libssh2_session_free(s);
+    if (had) g_file_set_contents(path, orig, (gssize)olen, NULL);
+    else g_unlink(path);
+    g_free(orig); g_free(path);
+    g_print("ok known_hosts append\n");
+}
+
+
+/* ── command line: a watched panel is not reloaded after every command
+ * (its monitor brings the changes); an unwatched one still is ──────── */
+
+static void count_changes(GListModel *m, guint pos, guint rem, guint add, int *n)
+{
+    (void)m; (void)pos; (void)rem; (void)add;
+    (*n)++;
+}
+
+static void test_cmd_no_reload(FM *fm)
+{
+    local_panels(fm);
+    gboolean prev_ar = fm->auto_refresh;
+    gchar *d = g_build_filename(tmp, "cmdr", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "one.txt", "1");
+    Panel *p = &fm->panels[0], *o = &fm->panels[1];
+
+    fm->auto_refresh = TRUE;
+    panel_load(p, d);
+    CHECK(p->dir_monitor != NULL);
+    int changes = 0;
+    gulong h = g_signal_connect(p->store, "items-changed", G_CALLBACK(count_changes), &changes);
+    cmd_report(fm, "true", 0, NULL, NULL);
+    pump(50);
+    CHECK(changes == 0);
+    g_signal_handler_disconnect(p->store, h);
+
+    fm->auto_refresh = FALSE;
+    panel_monitor_stop(o);
+    panel_load(o, d);
+    CHECK(o->dir_monitor == NULL);
+    write_in(d, "two.txt", "2");
+    cmd_report(fm, "touch two.txt", 0, NULL, NULL);
+    pump(50);
+    CHECK(store_has(o, "two.txt"));                  /* unwatched: reloaded */
+
+    fm->auto_refresh = prev_ar;
+    local_panels(fm);
+    g_free(d);
+    g_print("ok cmd line reload\n");
+}
+
+
+/* ── SFTP auto-refresh: many remote changes go in as one splice, marks
+ * survive; a small change stays incremental ────────────────────────── */
+
+static LIBSSH2_SFTP_ATTRIBUTES *fake_attr(gint64 size, gint64 mtime)
+{
+    LIBSSH2_SFTP_ATTRIBUTES *a = g_new0(LIBSSH2_SFTP_ATTRIBUTES, 1);
+    a->flags = LIBSSH2_SFTP_ATTR_PERMISSIONS | LIBSSH2_SFTP_ATTR_SIZE |
+               LIBSSH2_SFTP_ATTR_ACMODTIME;
+    a->permissions = LIBSSH2_SFTP_S_IFREG | 0644;
+    a->filesize = (libssh2_uint64_t)size;
+    a->mtime = (unsigned long)mtime;
+    return a;
+}
+
+static gint64 item_mtime(Panel *p, const char *name)
+{
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+    for (guint i = 0; i < n; i++) {
+        FileItem *it = g_list_model_get_item(G_LIST_MODEL(p->store), i);
+        gint64 m = strcmp(it->name, name) == 0 ? it->date_raw : -1;
+        g_object_unref(it);
+        if (m >= 0) return m;
+    }
+    return -1;
+}
+
+static void test_sftp_poll_bulk(FM *fm)
+{
+    local_panels(fm);
+    gchar *d = g_build_filename(tmp, "pollb", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "a.txt", "1");
+    write_in(d, "b.txt", "1");
+    write_in(d, "c.txt", "1");
+    Panel *p = &fm->panels[0];
+    panel_load(p, d);
+    sel_mark_all(p, FALSE);
+    panel_select_name(p, "b.txt");
+    sel_toggle_cursor(p, FALSE);
+    CHECK(has_marked_item(p, "b.txt"));
+    gint64 bm = item_mtime(p, "b.txt");
+
+    GHashTable *remote = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    g_hash_table_insert(remote, g_strdup("b.txt"), fake_attr(1, bm));   /* unchanged */
+    g_hash_table_insert(remote, g_strdup("c.txt"), fake_attr(1, bm));
+    g_hash_table_insert(remote, g_strdup("a.txt"), fake_attr(1, bm));
+    g_hash_table_insert(remote, g_strdup("new.txt"), fake_attr(5, bm));
+    /* one difference: incremental path, store untouched here */
+    CHECK(!sftp_poll_rebuild(p, remote));
+
+    g_hash_table_remove(remote, "a.txt");
+    for (int i = 0; i < 100; i++) {
+        gchar n[32];
+        g_snprintf(n, sizeof n, "r%03d", i);
+        g_hash_table_insert(remote, g_strdup(n), fake_attr(i, bm));
+    }
+    int changes = 0;
+    gulong h = g_signal_connect(p->store, "items-changed", G_CALLBACK(count_changes), &changes);
+    CHECK(sftp_poll_rebuild(p, remote));
+    g_signal_handler_disconnect(p->store, h);
+    CHECK(changes == 1);                              /* one splice */
+    CHECK(!store_has(p, "a.txt"));
+    CHECK(store_has(p, "b.txt") && store_has(p, "c.txt") && store_has(p, "new.txt"));
+    CHECK(store_has(p, "r000") && store_has(p, "r099"));
+    CHECK(has_marked_item(p, "b.txt"));               /* mark kept */
+    CHECK(store_has(p, ".."));
+    guint n = g_list_model_get_n_items(G_LIST_MODEL(p->store));
+    CHECK(n == 1 + 3 + 100);                          /* "..", b, c, new, r* */
+    g_hash_table_destroy(remote);
+    sel_mark_all(p, FALSE);
+    local_panels(fm);
+    g_free(d);
+    g_print("ok sftp poll bulk\n");
+}
+
+
+/* ── a mount / connection finishing while a copy runs must not switch
+ * the panel (it would drop the connection the job is using) ───────── */
+
+static gboolean guard_seen, guard_kept;
+static gchar *guard_cwd;
+
+static gboolean guard_probe(gpointer fm_)
+{
+    FM *fm = fm_;
+    Panel *p = &fm->panels[0];
+    guard_seen = job_foreground_running();
+    open_in_panel(p, "/");                            /* devices.c */
+    guard_kept = g_strcmp0(p->cwd, guard_cwd) == 0;
+    return G_SOURCE_REMOVE;
+}
+
+static void sleep_worker(Job *job, gpointer d) { (void)job; (void)d; g_usleep(400000); }
+
+static void test_job_guard(FM *fm)
+{
+    local_panels(fm);
+    Panel *p = &fm->panels[0];
+    guard_cwd = g_strdup(p->cwd);
+    guard_seen = guard_kept = FALSE;
+    CHECK(!job_foreground_running());
+    Job *j = job_new(fm, "Guard");
+    g_timeout_add(100, guard_probe, fm);
+    job_run(j, sleep_worker, NULL);
+    job_free(j);
+    CHECK(guard_seen && guard_kept);
+    CHECK(!job_foreground_running());
+    open_in_panel(p, tmp);                            /* no job: opens */
+    CHECK(g_strcmp0(p->cwd, tmp) == 0);
+    g_clear_pointer(&guard_cwd, g_free);
+    local_panels(fm);
+    g_print("ok job guard\n");
+}
+
+
+/* ── helpers for the review tests ─────────────────────────────────── */
+
+static int count_hidden_aside(const char *dir)
+{
+    int n = 0;
+    GDir *d = g_dir_open(dir, 0, NULL);
+    const char *e;
+    while (d && (e = g_dir_read_name(d)))
+        if (strstr(e, ".fm-")) n++;
+    if (d) g_dir_close(d);
+    return n;
+}
+
+static gchar *slurp(const char *path)
+{
+    gchar *d = NULL;
+    return g_file_get_contents(path, &d, NULL, NULL) ? d : NULL;
+}
+
+/* ── SFTP transfers: remote → remote one file at a time, a connection
+ * dropped by its tab during the job stays alive, a failed replace keeps
+ * the old target (upload and download) ────────────────────────────── */
+
+static Panel *drop_panel;
+static gboolean drop_conn_idle(gpointer d)
+{
+    (void)d;
+    panel_tab_set_conn(drop_panel, NULL);         /* the tab lets go */
+    return G_SOURCE_REMOVE;
+}
+
+static void test_sftp_xfer(FM *fm, const char *work)
+{
+    local_panels(fm);
+    Panel *p = &fm->panels[0];
+    gchar *x = g_build_filename(work, "xfer", NULL);
+    mk(work, "xfer");
+    gchar *src = g_build_filename(x, "src", NULL);
+    mk(x, "src");
+    gchar *d1 = g_build_filename(src, "d1", NULL);
+    mk(src, "d1");
+    write_in(d1, "f1", "one");
+    write_in(src, "f2", "two");
+
+    SshConn *c = connect_test();
+    CHECK(c != NULL);
+    if (!c) goto done;
+    panel_tab_set_conn(p, c);
+    panel_load_remote(p, x);
+    CHECK(c->refs == 1);
+
+    /* remote → remote copy of a tree */
+    gchar *cdst = g_build_filename(x, "copy", NULL);
+    mk(x, "copy");
+    GList *l = g_list_append(NULL, src);
+    CHECK(fo_transfer(fm, l, c, cdst, c, FALSE) == FS_OK);
+    gchar *cf1 = g_build_filename(cdst, "src", "d1", "f1", NULL);
+    gchar *cf2 = g_build_filename(cdst, "src", "f2", NULL);
+    gchar *g1 = slurp(cf1), *g2 = slurp(cf2);
+    CHECK(g_strcmp0(g1, "one") == 0 && g_strcmp0(g2, "two") == 0);
+    CHECK(g_file_test(src, G_FILE_TEST_IS_DIR));     /* copy keeps source */
+    g_free(g1); g_free(g2);
+
+    /* remote → remote move: source tree gone, target complete */
+    gchar *mdst = g_build_filename(x, "moved", NULL);
+    mk(x, "moved");
+    CHECK(fo_transfer(fm, l, c, mdst, c, TRUE) == FS_OK);
+    gchar *mf1 = g_build_filename(mdst, "src", "d1", "f1", NULL);
+    g1 = slurp(mf1);
+    CHECK(g_strcmp0(g1, "one") == 0);
+    CHECK(!g_file_test(src, G_FILE_TEST_EXISTS));
+    g_free(g1);
+    g_list_free(l);
+
+    /* failed replace keeps the old target – upload: a local directory
+     * with an unreadable file over a remote file */
+    if (getuid() != 0) {
+        gchar *up = g_build_filename(tmp, "up", NULL);
+        mk(tmp, "up");
+        write_in(up, "ok.txt", "ok");
+        write_in(up, "bad.txt", "bad");
+        gchar *bad = g_build_filename(up, "bad.txt", NULL);
+        chmod(bad, 0);
+        gchar *rt = g_build_filename(x, "up", NULL);
+        CHECK(g_file_set_contents(rt, "OLD", -1, NULL));
+        FsCtx fc = { .policy = FS_OVERWRITE_ALL };
+        ssh_conn_lock(c);
+        int r = fs_sftp_upload(&fc, c->sftp, up, rt);
+        ssh_conn_unlock(c);
+        CHECK(r != FS_OK);
+        gchar *got = slurp(rt);
+        CHECK(g_strcmp0(got, "OLD") == 0);
+        CHECK(count_hidden_aside(x) == 0);
+        g_free(got);
+        fs_ctx_clear(&fc);
+
+        /* download: a remote directory with an unreadable file over a
+         * local file */
+        gchar *rd = g_build_filename(x, "down", NULL);
+        mk(x, "down");
+        write_in(rd, "ok.txt", "ok");
+        write_in(rd, "bad.txt", "bad");
+        gchar *rbad = g_build_filename(rd, "bad.txt", NULL);
+        chmod(rbad, 0);
+        gchar *lt = g_build_filename(tmp, "down", NULL);
+        CHECK(g_file_set_contents(lt, "OLDL", -1, NULL));
+        FsCtx dc = { .policy = FS_OVERWRITE_ALL };
+        ssh_conn_lock(c);
+        r = fs_sftp_download(&dc, c->sftp, rd, lt);
+        ssh_conn_unlock(c);
+        CHECK(r != FS_OK);
+        got = slurp(lt);
+        CHECK(g_strcmp0(got, "OLDL") == 0);
+        CHECK(count_hidden_aside(tmp) == 0);
+        g_free(got);
+        fs_ctx_clear(&dc);
+        chmod(bad, 0644); chmod(rbad, 0644);
+        g_unlink(lt);
+        g_free(bad); g_free(rbad); g_free(rt); g_free(rd); g_free(lt); g_free(up);
+    }
+
+    /* the panel drops the connection while the job runs: the job's own
+     * reference keeps it alive, it goes away only after the job */
+    gchar *big = g_build_filename(x, "big.bin", NULL);
+    {
+        gchar *data = g_malloc0(4 << 20);
+        CHECK(g_file_set_contents(big, data, 4 << 20, NULL));
+        g_free(data);
+    }
+    gchar *ldst = g_build_filename(tmp, "dl", NULL);
+    mk(tmp, "dl");
+    drop_panel = p;
+    g_idle_add(drop_conn_idle, NULL);              /* runs in the job's loop */
+    l = g_list_append(NULL, big);
+    CHECK(fo_transfer(fm, l, c, ldst, NULL, FALSE) == FS_OK);   /* c freed after */
+    g_list_free(l);
+    CHECK(p->ssh_conn == NULL);
+    gchar *lbig = g_build_filename(ldst, "big.bin", NULL);
+    struct stat st;
+    CHECK(stat(lbig, &st) == 0 && st.st_size == (4 << 20));
+    g_free(lbig); g_free(ldst); g_free(big);
+
+    g_free(cdst); g_free(cf1); g_free(cf2); g_free(mdst); g_free(mf1);
+done:
+    local_panels(fm);
+    g_free(d1); g_free(src); g_free(x);
+    g_print("ok sftp transfers\n");
+}
+
+/* ── TCP connect gives up after its timeout (a black-holed host used to
+ * block ~2 min); a listening port still connects ─────────────────── */
+
+static void test_connect_timeout(void)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(22) };
+    inet_pton(AF_INET, "10.255.255.1", &a.sin_addr);     /* unroutable */
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    double t0 = now_s();
+    int r = connect_timeout(s, (struct sockaddr *)&a, sizeof a, 300);
+    double dt = now_s() - t0;
+    close(s);
+    CHECK(r == -1);
+    CHECK(dt < 2.0);
+
+    /* a local listener: connects, socket blocking again */
+    int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in la = { .sin_family = AF_INET };
+    inet_pton(AF_INET, "127.0.0.1", &la.sin_addr);
+    socklen_t ll = sizeof la;
+    CHECK(bind(ls, (struct sockaddr *)&la, sizeof la) == 0 && listen(ls, 1) == 0 &&
+          getsockname(ls, (struct sockaddr *)&la, &ll) == 0);
+    s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(connect_timeout(s, (struct sockaddr *)&la, sizeof la, 2000) == 0);
+    CHECK((fcntl(s, F_GETFL) & O_NONBLOCK) == 0);
+    int ka = 0; socklen_t kl = sizeof ka;
+    CHECK(getsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &ka, &kl) == 0 && ka);
+    close(s);
+
+    /* closed port: refused at once, not a timeout */
+    s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    close(ls);                                   /* nobody listens now */
+    t0 = now_s();
+    CHECK(connect_timeout(s, (struct sockaddr *)&la, sizeof la, 2000) == -1);
+    CHECK(now_s() - t0 < 1.0);
+    close(s);
+    g_print("ok connect timeout\n");
+}
+
+/* ── editor search: capped match count, F3 starts at the cached offset,
+ * offsets dropped (and still right) after an edit ─────────────────── */
+
+static void test_editor_search(FM *fm)
+{
+    EditorCtx *ctx = g_new0(EditorCtx, 1);
+    ctx->fm = fm;
+    ctx->buffer = gtk_text_buffer_new(NULL);
+    ctx->text_view = g_object_ref_sink(gtk_text_view_new_with_buffer(ctx->buffer));
+    ctx->search_entry = g_object_ref_sink(gtk_entry_new());
+    ctx->match_lbl = g_object_ref_sink(gtk_label_new(""));
+    ctx->match_tag = gtk_text_buffer_create_tag(ctx->buffer, NULL, "background", "yellow", NULL);
+    ctx->match_lines = g_array_new(FALSE, FALSE, sizeof(int));
+    g_signal_connect(ctx->buffer, "changed", G_CALLBACK(on_buffer_changed), ctx);
+    ctx->window = g_object_ref_sink(gtk_window_new());
+
+    /* 30 000 lines with "e": far over the cap */
+    GString *txt = g_string_new(NULL);
+    for (int i = 0; i < 30000; i++) g_string_append_printf(txt, "line %d e\n", i);
+    gtk_text_buffer_set_text(ctx->buffer, txt->str, -1);
+    g_string_free(txt, TRUE);
+
+    double t0 = now_s();
+    search_highlight_all(ctx, "e");
+    double dt = now_s() - t0;
+    CHECK(ctx->total_matches == SEARCH_MAX_MATCHES);
+    CHECK(ctx->match_offs && ctx->match_offs->len == SEARCH_MAX_MATCHES);
+    CHECK(g_str_has_suffix(gtk_label_get_text(GTK_LABEL(ctx->match_lbl)), "+"));
+    CHECK(dt < 5.0);
+
+    /* jump far in: lands on the right match (line of the 9000th "e") */
+    gtk_editable_set_text(GTK_EDITABLE(ctx->search_entry), "e");
+    if (ctx->search_idle) { g_source_remove(ctx->search_idle); ctx->search_idle = 0; }
+    search_goto_match(ctx, 9000);
+    GtkTextIter it;
+    gtk_text_buffer_get_iter_at_mark(ctx->buffer, &it, gtk_text_buffer_get_insert(ctx->buffer));
+    CHECK(gtk_text_iter_get_offset(&it) == g_array_index(ctx->match_offs, int, 8999));
+    CHECK(ctx->current_match == 9000);
+    /* a thousand steps from the cache stay fast */
+    t0 = now_s();
+    for (int i = 0; i < 1000; i++) search_goto_match(ctx, 9000 + (i % 1000));
+    CHECK(now_s() - t0 < 10.0);        /* rescanning from the top: minutes */
+
+    /* an edit drops the offsets; F3 still finds the right place */
+    GtkTextIter s0;
+    gtk_text_buffer_get_start_iter(ctx->buffer, &s0);
+    gtk_text_buffer_insert(ctx->buffer, &s0, "xx\n", -1);
+    CHECK(ctx->match_offs == NULL);
+    search_goto_match(ctx, 2);
+    gtk_text_buffer_get_iter_at_mark(ctx->buffer, &it, gtk_text_buffer_get_insert(ctx->buffer));
+    /* "xx\nline 0 e\n…": the 2nd "e" is the one after "line 0 " */
+    CHECK(gtk_text_iter_get_line(&it) == 1);
+    CHECK(gtk_text_iter_get_offset(&it) == 10);
+
+    /* a short needle list below the cap: no "+" */
+    search_highlight_all(ctx, "line 2999 ");
+    CHECK(ctx->total_matches == 1);
+    CHECK(!g_str_has_suffix(gtk_label_get_text(GTK_LABEL(ctx->match_lbl)), "+"));
+
+    if (ctx->search_idle) g_source_remove(ctx->search_idle);
+    if (ctx->hl_idle) g_source_remove(ctx->hl_idle);     /* as editor close does */
+    g_signal_handlers_disconnect_by_data(ctx->buffer, ctx);
+    g_array_free(ctx->match_lines, TRUE);
+    if (ctx->match_offs) g_array_free(ctx->match_offs, TRUE);
+    gtk_window_destroy(GTK_WINDOW(ctx->window));
+    g_object_unref(ctx->window);
+    g_object_unref(ctx->text_view);
+    g_object_unref(ctx->search_entry);
+    g_object_unref(ctx->match_lbl);
+    g_object_unref(ctx->buffer);
+    g_free(ctx);
+    g_print("ok editor search\n");
+}
+
+/* ── compare: diff runs in a worker and keeps only what is shown;
+ * without diff, sizes first and streamed comparison ──────────────── */
+
+static gboolean diff_done_flag;
+static void diff_wait_cb(GObject *s, GAsyncResult *r, gpointer d)
+{
+    (void)s; (void)r; (void)d;
+    diff_done_flag = TRUE;
+}
+
+static void run_diff_thread(DiffCtx *dc)
+{
+    diff_done_flag = FALSE;
+    GTask *t = g_task_new(NULL, NULL, diff_wait_cb, NULL);
+    g_task_set_task_data(t, dc, NULL);
+    g_task_run_in_thread(t, diff_thread);
+    g_object_unref(t);
+    gint64 end = g_get_monotonic_time() + 60 * G_USEC_PER_SEC;
+    while (!diff_done_flag && g_get_monotonic_time() < end) pump(20);
+    CHECK(diff_done_flag);
+}
+
+static void test_compare_worker(void)
+{
+    gchar *d = g_build_filename(tmp, "cmpw", NULL);
+    g_mkdir_with_parents(d, 0755);
+    gchar *a = g_build_filename(d, "a.txt", NULL), *b = g_build_filename(d, "b.txt", NULL);
+    gchar *c = g_build_filename(d, "c.txt", NULL);
+
+    /* two large, completely different files: diff output » 8 MB */
+    GString *sa = g_string_new(NULL), *sb = g_string_new(NULL);
+    for (int i = 0; i < 400000; i++) {
+        g_string_append_printf(sa, "left line %d\n", i);
+        g_string_append_printf(sb, "right line %d\n", i);
+    }
+    CHECK(g_file_set_contents(a, sa->str, (gssize)sa->len, NULL));
+    CHECK(g_file_set_contents(b, sb->str, (gssize)sb->len, NULL));
+    CHECK(g_file_set_contents(c, sa->str, (gssize)sa->len, NULL));
+
+    gchar *diff_bin = g_find_program_in_path("diff");
+    if (diff_bin) {
+        DiffCtx dc = { .f1 = a, .f2 = b };
+        run_diff_thread(&dc);
+        CHECK(dc.code == 1);
+        CHECK(dc.out && strlen(dc.out) > DIFF_MAX_SHOW);
+        CHECK(dc.out && strlen(dc.out) <= DIFF_MAX_SHOW + 65536);   /* not all of it */
+        g_free(dc.out); g_free(dc.err);
+
+        DiffCtx de = { .f1 = a, .f2 = c };
+        run_diff_thread(&de);
+        CHECK(de.code == 0);
+        g_free(de.out); g_free(de.err);
+    }
+
+    g_free(diff_bin);
+
+    /* no diff installed: byte comparison */
+    CHECK(same_bytes(a, c) == 1);
+    CHECK(same_bytes(a, b) == 0);               /* sizes differ: at once */
+    gchar *e = g_build_filename(d, "e.txt", NULL);
+    sa->str[sa->len - 2] ^= 1;                   /* same size, last byte differs */
+    CHECK(g_file_set_contents(e, sa->str, (gssize)sa->len, NULL));
+    CHECK(same_bytes(a, e) == 0);
+    gchar *none = g_build_filename(d, "none", NULL);
+    CHECK(same_bytes(a, none) == -1);
+
+    g_string_free(sa, TRUE); g_string_free(sb, TRUE);
+    g_free(a); g_free(b); g_free(c); g_free(e); g_free(none); g_free(d);
+    g_print("ok compare worker\n");
+}
+
+
+/* ── multi-rename: typing waits for a pause before recomputing (each
+ * pass lstat()s every item and rebuilds the preview); Enter flushes ── */
+
+static void test_mrn_debounce(void)
+{
+    gchar *d = g_build_filename(tmp, "mrn", NULL);
+    g_mkdir_with_parents(d, 0755);
+    write_in(d, "a.txt", "1");
+    MrnDlg m = { .items = g_ptr_array_new_with_free_func(mrn_item_free) };
+    MrnItem *it = g_new0(MrnItem, 1);
+    it->path = g_build_filename(d, "a.txt", NULL);
+    it->dir = g_strdup(d);
+    it->old_name = g_strdup("a.txt");
+    g_ptr_array_add(m.items, it);
+    GtkWidget *keep[] = {
+        m.mask = gtk_entry_new(), m.find = gtk_entry_new(), m.repl = gtk_entry_new(),
+        m.start = mrn_spin(0, 1000, 1), m.step = mrn_spin(1, 100, 1),
+        m.digits = mrn_spin(1, 9, 1),
+        m.casedd = gtk_drop_down_new_from_strings((const char *[]){ "As is", "lower", "UPPER", NULL }),
+        m.scroll = gtk_scrolled_window_new(), m.status = gtk_label_new(""),
+        m.ok_btn = gtk_button_new(),
+    };
+    for (gsize i = 0; i < G_N_ELEMENTS(keep); i++) g_object_ref_sink(keep[i]);
+    gtk_editable_set_text(GTK_EDITABLE(m.mask), "[N]");
+
+    /* five quick keystrokes: nothing computed yet, OK disabled */
+    const char *steps[] = { "[", "[N", "[N]", "[N]_", "[N]_x.[E]" };
+    for (int i = 0; i < 5; i++) {
+        gtk_editable_set_text(GTK_EDITABLE(m.mask), steps[i]);
+        on_mrn_changed(NULL, &m);
+    }
+    CHECK(m.update_id != 0);
+    CHECK(it->new_name == NULL);
+    CHECK(!gtk_widget_get_sensitive(m.ok_btn));
+    pump(MRN_DEBOUNCE_MS + 150);                  /* the pause: computed once */
+    CHECK(m.update_id == 0);
+    CHECK(g_strcmp0(it->new_name, "a_x.txt") == 0);
+    CHECK(gtk_widget_get_sensitive(m.ok_btn));
+
+    /* Enter right after typing: flushed at once */
+    gtk_editable_set_text(GTK_EDITABLE(m.mask), "[N]_y.[E]");
+    on_mrn_changed(NULL, &m);
+    mrn_flush(&m);
+    CHECK(m.update_id == 0);
+    CHECK(g_strcmp0(it->new_name, "a_y.txt") == 0);
+    CHECK(gtk_widget_get_sensitive(m.ok_btn));
+
+    /* invalid name: OK stays off after the recheck */
+    gtk_editable_set_text(GTK_EDITABLE(m.mask), "");
+    on_mrn_changed(NULL, &m);
+    mrn_flush(&m);
+    CHECK(!gtk_widget_get_sensitive(m.ok_btn));
+
+    for (gsize i = 0; i < G_N_ELEMENTS(keep); i++) g_object_unref(keep[i]);
+    g_ptr_array_unref(m.items);
+    g_free(d);
+    g_print("ok multi-rename debounce\n");
 }
 
 
@@ -894,6 +1675,7 @@ static gboolean run_tests(gpointer data)
     if (work && g_getenv("FM_SFTP_PORT")) test_sftp_tabs(fm, work);
     else g_print("skip sftp tabs (no test sshd)\n");
     if (work && g_getenv("FM_SFTP_PORT")) test_sftp_save_exec(fm, work);
+    if (work && g_getenv("FM_SFTP_PORT")) test_sftp_xfer(fm, work);
     test_devices(fm);
     test_compare_dirs(fm);
     test_quickview(fm);
@@ -902,6 +1684,16 @@ static gboolean run_tests(gpointer data)
     test_cks_verify(fm);
     test_quickview_image(fm);
     test_focus_keeps_scroll(fm);
+    test_tab_middle_close(fm);
+    test_queued_cancel(fm);
+    test_known_hosts_append();
+    test_cmd_no_reload(fm);
+    test_sftp_poll_bulk(fm);
+    test_job_guard(fm);
+    test_connect_timeout();
+    test_editor_search(fm);
+    test_compare_worker();
+    test_mrn_debounce();
     g_application_quit(G_APPLICATION(fm->app));
     return G_SOURCE_REMOVE;
 }

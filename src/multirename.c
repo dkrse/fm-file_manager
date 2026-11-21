@@ -25,6 +25,7 @@ typedef struct {
     GPtrArray *items;       /* MrnItem*        */
     GtkWidget *mask, *find, *repl, *start, *step, *digits, *casedd;
     GtkWidget *scroll, *status, *ok_btn;
+    guint      update_id;   /* pending debounced preview */
 } MrnDlg;
 
 static void mrn_item_free(gpointer d)
@@ -111,11 +112,36 @@ static void mrn_update(MrnDlg *d)
     gtk_widget_set_sensitive(d->ok_btn, err == NULL);
 }
 
-static void on_mrn_changed(GtkWidget *w, MrnDlg *d) { (void)w; mrn_update(d); }
+/* every keystroke recomputed all names (2 lstat each) and rebuilt the
+ * preview grid: wait for a short typing pause */
+#define MRN_DEBOUNCE_MS 150
+static gboolean mrn_update_cb(gpointer data)
+{
+    MrnDlg *d = data;
+    d->update_id = 0;
+    mrn_update(d);
+    return G_SOURCE_REMOVE;
+}
+
+static void mrn_flush(MrnDlg *d)
+{
+    if (!d->update_id) return;
+    g_source_remove(d->update_id);
+    mrn_update_cb(d);
+}
+
+static void on_mrn_changed(GtkWidget *w, MrnDlg *d)
+{
+    (void)w;
+    if (d->update_id) g_source_remove(d->update_id);
+    gtk_widget_set_sensitive(d->ok_btn, FALSE);      /* until rechecked */
+    d->update_id = g_timeout_add(MRN_DEBOUNCE_MS, mrn_update_cb, d);
+}
 
 static void on_mrn_activate(GtkEntry *e, DlgCtx *ctx)
 {
     MrnDlg *d = g_object_get_data(G_OBJECT(e), "mrn");
+    mrn_flush(d);                                     /* Enter right after typing */
     if (gtk_widget_get_sensitive(d->ok_btn)) dlg_ctx_entry_ok(e, ctx);
 }
 
@@ -360,6 +386,7 @@ void fo_multi_rename(FM *fm)
     gtk_editable_select_region(GTK_EDITABLE(d.mask), 0, 3);   /* "[N]" */
 
     int resp = dlg_ctx_run(&ctx);
+    if (d.update_id) { g_source_remove(d.update_id); d.update_id = 0; }
     if (resp == 1 && mrn_compute(&d) == NULL) {   /* recheck: files may have changed */
         gchar *err = NULL;
         guint done = mrn_execute(d.items, &err);

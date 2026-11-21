@@ -38,6 +38,7 @@ static const char *tab_dir(Panel *p)
 }
 
 static void tabs_rebuild(Panel *p);
+static gboolean tabs_refused(Panel *p);
 
 static void on_tab_clicked(GtkButton *btn, Panel *p)
 {
@@ -54,8 +55,13 @@ static void on_tab_middle(GtkGestureClick *g, int n_press, double x, double y,
     GtkWidget *btn = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(g));
     guint i = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(btn), "fm-tab-idx"));
     set_active_panel(p->fm, p->idx);
-    if (i != p->tab_active) panel_tab_cycle(p, (int)i - (int)p->tab_active);
-    if (i == p->tab_active) panel_tab_close(p);
+    if (i == p->tab_active) { panel_tab_close(p); return; }
+    /* another tab: drop it without loading it first (the visible tab
+     * stays; switching there and closing landed on a neighbour) */
+    if (tabs_refused(p) || i >= p->tabs->len) return;
+    g_ptr_array_remove_index(p->tabs, i);
+    if (i < p->tab_active) p->tab_active--;
+    tabs_rebuild(p);
 }
 
 /* Tabs are written to settings shortly after every change (not only

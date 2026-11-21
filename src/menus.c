@@ -69,14 +69,18 @@ static void pmenu_openwith(GSimpleAction *a, GVariant *v, gpointer d)
         GList *files = g_list_append(NULL, file);
         GdkAppLaunchContext *lc = gdk_display_get_app_launch_context(
             gtk_widget_get_display(p->fm->window));
+        ext_view_remember(p);       /* before: the app may take focus at once */
         if (!app || !g_app_info_launch(G_APP_INFO(app), files,
-                                       G_APP_LAUNCH_CONTEXT(lc), &err))
+                                       G_APP_LAUNCH_CONTEXT(lc), &err)) {
+            ext_view_forget();
             fm_status(p->fm, "Open with: %s", err ? err->message : "application not found");
+        }
         g_clear_error(&err);
         g_list_free(files);
         g_object_unref(lc);
         if (app) g_object_unref(app);
     } else {
+        ext_view_remember(p);
         GtkFileLauncher *fl = gtk_file_launcher_new(file);
         gtk_file_launcher_set_always_ask(fl, TRUE);
         gtk_file_launcher_launch(fl, GTK_WINDOW(p->fm->window), NULL, NULL, NULL);

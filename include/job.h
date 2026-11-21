@@ -66,6 +66,7 @@ gboolean job_cancelled(Job *job);
 /* Background jobs: the worker threads run one after another (a queue);
  * while one runs in the background the main window stays usable. */
 guint    job_running_count(void);        /* jobs started and not finished */
+gboolean job_foreground_running(void);   /* … one of them with its window shown */
 void     job_show_background(FM *fm);    /* Ctrl+J – show their windows   */
 
 #endif /* FM_JOB_H */

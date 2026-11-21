@@ -761,6 +761,202 @@ static void test_content_invalid_utf8(void)
     rm_rf(d); g_free(d);
 }
 
+/* ── replacing with a directory on either side: the old target survives
+ * a failed copy, nothing hidden is left behind ─────────────────────── */
+
+static int count_aside(const char *dir)
+{
+    int n = 0;
+    GDir *d = g_dir_open(dir, 0, NULL);
+    const char *e;
+    while (d && (e = g_dir_read_name(d)))
+        if (strstr(e, ".fm-")) n++;
+    if (d) g_dir_close(d);
+    return n;
+}
+
+static void test_replace_keeps_old(void)
+{
+    gchar *d = tmp_root();
+    gchar *src = J(d, "src"), *dst = J(d, "dst");
+    g_mkdir(src, 0755);
+    gchar *a = J(src, "a.txt"), *bad = J(src, "bad.txt");
+    write_file(a, "A");
+    write_file(bad, "B");
+    write_file(dst, "OLD");
+
+    if (getuid() != 0) {                  /* root reads mode 000 anyway */
+        chmod(bad, 0);
+        FsCtx c = { .policy = FS_OVERWRITE_ALL };
+        int r = fs_copy(&c, src, dst);
+        g_assert_cmpint(r, !=, FS_OK);
+        gchar *got = read_file(dst);       /* still the old file */
+        g_assert_cmpstr(got, ==, "OLD");
+        g_free(got);
+        g_assert_cmpint(count_aside(d), ==, 0);
+        fs_ctx_clear(&c);
+        chmod(bad, 0644);
+    }
+
+    /* success: directory replaces the file, old one gone */
+    FsCtx c = { .policy = FS_OVERWRITE_ALL };
+    g_assert_cmpint(fs_copy(&c, src, dst), ==, FS_OK);
+    g_assert_true(g_file_test(dst, G_FILE_TEST_IS_DIR));
+    gchar *da = J(dst, "a.txt");
+    g_assert_true(g_file_test(da, G_FILE_TEST_IS_REGULAR));
+    g_assert_cmpint(count_aside(d), ==, 0);
+    fs_ctx_clear(&c);
+
+    /* move: a file replaces that directory (same disk) */
+    gchar *nf = J(d, "new.txt");
+    write_file(nf, "NEW");
+    FsCtx m = { .policy = FS_OVERWRITE_ALL };
+    g_assert_cmpint(fs_move(&m, nf, dst), ==, FS_OK);
+    gchar *got = read_file(dst);
+    g_assert_cmpstr(got, ==, "NEW");
+    g_assert_false(g_file_test(nf, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(count_aside(d), ==, 0);
+    fs_ctx_clear(&m);
+
+    g_free(got); g_free(nf); g_free(da);
+    g_free(a); g_free(bad); g_free(src); g_free(dst);
+    rm_rf(d); g_free(d);
+}
+
+/* ── move to another filesystem: a file that appears in the source
+ * during the move is never deleted without being moved ──────────── */
+
+static gchar *late_path;
+static void make_late(FsCtx *c, const char *name, gint64 bytes)
+{
+    (void)c; (void)name; (void)bytes;
+    if (late_path && !g_file_test(late_path, G_FILE_TEST_EXISTS))
+        write_file(late_path, "late");
+}
+
+static void test_xdev_move_keeps_new(void)
+{
+    struct stat a, b;
+    gchar *d = tmp_root();
+    gchar *other = g_dir_make_tmp("fm-test-XXXXXX", NULL);
+    gchar *shm = NULL;
+    if (stat("/dev/shm", &b) == 0 && stat(d, &a) == 0 && a.st_dev != b.st_dev &&
+        access("/dev/shm", W_OK) == 0) {
+        g_free(other);
+        shm = g_build_filename("/dev/shm", "fm-test-XXXXXX", NULL);
+        other = g_mkdtemp(shm) ? g_strdup(shm) : NULL;
+        g_free(shm);
+    } else {
+        g_test_skip("no second filesystem");
+        if (other) { rm_rf(other); g_free(other); }
+        rm_rf(d); g_free(d);
+        return;
+    }
+    g_assert_nonnull(other);
+    gchar *src = J(other, "s"), *dst = J(d, "s");
+    g_mkdir(src, 0755);
+    for (int i = 0; i < 5; i++) {
+        gchar n[16]; g_snprintf(n, sizeof n, "f%d", i);
+        gchar *f = J(src, n); write_file(f, n); g_free(f);
+    }
+    late_path = J(src, "zz-late.txt");
+    FsCtx c = { .progress = make_late };
+    int r = fs_move(&c, src, dst);
+    for (int i = 0; i < 5; i++) {
+        gchar n[16]; g_snprintf(n, sizeof n, "f%d", i);
+        gchar *f = J(dst, n);
+        g_assert_true(g_file_test(f, G_FILE_TEST_IS_REGULAR));
+        g_free(f);
+    }
+    gchar *moved_late = J(dst, "zz-late.txt");
+    /* either moved along or left in the source – never lost */
+    g_assert_true(g_file_test(late_path, G_FILE_TEST_EXISTS) ||
+                  g_file_test(moved_late, G_FILE_TEST_EXISTS));
+    if (g_file_test(late_path, G_FILE_TEST_EXISTS))
+        g_assert_cmpint(r, !=, FS_OK);              /* and reported */
+    else
+        g_assert_false(g_file_test(src, G_FILE_TEST_EXISTS));
+    fs_ctx_clear(&c);
+    g_free(moved_late); g_clear_pointer(&late_path, g_free);
+    g_free(src); g_free(dst);
+    rm_rf(other); g_free(other);
+    rm_rf(d); g_free(d);
+}
+
+/* ── content search: cancel is seen inside one huge line ───────────── */
+
+static gpointer cancel_soon(gpointer p)
+{
+    g_usleep(2000);
+    g_atomic_int_set((gint *)p, 1);
+    return NULL;
+}
+
+static void test_contains_cancel_long_line(void)
+{
+    gchar *d = tmp_root();
+    gchar *f = J(d, "one-line.txt");
+    gsize n = 256u << 20;                 /* 256 MB, no newline, no match */
+    int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    g_assert_cmpint(fd, >=, 0);
+    char *chunk = g_malloc(1 << 20);
+    memset(chunk, 'a', 1 << 20);
+    for (gsize w = 0; w < n; w += 1 << 20)
+        g_assert_cmpint(write(fd, chunk, 1 << 20), ==, 1 << 20);
+    close(fd);
+    g_free(chunk);
+
+    gint cancelled = 0;
+    GThread *t = g_thread_new("cancel", cancel_soon, &cancelled);
+    gint64 t0 = g_get_monotonic_time();
+    g_assert_null(fs_file_contains(f, "needle", NULL, &cancelled));
+    gint64 ms = (g_get_monotonic_time() - t0) / 1000;
+    g_thread_join(t);
+    /* reading all 256 MB takes far longer than this */
+    g_assert_cmpint(ms, <, 100);
+    g_free(f);
+    rm_rf(d); g_free(d);
+}
+
+/* ── move of a directory within one filesystem: a rename, no walk of the
+ * tree afterwards (it used to lstat every entry again for progress) ── */
+
+static gint64 moved_bytes;
+static int    moved_reports;
+static void count_report(FsCtx *c, const char *name, gint64 bytes)
+{
+    (void)c; (void)name;
+    moved_bytes += bytes;
+    moved_reports++;
+}
+
+static void test_move_same_fs_no_walk(void)
+{
+    gchar *d = tmp_root();
+    gchar *src = J(d, "tree"), *dst = J(d, "moved");
+    g_mkdir(src, 0755);
+    for (int i = 0; i < 200; i++) {
+        gchar n[16]; g_snprintf(n, sizeof n, "f%03d", i);
+        gchar *f = J(src, n);
+        write_file(f, "0123456789");            /* 2000 bytes in the tree */
+        g_free(f);
+    }
+    struct stat st;
+    g_assert_cmpint(lstat(src, &st), ==, 0);
+    moved_bytes = 0; moved_reports = 0;
+    FsCtx c = { .progress = count_report };
+    g_assert_cmpint(fs_move(&c, src, dst), ==, FS_OK);
+    gchar *f = J(dst, "f199");
+    g_assert_true(g_file_test(f, G_FILE_TEST_IS_REGULAR));
+    g_assert_false(g_file_test(src, G_FILE_TEST_EXISTS));
+    /* only the directory's own size – the 200 files were not visited */
+    g_assert_cmpint(moved_bytes, ==, st.st_size);
+    g_assert_cmpint(moved_reports, <=, 2);
+    fs_ctx_clear(&c);
+    g_free(f); g_free(src); g_free(dst);
+    rm_rf(d); g_free(d);
+}
+
 static void test_parse_size(void)
 {
     g_assert_cmpint(fs_parse_size("", 0), ==, -1);
@@ -1171,5 +1367,9 @@ int main(int argc, char **argv)
     g_test_add_func("/util/local-exists",      test_local_exists);
     g_test_add_func("/util/content-extra",     test_content_extra);
     g_test_add_func("/fsops/calc-size-cancel", test_calc_size_cancelled);
+    g_test_add_func("/fsops/replace-keeps-old", test_replace_keeps_old);
+    g_test_add_func("/fsops/xdev-move-new-file", test_xdev_move_keeps_new);
+    g_test_add_func("/fsops/move-same-fs-no-walk", test_move_same_fs_no_walk);
+    g_test_add_func("/util/contains-cancel-long-line", test_contains_cancel_long_line);
     return g_test_run();
 }

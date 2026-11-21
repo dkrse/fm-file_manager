@@ -8,6 +8,7 @@
  * search, archives …) works unchanged.  Unmount with ⏏ in the device
  * picker (Alt+F1 / Alt+F2), which lists gvfs mounts. */
 #include "fm.h"
+#include "job.h"
 #include <string.h>
 
 #define NET_GROUP  "network"
@@ -83,6 +84,11 @@ static void open_in_panel(NetMount *nm, GFile *f)
         path = d;
     }
     recent_add(nm->uri);
+    if (job_foreground_running()) {
+        fm_status(fm, "Connected to %s (panel busy, not opened)", nm->uri);
+        g_free(path);
+        return;
+    }
     if (p->ssh_conn) panel_tab_new(p, path);   /* keep the SFTP tab */
     else             panel_load(p, path);
     panel_focus(p);
