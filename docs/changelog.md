@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+**Added:**
+- **Refine…** button (Alt+R) in the Copy (F5), Move (F6) and Delete (F8 / Shift+Del) dialogs: a pattern editor in `.gitignore` syntax (`*.o`, `build/`, `/top`, `docs/**/*.tmp`, `[a-z]`, `!keep.o`, `#` comments, `\#` / `\!` escapes), matched relative to the directory of the selected items; a live counter shows how many patterns are valid
+- Two filter modes: **Leave out matching** (like `.gitignore`) and **Only matching** (the negation – only matching items are processed, a matched directory with all its content)
+- The last patterns and mode are remembered per operation (copy / move / delete, `[refine]` in `settings.ini`) and prefilled, but they apply only when Refine… is pressed in that dialog – without it the operation runs unfiltered
+- Filtering works for local and SFTP copy / move / delete / trash, incl. remote-to-remote: directories that keep excluded items stay in the source, directories left empty are not created at the target, a directory without excluded items is still moved with a single rename / trashed as one piece; the progress total counts only what is processed and the status line reports the items left out
+- Ctrl+Enter in the pattern editor starts the operation; in the Delete dialog Y / N type into the editor instead of answering
+
 ## [3.6.0] - 2026-11-20
 
 **Changed:**

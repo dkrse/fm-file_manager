@@ -34,6 +34,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 - **SFTP panel** — connect to a remote server via SSH/SFTP (libssh2), async connect (non-blocking UI); host keys verified against `~/.ssh/known_hosts`; ssh-agent, ed25519/ecdsa/rsa keys, encrypted keys, password and keyboard-interactive auth; IPv4 + IPv6
 - **File marking** — Insert/Space or Shift+arrows mark files; `+`/`-` select/unselect group by pattern (`*.c;*.h`), `*` inverts, Ctrl+A all; status bar shows count and total size of marked files
 - **Copy, move, delete** — Total Commander style: F5 → path of the other panel is pre-selected, Enter starts copying (type `dir/newname` to rename a single item); F8 → Yes/No confirmation; operations run in a background thread with a From/To progress window (current file + total bar, speed, time left, Esc = cancel); overwrite prompt (Overwrite / Overwrite all / Skip / Skip all / Cancel); permissions, timestamps and symlinks preserved; directories merged; copying a directory into itself is refused; full recursive SFTP support incl. remote-to-remote
+- **Refine… (filtered copy / move / delete)** — the F5, F6 and F8 dialogs have a *Refine…* button (Alt+R) that opens a pattern editor in `.gitignore` syntax: `*.o`, `build/` (directories only), `/top` (top level only), `docs/**/*.tmp`, `!keep.o` (re-include), `#` comments; patterns are relative to the directory of the selected items. Two modes: **Leave out matching** (Alt+L, like `.gitignore` – matching items are not touched) and **Only matching** (Alt+O, the negation – only matching items are processed, a matched directory with all its content). The last patterns and mode are remembered separately for copy, move and delete and prefilled next time, but they **apply only when Refine… is pressed** in that dialog – otherwise the operation runs unfiltered. Directories that keep excluded items stay in the source, empty ones are not created at the target; Ctrl+Enter in the editor starts the operation; the status line reports how many items were left out. Works locally and over SFTP
 - **Multi-rename** — Ctrl+M on marked files: name mask with `[N]` name, `[E]` extension, `[C]` counter (start, step, digits), find/replace, lower/upper case, live preview of old → new names; conflicts are detected before anything is renamed and swaps (a↔b) work (local files)
 - **Trash** — F8/Del moves local files to the trash (freedesktop), Shift+Del / Shift+F8 deletes permanently
 - **Clipboard** — Ctrl+C / Ctrl+X / Ctrl+V interoperable with other file managers (Nautilus, Dolphin, …); paste into an SFTP panel uploads
@@ -99,6 +100,7 @@ Dual-panel file manager inspired by Total Commander, written in C with GTK4.
 | Ctrl+M | Multi-rename marked files |
 | F7 | New directory (nested `a/b/c` allowed) |
 | F8 / Del | Delete (local: move to trash) |
+| Alt+R in the F5 / F6 / F8 dialog | Refine… – filter this one operation (`.gitignore` patterns) |
 | Shift+F8 / Shift+Del | Delete permanently |
 | F10 | Quit |
 | Ctrl+S | Incremental search (MC-style jump to file) |
@@ -219,6 +221,7 @@ src/netmount.c      — network locations via GIO/gvfs (Ctrl+N)
 src/fileitem.c      — FileItem GObject (model for file list)
 src/fileops.c       — copy/move/delete/mkdir/new file/rename/properties (dialogs + jobs)
 src/fsops.c         — engine: local + SFTP copy/move/delete, conflicts, progress, cancel
+src/fsfilter.c      — .gitignore-style pattern matcher for Refine… (GLib-only)
 src/util.c          — pure helpers used by the engine and the UI
 src/job.c           — worker thread + progress dialog (modal or background, queued) + overwrite prompt
 src/dialogs.c       — shared dialogs (destination, text entry, multi-button choice)
@@ -263,6 +266,8 @@ Stored in `~/.config/fm/settings.ini`. Configuration via Settings dialog (gear i
 **Editor** — text font, editor GUI font, line number font size, line numbers, syntax highlighting, color scheme
 
 **System** — theme (dark / light / follow system), terminal emulator (e.g. `ptyxis`, `gnome-terminal`, `konsole`)
+
+The last *Refine…* patterns and mode are kept in the `[refine]` group (`copy-patterns`, `copy-mode`, `move-…`, `delete-…`).
 
 ## SSH connections
 

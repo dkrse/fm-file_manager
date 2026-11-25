@@ -58,6 +58,212 @@ GtkWidget *dlg_file_list(GList *files)
 }
 
 /* ─────────────────────────────────────────────────────────────────── *
+ *  "Refine…" – filter for a single copy / move / delete.
+ *  The last patterns and mode are remembered per operation (prefilled
+ *  next time), but they apply only when the button is pressed in this
+ *  very dialog – an operation without it is never filtered.
+ * ─────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    GtkWidget *toggle;     /* "Refine…" in the button row            */
+    GtkWidget *revealer;   /* the rules editor below the question    */
+    GtkWidget *view;
+    GtkWidget *status;
+    GtkWidget *mode_out;   /* "Leave out matching"  (gitignore)      */
+    GtkWidget *mode_only;  /* "Only matching"       (negation)       */
+    const char *key;       /* settings key prefix: copy / move / … */
+    DlgCtx    *ctx;
+} Refine;
+
+#define REFINE_GROUP "refine"
+
+static gboolean refine_only(Refine *rf)
+{
+    return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(rf->mode_only));
+}
+
+static void refine_update_status(Refine *rf)
+{
+    GtkTextBuffer *b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(rf->view));
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(b, &s, &e);
+    gchar *txt = gtk_text_buffer_get_text(b, &s, &e, FALSE);
+    FsFilter *f = fs_filter_new(txt);
+    guint n = fs_filter_rule_count(f);
+    fs_filter_free(f);
+    g_free(txt);
+    gchar *msg = !n ? g_strdup("No patterns – everything is processed")
+               : g_strdup_printf(refine_only(rf)
+                                   ? "%u pattern%s – only matching items are processed"
+                                   : "%u pattern%s – matching items are left out",
+                                 n, n == 1 ? "" : "s");
+    gtk_label_set_text(GTK_LABEL(rf->status), msg);
+    g_free(msg);
+}
+
+static void on_refine_changed(GtkTextBuffer *b, Refine *rf)
+{
+    (void)b;
+    refine_update_status(rf);
+}
+
+static void on_refine_mode(GtkToggleButton *t, Refine *rf)
+{
+    if (gtk_toggle_button_get_active(t)) refine_update_status(rf);
+}
+
+static void on_refine_toggled(GtkToggleButton *t, Refine *rf)
+{
+    gboolean on = gtk_toggle_button_get_active(t);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(rf->revealer), on);
+    if (on) gtk_widget_grab_focus(rf->view);
+}
+
+/* Ctrl+Enter in the rules editor = OK (plain Enter is a new line) */
+static gboolean on_refine_key(GtkEventControllerKey *k, guint keyval, guint code,
+                              GdkModifierType state, Refine *rf)
+{
+    (void)k; (void)code;
+    if ((keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) &&
+        (state & GDK_CONTROL_MASK)) {
+        dlg_ctx_ok(NULL, rf->ctx);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static GtkWidget *refine_build(Refine *rf, DlgCtx *ctx, const char *store_key)
+{
+    rf->ctx = ctx;
+    rf->key = store_key;
+    rf->toggle = gtk_toggle_button_new_with_mnemonic("_Refine…");
+    gtk_widget_set_tooltip_text(rf->toggle,
+        "Filter this operation with .gitignore-style patterns.\n"
+        "The last patterns are remembered, but they apply only when "
+        "this button is pressed.");
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_margin_top(box, 4);
+
+    /* mode: gitignore (leave out) or its negation (only these) */
+    rf->mode_out  = gtk_toggle_button_new_with_mnemonic("_Leave out matching");
+    rf->mode_only = gtk_toggle_button_new_with_mnemonic("_Only matching");
+    gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(rf->mode_only),
+                                GTK_TOGGLE_BUTTON(rf->mode_out));
+    gtk_widget_set_tooltip_text(rf->mode_out,
+        "Matching items are not touched (like .gitignore)");
+    gtk_widget_set_tooltip_text(rf->mode_only,
+        "Only matching items are processed – a matched directory with "
+        "all its content");
+    GtkWidget *modes = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(modes, "linked");
+    gtk_box_append(GTK_BOX(modes), rf->mode_out);
+    gtk_box_append(GTK_BOX(modes), rf->mode_only);
+    GtkWidget *syn = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(syn),
+        "<small>.gitignore syntax, one pattern per line</small>");
+    gtk_widget_add_css_class(syn, "dim-label");
+    gtk_widget_set_hexpand(syn, TRUE);
+    gtk_widget_set_halign(syn, GTK_ALIGN_END);
+    GtkWidget *head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(head), modes);
+    gtk_box_append(GTK_BOX(head), syn);
+
+    rf->view = gtk_text_view_new();
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(rf->view), TRUE);
+    gtk_text_view_set_accepts_tab(GTK_TEXT_VIEW(rf->view), FALSE);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(rf->view), 4);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(rf->view), 4);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(rf->view), 6);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(rf->view), 6);
+    GtkEventController *key = gtk_event_controller_key_new();
+    g_signal_connect(key, "key-pressed", G_CALLBACK(on_refine_key), rf);
+    gtk_widget_add_controller(rf->view, key);
+
+    GtkWidget *sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(sw), 110);
+    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(sw), TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), rf->view);
+
+    GtkWidget *hint = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hint),
+        "<small><tt>*.o</tt> any .o file   <tt>build/</tt> directories only   "
+        "<tt>/top</tt> top level only\n"
+        "<tt>docs/**/*.tmp</tt> any depth   <tt>!keep.o</tt> re-include   "
+        "<tt>#</tt> comment\n"
+        "Last patterns are remembered · Ctrl+Enter runs the operation</small>");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0f);
+    gtk_widget_add_css_class(hint, "dim-label");
+
+    rf->status = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(rf->status), 0.0f);
+    gtk_widget_add_css_class(rf->status, "caption");
+
+    gtk_box_append(GTK_BOX(box), head);
+    gtk_box_append(GTK_BOX(box), sw);
+    gtk_box_append(GTK_BOX(box), rf->status);
+    gtk_box_append(GTK_BOX(box), hint);
+
+    rf->revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(rf->revealer),
+                                     GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_child(GTK_REVEALER(rf->revealer), box);
+
+    /* prefill with what was used last time for this operation */
+    GtkTextBuffer *b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(rf->view));
+    gchar *k = g_strconcat(store_key, "-patterns", NULL);
+    gchar *saved = settings_get_string(REFINE_GROUP, k);
+    g_free(k);
+    if (saved) gtk_text_buffer_set_text(b, saved, -1);
+    g_free(saved);
+    k = g_strconcat(store_key, "-mode", NULL);
+    gchar *mode = settings_get_string(REFINE_GROUP, k);
+    g_free(k);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(
+        g_strcmp0(mode, "only") == 0 ? rf->mode_only : rf->mode_out), TRUE);
+    g_free(mode);
+
+    g_signal_connect(b, "changed", G_CALLBACK(on_refine_changed), rf);
+    g_signal_connect(rf->toggle, "toggled", G_CALLBACK(on_refine_toggled), rf);
+    g_signal_connect(rf->mode_out,  "toggled", G_CALLBACK(on_refine_mode), rf);
+    g_signal_connect(rf->mode_only, "toggled", G_CALLBACK(on_refine_mode), rf);
+    refine_update_status(rf);
+    return rf->revealer;
+}
+
+/* The filter to apply – only when "Refine…" is pressed and holds rules.
+ * What was used is remembered for the next dialog of this operation. */
+static FsFilter *refine_result(Refine *rf)
+{
+    if (!rf->toggle || !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(rf->toggle)))
+        return NULL;
+    GtkTextBuffer *b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(rf->view));
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(b, &s, &e);
+    gchar *txt = gtk_text_buffer_get_text(b, &s, &e, FALSE);
+    gboolean only = refine_only(rf);
+
+    gchar *k = g_strconcat(rf->key, "-patterns", NULL);
+    settings_set_string(REFINE_GROUP, k, txt);
+    g_free(k);
+    k = g_strconcat(rf->key, "-mode", NULL);
+    settings_set_string(REFINE_GROUP, k, only ? "only" : "out");
+    g_free(k);
+
+    FsFilter *f = fs_filter_new(txt);
+    fs_filter_set_invert(f, only);
+    g_free(txt);
+    return f;
+}
+
+static gboolean refine_has_focus(Refine *rf)
+{
+    return rf && rf->view && gtk_widget_has_focus(rf->view);
+}
+
+/* ─────────────────────────────────────────────────────────────────── *
  *  Destination dialog (copy / move / extract) – Total Commander style
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -95,8 +301,17 @@ static void add_escape(GtkWidget *dlg, DlgCtx *ctx)
 gchar *ask_destination(FM *fm, const char *title, const char *prompt,
                        const char *default_dst)
 {
+    return ask_destination_filter(fm, title, prompt, default_dst, NULL, NULL);
+}
+
+gchar *ask_destination_filter(FM *fm, const char *title, const char *prompt,
+                              const char *default_dst, const char *store_key,
+                              FsFilter **filter)
+{
     DlgCtx ctx;
     dlg_ctx_init(&ctx);
+    Refine rf = { 0 };
+    if (filter) *filter = NULL;
 
     GtkWidget *dlg  = dlg_window(fm, title, 520);
     gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
@@ -140,7 +355,18 @@ gchar *ask_destination(FM *fm, const char *title, const char *prompt,
 
     gtk_box_append(GTK_BOX(vbox), lbl);
     gtk_box_append(GTK_BOX(vbox), hbox);
-    gtk_box_append(GTK_BOX(vbox), btn_box);
+    if (filter) {
+        gtk_box_append(GTK_BOX(vbox), refine_build(&rf, &ctx, store_key));
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_top(row, 4);
+        gtk_widget_set_margin_top(btn_box, 0);
+        gtk_widget_set_hexpand(btn_box, TRUE);
+        gtk_box_append(GTK_BOX(row), rf.toggle);
+        gtk_box_append(GTK_BOX(row), btn_box);
+        gtk_box_append(GTK_BOX(vbox), row);
+    } else {
+        gtk_box_append(GTK_BOX(vbox), btn_box);
+    }
     gtk_window_set_child(GTK_WINDOW(dlg), vbox);
     gtk_window_set_default_widget(GTK_WINDOW(dlg), ok_btn);
 
@@ -164,6 +390,7 @@ gchar *ask_destination(FM *fm, const char *title, const char *prompt,
                 result = g_strdup(txt);
             gsize l = strlen(result);
             while (l > 1 && result[l - 1] == '/') result[--l] = '\0';
+            if (filter) *filter = refine_result(&rf);
         }
     }
     gtk_window_destroy(GTK_WINDOW(dlg));
@@ -177,7 +404,12 @@ gchar *ask_destination(FM *fm, const char *title, const char *prompt,
 static gboolean on_yes_no_key(GtkEventControllerKey *k, guint keyval, guint code,
                               GdkModifierType state, DlgCtx *ctx)
 {
-    (void)k; (void)code; (void)state;
+    (void)code; (void)state;
+    /* typing patterns into "Refine…": y / n are letters there */
+    GtkWidget *w = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(k));
+    if (refine_has_focus(g_object_get_data(G_OBJECT(w), "fm-refine")) &&
+        keyval != GDK_KEY_Escape)
+        return FALSE;
     switch (keyval) {
     case GDK_KEY_y: case GDK_KEY_Y: dlg_ctx_ok(NULL, ctx);     return TRUE;
     case GDK_KEY_n: case GDK_KEY_N:
@@ -188,8 +420,16 @@ static gboolean on_yes_no_key(GtkEventControllerKey *k, guint keyval, guint code
 
 gboolean ask_yes_no(FM *fm, const char *title, const char *markup)
 {
+    return ask_yes_no_filter(fm, title, markup, NULL, NULL);
+}
+
+gboolean ask_yes_no_filter(FM *fm, const char *title, const char *markup,
+                           const char *store_key, FsFilter **filter)
+{
     DlgCtx ctx;
     dlg_ctx_init(&ctx);
+    Refine rf = { 0 };
+    if (filter) *filter = NULL;
 
     GtkWidget *dlg  = dlg_window(fm, title, 420);
     gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
@@ -218,7 +458,20 @@ gboolean ask_yes_no(FM *fm, const char *title, const char *markup)
     gtk_box_append(GTK_BOX(bb), no);
 
     gtk_box_append(GTK_BOX(vbox), row);
-    gtk_box_append(GTK_BOX(vbox), bb);
+    if (filter) {
+        gtk_box_append(GTK_BOX(vbox), refine_build(&rf, &ctx, store_key));
+        g_object_set_data(G_OBJECT(dlg), "fm-refine", &rf);
+        /* Refine… left, Yes / No stay centred in the remaining space */
+        GtkWidget *brow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_hexpand(bb, TRUE);
+        gtk_widget_set_halign(bb, GTK_ALIGN_END);
+        gtk_box_append(GTK_BOX(brow), rf.toggle);
+        gtk_box_append(GTK_BOX(brow), bb);
+        gtk_box_append(GTK_BOX(vbox), brow);
+        gtk_window_set_default_size(GTK_WINDOW(dlg), 480, -1);
+    } else {
+        gtk_box_append(GTK_BOX(vbox), bb);
+    }
     gtk_window_set_child(GTK_WINDOW(dlg), vbox);
     gtk_window_set_default_widget(GTK_WINDOW(dlg), yes);
 
@@ -233,6 +486,8 @@ gboolean ask_yes_no(FM *fm, const char *title, const char *markup)
     gtk_window_present(GTK_WINDOW(dlg));
     gtk_widget_grab_focus(yes);
     gboolean r = dlg_ctx_run(&ctx) == 1;
+    if (r && filter) *filter = refine_result(&rf);
+    g_object_set_data(G_OBJECT(dlg), "fm-refine", NULL);
     gtk_window_destroy(GTK_WINDOW(dlg));
     return r;
 }

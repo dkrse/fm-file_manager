@@ -1319,10 +1319,267 @@ static void test_calc_size_cancelled(void)
     g_free(f); g_free(root);
 }
 
+/* ── one-shot filter (.gitignore semantics) ──────────────────────── */
+
+static gboolean ex(const char *rules, const char *rel, gboolean dir)
+{
+    FsFilter *f = fs_filter_new(rules);
+    gboolean r = fs_filter_excluded(f, rel, dir);
+    fs_filter_free(f);
+    return r;
+}
+
+static void test_filter_match(void)
+{
+    g_assert_null(fs_filter_new(""));
+    g_assert_null(fs_filter_new("# only a comment\n\n   \n"));
+    FsFilter *f = fs_filter_new("*.o\n# c\n\nbuild/\n");
+    g_assert_cmpuint(fs_filter_rule_count(f), ==, 2);
+    fs_filter_free(f);
+
+    /* no slash: the name at any depth */
+    g_assert_true (ex("*.o", "a.o", FALSE));
+    g_assert_true (ex("*.o", "src/x/a.o", FALSE));
+    g_assert_false(ex("*.o", "a.c", FALSE));
+    g_assert_false(ex("*.o", "a.ob", FALSE));
+    /* trailing slash: directories only */
+    g_assert_true (ex("build/", "p/build", TRUE));
+    g_assert_false(ex("build/", "p/build", FALSE));
+    /* leading / or middle slash: anchored to the root */
+    g_assert_true (ex("/top", "top", FALSE));
+    g_assert_false(ex("/top", "a/top", FALSE));
+    g_assert_true (ex("doc/*.md", "doc/a.md", FALSE));
+    g_assert_false(ex("doc/*.md", "doc/x/a.md", FALSE));
+    g_assert_false(ex("doc/*.md", "x/doc/a.md", FALSE));
+    /* ** */
+    g_assert_true (ex("**/tmp", "tmp", TRUE));
+    g_assert_true (ex("**/tmp", "a/b/tmp", TRUE));
+    g_assert_true (ex("a/**/b", "a/b", FALSE));
+    g_assert_true (ex("a/**/b", "a/x/y/b", FALSE));
+    g_assert_false(ex("a/**/b", "a/xb", FALSE));
+    g_assert_true (ex("a/**", "a/x/y", FALSE));
+    g_assert_false(ex("a/**", "a", TRUE));
+    /* ? and classes never cross '/' */
+    g_assert_true (ex("?.c", "a.c", FALSE));
+    g_assert_false(ex("?.c", "ab.c", FALSE));
+    g_assert_true (ex("[ab].c", "b.c", FALSE));
+    g_assert_false(ex("[!ab].c", "b.c", FALSE));
+    g_assert_true (ex("[a-c]x", "bx", FALSE));
+    g_assert_false(ex("a?b", "a/b", FALSE));
+    /* negation: last match wins */
+    g_assert_false(ex("*.o\n!keep.o", "keep.o", FALSE));
+    g_assert_true (ex("!keep.o\n*.o", "keep.o", FALSE));
+    g_assert_false(ex("*\n!*/\n!*.c", "src", TRUE));
+    g_assert_false(ex("*\n!*/\n!*.c", "src/a.c", FALSE));
+    g_assert_true (ex("*\n!*/\n!*.c", "src/a.h", FALSE));
+    /* escapes and trailing spaces */
+    g_assert_true (ex("\\#x", "#x", FALSE));
+    g_assert_true (ex("\\!x", "!x", FALSE));
+    g_assert_true (ex("a.txt   ", "a.txt", FALSE));
+    g_assert_true (ex("a\\ ", "a ", FALSE));
+    g_assert_true (ex("a.txt\r", "a.txt", FALSE));
+    /* case-sensitive like git */
+    g_assert_false(ex("*.O", "a.o", FALSE));
+}
+
+/* src/{a.c, a.o, keep.o, sub/{b.c, b.o}, objs/{x.o}, build/{y.c}} */
+static gchar *filter_tree(const char *root)
+{
+    gchar *src = J(root, "src");
+    g_assert_cmpint(g_mkdir_with_parents(src, 0755), ==, 0);
+    gchar *p;
+    p = J(src, "a.c");    write_file(p, "a"); g_free(p);
+    p = J(src, "a.o");    write_file(p, "o"); g_free(p);
+    p = J(src, "keep.o"); write_file(p, "k"); g_free(p);
+    p = g_build_filename(src, "sub", NULL);   g_mkdir(p, 0755); g_free(p);
+    p = g_build_filename(src, "sub", "b.c", NULL); write_file(p, "b"); g_free(p);
+    p = g_build_filename(src, "sub", "b.o", NULL); write_file(p, "o"); g_free(p);
+    p = g_build_filename(src, "objs", NULL);  g_mkdir(p, 0755); g_free(p);
+    p = g_build_filename(src, "objs", "x.o", NULL); write_file(p, "x"); g_free(p);
+    p = g_build_filename(src, "build", NULL); g_mkdir(p, 0755); g_free(p);
+    p = g_build_filename(src, "build", "y.c", NULL); write_file(p, "y"); g_free(p);
+    return src;
+}
+
+static gboolean has(const char *dir, const char *rel)
+{
+    gchar *p = g_build_filename(dir, rel, NULL);
+    gboolean r = g_file_test(p, G_FILE_TEST_EXISTS);
+    g_free(p);
+    return r;
+}
+
+static void test_filter_copy(void)
+{
+    gchar *root = tmp_root();
+    gchar *src = filter_tree(root);
+    gchar *dst = J(root, "out");
+    FsFilter *f = fs_filter_new("*.o\n!keep.o\n/src/build/\n");
+    FsCtx c = { 0 };
+    c.filter = f;
+    g_assert_cmpint(fs_copy(&c, src, dst), ==, FS_OK);
+    g_assert_true (has(dst, "a.c"));
+    g_assert_true (has(dst, "keep.o"));
+    g_assert_false(has(dst, "a.o"));
+    g_assert_true (has(dst, "sub/b.c"));
+    g_assert_false(has(dst, "sub/b.o"));
+    g_assert_false(has(dst, "objs"));          /* only excluded inside: pruned */
+    g_assert_false(has(dst, "build"));         /* anchored dir rule          */
+    g_assert_cmpint(c.filtered, ==, 4);        /* a.o sub/b.o objs/x.o build */
+    /* size counts only what is copied */
+    FsCtx s = { 0 };
+    s.filter = f;
+    g_assert_cmpint(fs_calc_size(&s, src), ==, 3);   /* a.c keep.o sub/b.c */
+    fs_ctx_clear(&c);
+    fs_filter_free(f);
+    rm_rf(root);
+    g_free(src); g_free(dst); g_free(root);
+}
+
+static void test_filter_move(void)
+{
+    gchar *root = tmp_root();
+    gchar *src = filter_tree(root);
+    gchar *dst = J(root, "out");
+    FsFilter *f = fs_filter_new("*.o\n");
+    FsCtx c = { 0 };
+    c.filter = f;
+    g_assert_cmpint(fs_move(&c, src, dst), ==, FS_OK);
+    g_assert_null(c.error);
+    /* moved */
+    g_assert_true (has(dst, "a.c"));
+    g_assert_true (has(dst, "sub/b.c"));
+    g_assert_true (has(dst, "build/y.c"));
+    g_assert_false(has(src, "a.c"));
+    g_assert_false(has(src, "build"));         /* no excluded items: moved whole */
+    /* left in place */
+    g_assert_true (has(src, "a.o"));
+    g_assert_true (has(src, "keep.o"));
+    g_assert_true (has(src, "sub/b.o"));
+    g_assert_true (has(src, "objs/x.o"));
+    g_assert_false(has(dst, "a.o"));
+    g_assert_false(has(dst, "objs"));
+    fs_ctx_clear(&c);
+    fs_filter_free(f);
+    rm_rf(root);
+    g_free(src); g_free(dst); g_free(root);
+}
+
+static void test_filter_delete(void)
+{
+    gchar *root = tmp_root();
+    gchar *src = filter_tree(root);
+    FsFilter *f = fs_filter_new("*.c\n");      /* keep the sources */
+    FsCtx c = { 0 };
+    c.filter = f;
+    g_assert_cmpint(fs_delete(&c, src), ==, FS_OK);
+    g_assert_null(c.error);
+    g_assert_true (has(src, "a.c"));
+    g_assert_true (has(src, "sub/b.c"));
+    g_assert_true (has(src, "build/y.c"));
+    g_assert_false(has(src, "a.o"));
+    g_assert_false(has(src, "sub/b.o"));
+    g_assert_false(has(src, "objs"));          /* emptied → removed */
+    fs_ctx_clear(&c);
+    /* without a filter everything goes, as before */
+    FsCtx d = { 0 };
+    g_assert_cmpint(fs_delete(&d, src), ==, FS_OK);
+    g_assert_false(g_file_test(src, G_FILE_TEST_EXISTS));
+    fs_ctx_clear(&d);
+    fs_filter_free(f);
+    rm_rf(root);
+    g_free(src); g_free(root);
+}
+
+static gboolean exi(const char *rules, const char *rel, gboolean dir)
+{
+    FsFilter *f = fs_filter_new(rules);
+    fs_filter_set_invert(f, TRUE);
+    gboolean r = fs_filter_excluded(f, rel, dir);
+    fs_filter_free(f);
+    return r;
+}
+
+static void test_filter_invert_match(void)
+{
+    g_assert_false(exi("*.c", "a.c", FALSE));          /* matched: processed */
+    g_assert_true (exi("*.c", "a.o", FALSE));          /* the rest: left     */
+    g_assert_false(exi("*.c", "sub", TRUE));           /* dirs are entered   */
+    g_assert_false(exi("*.c", "sub/x.c", FALSE));
+    g_assert_true (exi("*.c", "sub/x.o", FALSE));
+    /* a matched directory comes whole */
+    g_assert_false(exi("docs/", "docs/a/b.bin", FALSE));
+    g_assert_true (exi("docs/", "src/b.bin", FALSE));
+    g_assert_false(exi("*.c\n!keep.c", "x.c", FALSE));
+    g_assert_true (exi("*.c\n!keep.c", "keep.c", FALSE));
+}
+
+static void test_filter_invert_ops(void)
+{
+    gchar *root = tmp_root();
+    gchar *src = filter_tree(root);
+    gchar *empty = J(src, "empty");
+    g_mkdir(empty, 0755);
+    gchar *dst = J(root, "out");
+    FsFilter *f = fs_filter_new("*.c\n");
+    fs_filter_set_invert(f, TRUE);
+
+    /* copy only the *.c */
+    FsCtx c = { 0 };
+    c.filter = f;
+    g_assert_cmpint(fs_copy(&c, src, dst), ==, FS_OK);
+    g_assert_true (has(dst, "a.c"));
+    g_assert_true (has(dst, "sub/b.c"));
+    g_assert_true (has(dst, "build/y.c"));
+    g_assert_false(has(dst, "a.o"));
+    g_assert_false(has(dst, "sub/b.o"));
+    g_assert_false(has(dst, "objs"));
+    g_assert_false(has(dst, "empty"));
+    fs_ctx_clear(&c);
+    rm_rf(dst);
+
+    /* move only the *.c */
+    FsCtx m = { 0 };
+    m.filter = f;
+    g_assert_cmpint(fs_move(&m, src, dst), ==, FS_OK);
+    g_assert_null(m.error);
+    g_assert_true (has(dst, "a.c"));
+    g_assert_true (has(dst, "build/y.c"));
+    g_assert_false(has(src, "a.c"));
+    g_assert_false(has(src, "build"));             /* emptied */
+    g_assert_true (has(src, "a.o"));
+    g_assert_true (has(src, "objs/x.o"));
+    g_assert_true (has(src, "empty"));             /* not ours to move */
+    g_assert_false(has(dst, "empty"));
+    fs_ctx_clear(&m);
+
+    /* delete only the *.o */
+    FsFilter *o = fs_filter_new("*.o\n");
+    fs_filter_set_invert(o, TRUE);
+    FsCtx d = { 0 };
+    d.filter = o;
+    g_assert_cmpint(fs_delete(&d, src), ==, FS_OK);
+    g_assert_null(d.error);
+    g_assert_false(has(src, "a.o"));
+    g_assert_false(has(src, "objs"));              /* held only *.o */
+    g_assert_true (has(src, "empty"));             /* untouched */
+    fs_ctx_clear(&d);
+
+    fs_filter_free(f); fs_filter_free(o);
+    rm_rf(root);
+    g_free(src); g_free(dst); g_free(empty); g_free(root);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/util/name-safety",       test_name_safety);
+    g_test_add_func("/filter/match",           test_filter_match);
+    g_test_add_func("/filter/copy",            test_filter_copy);
+    g_test_add_func("/filter/move",            test_filter_move);
+    g_test_add_func("/filter/delete",          test_filter_delete);
+    g_test_add_func("/filter/invert-match",    test_filter_invert_match);
+    g_test_add_func("/filter/invert-ops",      test_filter_invert_ops);
     g_test_add_func("/util/path-inside",       test_path_inside);
     g_test_add_func("/util/remote-join",       test_remote_join);
     g_test_add_func("/util/fmt-size",          test_fmt_size);

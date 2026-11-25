@@ -208,6 +208,50 @@ static void test_replace(void)
     g_free(a); g_free(b); g_free(l); g_free(r);
 }
 
+/* "Refine…" filter through upload, download and remote delete */
+static void test_filter(void)
+{
+    gchar *l, *r; fresh(&l, &r);
+    gchar *sub = g_build_filename(l, "t/sub", NULL);
+    g_mkdir_with_parents(sub, 0755);
+    gchar *lt = g_build_filename(l, "t", NULL);
+    put(lt, "a.c", "A"); put(lt, "a.o", "O"); put(sub, "b.o", "O");
+    gchar *rt = g_build_filename(r, "t", NULL);
+    gchar *rsub = g_build_filename(rt, "sub", NULL);
+    FsFilter *f = fs_filter_new("*.o\n");
+
+    FsCtx c = { .conflict = answer_overwrite, .filter = f };
+    g_assert_cmpint(fs_sftp_upload(&c, sftp, lt, rt), ==, FS_OK);
+    assert_content(rt, "a.c", "A");
+    g_assert_false(fs_sftp_exists(sftp, rsub, NULL));     /* only *.o: pruned */
+    gchar *ro = g_build_filename(rt, "a.o", NULL);
+    g_assert_false(fs_sftp_exists(sftp, ro, NULL));
+    g_assert_cmpint(c.filtered, ==, 2);
+    g_assert_cmpint(fs_sftp_calc_size(&c, sftp, rt), ==, 1);
+    fs_ctx_clear(&c);
+
+    /* remote delete keeping the excluded */
+    put(rt, "x.o", "X");
+    FsFilter *keep = fs_filter_new("*.o\n");
+    FsCtx d = { .filter = keep };
+    g_assert_cmpint(fs_sftp_delete(&d, sftp, rt), ==, FS_OK);
+    gchar *rx = g_build_filename(rt, "x.o", NULL), *rc = g_build_filename(rt, "a.c", NULL);
+    g_assert_true (fs_sftp_exists(sftp, rx, NULL));
+    g_assert_false(fs_sftp_exists(sftp, rc, NULL));
+    fs_ctx_clear(&d);
+
+    /* download leaves the excluded behind */
+    gchar *back = g_build_filename(l, "back", NULL);
+    FsCtx e = { .conflict = answer_overwrite, .filter = f };
+    g_assert_cmpint(fs_sftp_download(&e, sftp, rt, back), ==, FS_OK);
+    g_assert_false(g_file_test(back, G_FILE_TEST_EXISTS));  /* only x.o: pruned */
+    fs_ctx_clear(&e);
+
+    fs_filter_free(f); fs_filter_free(keep);
+    g_free(sub); g_free(lt); g_free(rt); g_free(rsub); g_free(ro);
+    g_free(rx); g_free(rc); g_free(back); g_free(l); g_free(r);
+}
+
 /* ── setup ────────────────────────────────────────────────────────── */
 
 static gboolean connect_sftp(void)
@@ -249,6 +293,7 @@ int main(int argc, char **argv)
     g_test_add_func("/sftp/tree-download-delete",  test_tree_download_and_delete);
     g_test_add_func("/sftp/tree-upload",           test_tree_upload);
     g_test_add_func("/sftp/replace",               test_replace);
+    g_test_add_func("/sftp/filter",                test_filter);
     int rc = g_test_run();
 
     libssh2_sftp_shutdown(sftp);

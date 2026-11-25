@@ -96,6 +96,60 @@ static gboolean is_dot(const char *n)
     return n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0'));
 }
 
+/* ── operation filter ─────────────────────────────────────────────── */
+
+void fs_filter_begin(FsCtx *c, const char *path)
+{
+    if (!c || !c->filter || !path) return;
+    const char *s = strrchr(path, '/');
+    c->filter_root = s ? (gsize)(s - path) + 1 : 0;
+}
+
+static gboolean filter_match(FsCtx *c, const char *path, gboolean is_dir)
+{
+    if (!c || !c->filter) return FALSE;
+    const char *rel = strlen(path) > c->filter_root ? path + c->filter_root : path;
+    return fs_filter_excluded(c->filter, rel, is_dir);
+}
+
+gboolean fs_filter_skip(FsCtx *c, const char *path, gboolean is_dir)
+{
+    if (!filter_match(c, path, is_dir)) return FALSE;
+    g_atomic_int_inc(&c->filtered);
+    return TRUE;
+}
+
+static gint filtered_now(FsCtx *c)
+{
+    return c ? g_atomic_int_get(&c->filtered) : 0;
+}
+
+/* Did the walk since `before` leave excluded items behind?  Then the
+ * directory is kept (it is not empty) – that is not an error. */
+static gboolean kept_by_filter(FsCtx *c, gint before)
+{
+    return c && c->filter && filtered_now(c) > before;
+}
+
+/* "Only matching" mode: a directory that is neither matched nor inside
+ * a matched one is only a path to what is – it is not itself deleted
+ * or copied unless that leaves something in it. */
+static gboolean uncovered(FsCtx *c, const char *path)
+{
+    if (!c || !fs_filter_inverted(c->filter)) return FALSE;
+    const char *rel = strlen(path) > c->filter_root ? path + c->filter_root : path;
+    return !fs_filter_covers(c->filter, rel);
+}
+
+gboolean fs_filter_prune(FsCtx *c, const char *src, gint before)
+{
+    return kept_by_filter(c, before) || uncovered(c, src);
+}
+
+/* Does the local tree under the directory `path` hold an excluded item?
+ * `size` (optional) collects the bytes of what is not excluded. */
+static gboolean scan_excluded(FsCtx *c, const char *path, gint64 *size);
+
 /* Refuse to copy/move a directory into itself (resolves symlinks) */
 static gboolean dst_inside_src(const char *src, const char *dst)
 {
@@ -120,12 +174,13 @@ static gboolean dst_inside_src(const char *src, const char *dst)
  *  Local: size / delete
  * ─────────────────────────────────────────────────────────────────── */
 
-gint64 fs_calc_size(FsCtx *ctx, const char *path)
+static gint64 calc_r(FsCtx *ctx, const char *path)
 {
     if (fs_cancelled(ctx)) return 0;
 
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
+    if (filter_match(ctx, path, S_ISDIR(st.st_mode))) return 0;
     if (!S_ISDIR(st.st_mode)) return st.st_size;
 
     gint64 total = 0;
@@ -135,12 +190,43 @@ gint64 fs_calc_size(FsCtx *ctx, const char *path)
     while ((de = readdir(dir)) != NULL && !fs_cancelled(ctx)) {
         if (is_dot(de->d_name)) continue;
         gchar *sub = g_build_filename(path, de->d_name, NULL);
-        total += fs_calc_size(ctx, sub);
+        total += calc_r(ctx, sub);
         g_free(sub);
     }
     closedir(dir);
     return total;
 }
+
+gint64 fs_calc_size(FsCtx *ctx, const char *path)
+{
+    fs_filter_begin(ctx, path);
+    return calc_r(ctx, path);
+}
+
+static gboolean scan_excluded(FsCtx *c, const char *path, gint64 *size)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return FALSE;
+    gboolean found = FALSE;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL && !fs_cancelled(c)) {
+        if (is_dot(de->d_name)) continue;
+        gchar *sub = g_build_filename(path, de->d_name, NULL);
+        struct stat st;
+        if (lstat(sub, &st) == 0) {
+            gboolean d = S_ISDIR(st.st_mode);
+            if (filter_match(c, sub, d))       found = TRUE;
+            else if (d && scan_excluded(c, sub, size)) found = TRUE;
+            else if (!d && size)               *size += st.st_size;
+        }
+        g_free(sub);
+        if (found && !size) break;           /* the answer is enough */
+    }
+    closedir(dir);
+    return found;
+}
+
+static struct dirent *read_dir(DIR *dir, int *err);
 
 static int delete_r(FsCtx *c, const char *path, gboolean count)
 {
@@ -148,6 +234,7 @@ static int delete_r(FsCtx *c, const char *path, gboolean count)
 
     struct stat st;
     if (lstat(path, &st) != 0) return fail(c, path, errno);
+    if (fs_filter_skip(c, path, S_ISDIR(st.st_mode))) return FS_OK;
 
     if (!S_ISDIR(st.st_mode)) {
         if (count) start_file(c, path, NULL, 0);
@@ -162,6 +249,8 @@ static int delete_r(FsCtx *c, const char *path, gboolean count)
 
     DIR *dir = opendir(path);
     if (!dir) return fail(c, path, errno);
+    gint before = filtered_now(c);
+    gint done0 = c ? g_atomic_int_get(&c->files_done) : 0;
     int r = FS_OK;
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
@@ -173,16 +262,78 @@ static int delete_r(FsCtx *c, const char *path, gboolean count)
     }
     closedir(dir);
     if (r != FS_OK) return r;
+    if (kept_by_filter(c, before)) return FS_OK;     /* holds excluded items */
+    if (c && uncovered(c, path) && g_atomic_int_get(&c->files_done) == done0) {
+        g_atomic_int_inc(&c->filtered);  /* only matching: left alone, and */
+        return FS_OK;                    /* so is every parent             */
+    }
     if (rmdir(path) != 0) return fail(c, path, errno);
     return FS_OK;
 }
 
+/* Internal clean-up (old targets set aside, partial copies, the source
+ * of a finished file move): never filtered. */
+static int delete_all(FsCtx *c, const char *path)
+{
+    const FsFilter *f = c ? c->filter : NULL;
+    if (c) c->filter = NULL;
+    int r = delete_r(c, path, FALSE);
+    if (c) c->filter = f;
+    return r;
+}
+
 int fs_delete(FsCtx *ctx, const char *path)
 {
+    fs_filter_begin(ctx, path);
     return delete_r(ctx, path, TRUE);
 }
 
+static int trash_one(FsCtx *ctx, const char *path);
+
+/* Filtered trash: a directory without excluded items goes to the trash
+ * as one piece (restorable as a whole); otherwise its content is
+ * trashed item by item and the directory itself stays. */
+static int trash_r(FsCtx *c, const char *path)
+{
+    if (fs_cancelled(c)) return FS_CANCELLED;
+    struct stat st;
+    if (lstat(path, &st) != 0) return fail(c, path, errno);
+    if (fs_filter_skip(c, path, S_ISDIR(st.st_mode))) return FS_OK;
+    gboolean unc = S_ISDIR(st.st_mode) && uncovered(c, path);
+    if (!S_ISDIR(st.st_mode) || (!unc && !scan_excluded(c, path, NULL)))
+        return trash_one(c, path);
+    gint done0 = g_atomic_int_get(&c->files_done);
+
+    DIR *dir = opendir(path);
+    if (!dir) return fail(c, path, errno);
+    GPtrArray *names = g_ptr_array_new_with_free_func(g_free);
+    int err;
+    struct dirent *de;
+    while ((de = read_dir(dir, &err)) != NULL)
+        if (!is_dot(de->d_name)) g_ptr_array_add(names, g_strdup(de->d_name));
+    int r = (!de && err) ? fail(c, path, err) : FS_OK;
+    closedir(dir);
+    for (guint i = 0; i < names->len && r != FS_CANCELLED; i++) {
+        gchar *sub = g_build_filename(path, names->pdata[i], NULL);
+        r = fs_worst(r, trash_r(c, sub));
+        g_free(sub);
+    }
+    g_ptr_array_unref(names);
+    /* only matching: a path directory emptied by this is removed */
+    if (r == FS_OK && unc && g_atomic_int_get(&c->files_done) > done0) rmdir(path);
+    return r;
+}
+
 int fs_trash(FsCtx *ctx, const char *path)
+{
+    if (ctx && ctx->filter) {
+        fs_filter_begin(ctx, path);
+        return trash_r(ctx, path);
+    }
+    return trash_one(ctx, path);
+}
+
+static int trash_one(FsCtx *ctx, const char *path)
 {
     if (fs_cancelled(ctx)) return FS_CANCELLED;
     start_file(ctx, path, NULL, 0);
@@ -239,12 +390,12 @@ static int aside_end(FsCtx *c, const char *dst, gchar *aside, int r, gboolean mo
     struct stat st;
     gboolean have_dst = lstat(dst, &st) == 0;
     if (r == FS_OK) {
-        r = delete_r(c, aside, FALSE);
+        r = delete_all(c, aside);
     } else if (move && have_dst) {
         r = fs_worst(r, fail_msg(c, "Move incomplete: the previous '%s' was kept as '%s'",
                                  dst, aside));
     } else {
-        if (have_dst) delete_r(c, dst, FALSE);               /* partial copy */
+        if (have_dst) delete_all(c, dst);                    /* partial copy */
         if (rename(aside, dst) != 0) r = fs_worst(r, fail(c, aside, errno));
     }
     g_free(aside);
@@ -408,6 +559,7 @@ static int copy_any(FsCtx *c, const char *src, const char *dst, gboolean confirm
 
     struct stat st, dt;
     if (lstat(src, &st) != 0) return fail(c, src, errno);
+    if (fs_filter_skip(c, src, S_ISDIR(st.st_mode))) return FS_OK;
 
     gchar *name = g_path_get_basename(src);
     report(c, name, 0);
@@ -449,8 +601,11 @@ static int copy_any(FsCtx *c, const char *src, const char *dst, gboolean confirm
         g_free(target);
     } else if (S_ISDIR(st.st_mode)) {
         if (mkdir(dst, 0700) != 0) { r = fail(c, dst, errno); goto out; }
+        gint before = filtered_now(c);
         r = copy_dir_contents(c, src, dst);
         apply_attrs(dst, &st);
+        /* everything inside was excluded: no empty shell (like git) */
+        if (r == FS_OK && fs_filter_prune(c, src, before)) rmdir(dst);
     } else if (S_ISREG(st.st_mode)) {
         gchar *tmp = replace ? tmp_sibling(dst) : NULL;
         r = copy_reg(c, src, dst, tmp, &st, name);
@@ -467,6 +622,7 @@ out:
 
 int fs_copy(FsCtx *ctx, const char *src, const char *dst)
 {
+    fs_filter_begin(ctx, src);
     struct stat st;
     if (lstat(src, &st) == 0 && S_ISDIR(st.st_mode) && dst_inside_src(src, dst))
         return fail_msg(ctx, "Cannot copy '%s' into itself", src);
@@ -483,12 +639,21 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
 
     struct stat st, dt;
     if (lstat(src, &st) != 0) return fail(c, src, errno);
+    if (fs_filter_skip(c, src, S_ISDIR(st.st_mode))) return FS_OK;
 
     gchar *name = g_path_get_basename(src);
     report(c, name, 0);
     int r = FS_OK;
     gboolean confirmed = FALSE;
     gchar *aside = NULL;
+    gint before = filtered_now(c);
+    /* with a filter a directory is renamed as a whole only when nothing
+     * inside it is excluded – otherwise it moves item by item */
+    gint64 fsize = 0;
+    gboolean unc = S_ISDIR(st.st_mode) && uncovered(c, src);
+    gint done0 = c ? g_atomic_int_get(&c->files_done) : 0;
+    gboolean walk = S_ISDIR(st.st_mode) && c && c->filter &&
+                    (scan_excluded(c, src, &fsize) || unc);
 
     if (lstat(dst, &dt) == 0) {
         if (st.st_dev == dt.st_dev && st.st_ino == dt.st_ino) {
@@ -511,7 +676,8 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
             }
             if (!de && err) r = fs_worst(r, fail(c, src, err));
             closedir(dir);
-            if (r == FS_OK && rmdir(src) != 0) r = fail(c, src, errno);
+            if (r == FS_OK && !kept_by_filter(c, before) && rmdir(src) != 0)
+                r = fail(c, src, errno);
             goto out;
         }
         if (S_ISDIR(dt.st_mode) && src_inside_dst(src, dst)) {
@@ -531,14 +697,17 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
     }
 
     start_file(c, src, dst, 0);
-    if (rename(src, dst) == 0) {
-        /* no tree walk for a renamed directory: the caller counted it
-         * as its inode size (see xfer_worker) */
-        report(c, name, st.st_size);
-        count_file(c);
-        goto out;
+    if (!walk) {
+        if (rename(src, dst) == 0) {
+            /* no tree walk for a renamed directory: the caller counted
+             * it as its inode size (see xfer_worker) – or, filtered, as
+             * the size of its content (scan above) */
+            report(c, name, (c && c->filter && S_ISDIR(st.st_mode)) ? fsize : st.st_size);
+            count_file(c);
+            goto out;
+        }
+        if (errno != EXDEV) { r = fail(c, src, errno); goto out; }
     }
-    if (errno != EXDEV) { r = fail(c, src, errno); goto out; }
 
     /* different filesystem.  A directory moves child by child and is
      * removed only once empty: deleting the whole source tree after the
@@ -561,6 +730,13 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
         if (!de && err) r = fs_worst(r, fail(c, src, err));
         closedir(dir);
         apply_attrs(dst, &st);
+        if (r == FS_OK && c && unc && !kept_by_filter(c, before) &&
+            g_atomic_int_get(&c->files_done) == done0)
+            g_atomic_int_inc(&c->filtered);      /* left alone, parents too */
+        if (r == FS_OK && kept_by_filter(c, before)) {
+            rmdir(dst);                  /* only if nothing was moved in */
+            goto out;                    /* source keeps excluded items  */
+        }
         if (r == FS_OK && rmdir(src) != 0)
             r = errno == ENOTEMPTY || errno == EEXIST
                 ? fail_msg(c, "%s: new files appeared during the move – left in place", src)
@@ -568,7 +744,7 @@ static int move_any(FsCtx *c, const char *src, const char *dst)
         goto out;
     }
     r = copy_any(c, src, dst, confirmed);
-    if (r == FS_OK) r = delete_r(c, src, FALSE);
+    if (r == FS_OK) r = delete_all(c, src);
 
 out:
     if (aside) r = aside_end(c, dst, aside, r, TRUE);
@@ -578,6 +754,7 @@ out:
 
 int fs_move(FsCtx *ctx, const char *src, const char *dst)
 {
+    fs_filter_begin(ctx, src);
     struct stat st;
     if (lstat(src, &st) == 0 && S_ISDIR(st.st_mode) && dst_inside_src(src, dst))
         return fail_msg(ctx, "Cannot move '%s' into itself", src);
@@ -630,12 +807,13 @@ gboolean fs_sftp_exists(LIBSSH2_SFTP *sftp, const char *path, gboolean *is_dir)
     return TRUE;
 }
 
-gint64 fs_sftp_calc_size(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path)
+static gint64 sftp_calc_r(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path)
 {
     if (fs_cancelled(ctx)) return 0;
 
     LIBSSH2_SFTP_ATTRIBUTES a;
     if (libssh2_sftp_lstat(sftp, path, &a) != 0) return 0;
+    if (filter_match(ctx, path, attr_is_dir(&a))) return 0;
     if (!attr_is_dir(&a))
         return (a.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (gint64)a.filesize : 0;
 
@@ -648,16 +826,23 @@ gint64 fs_sftp_calc_size(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path)
                                    sizeof(longentry), &attrs) > 0) {
         if (fs_cancelled(ctx)) break;
         if (is_dot(name)) continue;
+        gchar *sub = fs_remote_join(path, name);
         if (attr_is_dir(&attrs)) {
-            gchar *sub = fs_remote_join(path, name);
-            total += fs_sftp_calc_size(ctx, sftp, sub);
-            g_free(sub);
-        } else if (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) {
+            total += sftp_calc_r(ctx, sftp, sub);
+        } else if ((attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) &&
+                   !filter_match(ctx, sub, FALSE)) {
             total += (gint64)attrs.filesize;
         }
+        g_free(sub);
     }
     libssh2_sftp_closedir(h);
     return total;
+}
+
+gint64 fs_sftp_calc_size(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path)
+{
+    fs_filter_begin(ctx, path);
+    return sftp_calc_r(ctx, sftp, path);
 }
 
 static int sftp_delete_r(FsCtx *c, LIBSSH2_SFTP *sftp, const char *path,
@@ -667,6 +852,7 @@ static int sftp_delete_r(FsCtx *c, LIBSSH2_SFTP *sftp, const char *path,
 
     LIBSSH2_SFTP_ATTRIBUTES a;
     if (libssh2_sftp_lstat(sftp, path, &a) != 0) return sftp_fail(c, sftp, path);
+    if (fs_filter_skip(c, path, attr_is_dir(&a))) return FS_OK;
 
     if (!attr_is_dir(&a)) {
         if (count) start_file(c, path, NULL, 0);
@@ -694,6 +880,8 @@ static int sftp_delete_r(FsCtx *c, LIBSSH2_SFTP *sftp, const char *path,
     int r = rc < 0 ? sftp_fail(c, sftp, path) : FS_OK;
     libssh2_sftp_closedir(h);
 
+    gint before = filtered_now(c);
+    gint done0 = c ? g_atomic_int_get(&c->files_done) : 0;
     for (guint i = 0; i < names->len; i++) {
         gchar *sub = fs_remote_join(path, names->pdata[i]);
         r = fs_worst(r, sftp_delete_r(c, sftp, sub, count));
@@ -702,12 +890,28 @@ static int sftp_delete_r(FsCtx *c, LIBSSH2_SFTP *sftp, const char *path,
     }
     g_ptr_array_unref(names);
     if (r != FS_OK) return r;
+    if (kept_by_filter(c, before)) return FS_OK;     /* holds excluded items */
+    if (c && uncovered(c, path) && g_atomic_int_get(&c->files_done) == done0) {
+        g_atomic_int_inc(&c->filtered);  /* only matching: left alone, and */
+        return FS_OK;                    /* so is every parent             */
+    }
     if (libssh2_sftp_rmdir(sftp, path) != 0) return sftp_fail(c, sftp, path);
     return FS_OK;
 }
 
+/* internal clean-up – never filtered (see delete_all) */
+static int sftp_delete_all(FsCtx *c, LIBSSH2_SFTP *sftp, const char *path)
+{
+    const FsFilter *f = c ? c->filter : NULL;
+    if (c) c->filter = NULL;
+    int r = sftp_delete_r(c, sftp, path, FALSE);
+    if (c) c->filter = f;
+    return r;
+}
+
 int fs_sftp_delete(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *path)
 {
+    fs_filter_begin(ctx, path);
     return sftp_delete_r(ctx, sftp, path, TRUE);
 }
 
@@ -852,6 +1056,7 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
 
     struct stat st;
     if (lstat(local, &st) != 0) return fail(c, local, errno);
+    if (fs_filter_skip(c, local, S_ISDIR(st.st_mode))) return FS_OK;
 
     gchar *name = g_path_get_basename(local);
     report(c, name, 0);
@@ -894,6 +1099,7 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
     } else if (S_ISDIR(st.st_mode)) {
         DIR *dir = opendir(local);
         if (!dir) { r = fail(c, local, errno); goto out; }
+        gint before = filtered_now(c);
         int err;
         struct dirent *de;
         while ((de = read_dir(dir, &err)) != NULL) {
@@ -906,6 +1112,9 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
         }
         if (!de && err) r = fs_worst(r, fail(c, local, err));
         closedir(dir);
+        /* only excluded items inside: no empty shell (fails if not empty) */
+        if (r == FS_OK && need_mkdir && fs_filter_prune(c, local, before))
+            libssh2_sftp_rmdir(sftp, remote);
     } else if (S_ISREG(st.st_mode)) {
         gchar *tmp = replace ? tmp_sibling(remote) : NULL;
         r = upload_file(c, sftp, local, remote, tmp, &st, name);
@@ -917,10 +1126,10 @@ static int upload_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *local,
 out:
     if (aside) {
         if (r == FS_OK) {
-            r = sftp_delete_r(c, sftp, aside, FALSE);
+            r = sftp_delete_all(c, sftp, aside);
         } else {
             gboolean d;
-            if (fs_sftp_exists(sftp, remote, &d)) sftp_delete_r(c, sftp, remote, FALSE);
+            if (fs_sftp_exists(sftp, remote, &d)) sftp_delete_all(c, sftp, remote);
             if (libssh2_sftp_rename_ex(sftp, aside, (unsigned)strlen(aside),
                     remote, (unsigned)strlen(remote), LIBSSH2_SFTP_RENAME_ATOMIC |
                     LIBSSH2_SFTP_RENAME_NATIVE) != 0)
@@ -935,6 +1144,7 @@ out:
 int fs_sftp_upload(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *local,
                    const char *remote)
 {
+    fs_filter_begin(ctx, local);
     return upload_any(ctx, sftp, local, remote);
 }
 
@@ -1002,6 +1212,7 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
 
     LIBSSH2_SFTP_ATTRIBUTES a;
     if (libssh2_sftp_lstat(sftp, remote, &a) != 0) return sftp_fail(c, sftp, remote);
+    if (fs_filter_skip(c, remote, attr_is_dir(&a))) return FS_OK;
 
     gchar *name = g_path_get_basename(remote);
     report(c, name, 0);
@@ -1042,6 +1253,7 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
         if (!h) { r = sftp_fail(c, sftp, remote); goto out; }
         char nm[NAME_BUF], longentry[NAME_BUF];
         LIBSSH2_SFTP_ATTRIBUTES attrs;
+        gint before = filtered_now(c);
         int rc;
         while ((rc = libssh2_sftp_readdir_ex(h, nm, sizeof(nm), longentry,
                                              sizeof(longentry), &attrs)) > 0) {
@@ -1062,6 +1274,8 @@ static int download_any(FsCtx *c, LIBSSH2_SFTP *sftp, const char *remote,
         libssh2_sftp_closedir(h);
         if (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
             chmod(local, (a.permissions & 0777) | 0700);
+        if (r == FS_OK && need_mkdir && fs_filter_prune(c, remote, before))
+            rmdir(local);                     /* only excluded items inside */
     } else {
         gchar *tmp = replace ? tmp_sibling(local) : NULL;
         r = download_file(c, sftp, remote, local, tmp, &a, name);
@@ -1077,6 +1291,7 @@ out:
 int fs_sftp_download(FsCtx *ctx, LIBSSH2_SFTP *sftp, const char *remote,
                      const char *local)
 {
+    fs_filter_begin(ctx, remote);
     return download_any(ctx, sftp, remote, local);
 }
 

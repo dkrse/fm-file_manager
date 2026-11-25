@@ -13,11 +13,23 @@
 gchar *ask_destination(FM *fm, const char *title, const char *prompt,
                        const char *default_dst);
 
+/* Same, with a "Refine…" button: when it is pressed and holds rules,
+ * *filter receives them (.gitignore syntax or its negation, caller
+ * frees with fs_filter_free); otherwise *filter = NULL.  The patterns
+ * are remembered under `key` ("copy", "move", "delete") and prefilled
+ * next time – but they apply only when the button is pressed again. */
+gchar *ask_destination_filter(FM *fm, const char *title, const char *prompt,
+                              const char *default_dst, const char *key,
+                              FsFilter **filter);
+
 /* "Copy 'name' to:" / "Copy 3 files/directories to:" (markup, caller frees) */
 gchar *dlg_count_prompt(const char *verb, GList *paths, const char *suffix);
 
 /* Yes / No question, Yes focused (Enter), No on Esc; Y/N keys work too */
 gboolean ask_yes_no(FM *fm, const char *title, const char *markup);
+/* … with "Refine…" (see ask_destination_filter) */
+gboolean ask_yes_no_filter(FM *fm, const char *title, const char *markup,
+                           const char *key, FsFilter **filter);
 
 /* Single-line text entry; `prompt` is Pango markup (escape user data!).
  * select_stem: preselect name without extension (rename). NULL = cancelled */

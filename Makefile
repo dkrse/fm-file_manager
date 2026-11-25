@@ -76,7 +76,7 @@ else
 endif
 
 # GLib-only core (unit-tested without GTK)
-CORE_SRCS := $(SRCDIR)/util.c $(SRCDIR)/fsops.c $(SRCDIR)/arcfs.c
+CORE_SRCS := $(SRCDIR)/util.c $(SRCDIR)/fsops.c $(SRCDIR)/fsfilter.c $(SRCDIR)/arcfs.c
 SRCS   := $(SRCDIR)/main.c $(SRCDIR)/tabs.c $(SRCDIR)/menus.c $(SRCDIR)/keys.c $(SRCDIR)/cmdline.c \
           $(SRCDIR)/compare.c $(SRCDIR)/quickview.c $(SRCDIR)/checksum.c $(SRCDIR)/netmount.c $(SRCDIR)/fileitem.c $(SRCDIR)/fileops.c \
           $(SRCDIR)/archive.c $(SRCDIR)/arcpanel.c $(SRCDIR)/job.c $(SRCDIR)/dialogs.c \

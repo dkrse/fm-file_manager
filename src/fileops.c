@@ -57,6 +57,12 @@ static void report_result(FM *fm, const char *verb, Job *job,
     g_string_append_printf(s, "%s: %d", verb, ok);
     if (skipped) g_string_append_printf(s, "  skipped: %d", skipped);
     if (fail)    g_string_append_printf(s, "  errors: %d", fail);
+    int filtered = g_atomic_int_get(&job->ctx.filtered);
+    if (job->ctx.filter)
+        g_string_append_printf(s, "  %s: %d",
+                               fs_filter_inverted(job->ctx.filter)
+                               ? "not matching (left alone)" : "left out by filter",
+                               filtered);
     if (job->ctx.error) g_string_append_printf(s, "  –  %s", job->ctx.error);
     fm_status(fm, "%s", s->str);
     g_string_free(s, TRUE);
@@ -83,6 +89,7 @@ typedef struct {
     SshConn *sconn;
     SshConn *dconn;
     gboolean move;
+    FsFilter *filter;     /* one-shot "Refine…" rules (owned)      */
     int      ok, skipped, fail;
     int      worst;       /* worst FS_* result of all items        */
 } Xfer;
@@ -118,11 +125,15 @@ static int r2r_file(Job *job, Xfer *x, const char *tmpdir,
     FsCtx *c = &job->ctx;
     gchar *base = g_path_get_basename(src);
     gchar *tmp  = g_build_filename(tmpdir, base, NULL);
+    /* r2r_any already applied the filter to this file */
+    const FsFilter *f = c->filter;
+    c->filter = NULL;
     job->src_remote = TRUE;
     int r = fs_sftp_download(c, x->sconn->sftp, src, tmp);
     job->src_remote = FALSE;           /* upload reads the local temp copy */
     if (r == FS_OK) r = fs_sftp_upload(c, x->dconn->sftp, tmp, dst);
     if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+    c->filter = f;
     fs_delete(NULL, tmp);
     g_free(base); g_free(tmp);
     return r;
@@ -134,24 +145,29 @@ static int r2r_any(Job *job, Xfer *x, const char *tmpdir,
     FsCtx *c = &job->ctx;
     if (fs_cancelled(c)) return FS_CANCELLED;
     LIBSSH2_SFTP_ATTRIBUTES a;
-    if (libssh2_sftp_lstat(x->sconn->sftp, src, &a) != 0 ||
-        !(a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) ||
-        !LIBSSH2_SFTP_S_ISDIR(a.permissions))
-        return r2r_file(job, x, tmpdir, src, dst);   /* file, link, unknown */
+    gboolean sdir = libssh2_sftp_lstat(x->sconn->sftp, src, &a) == 0 &&
+                    (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                    LIBSSH2_SFTP_S_ISDIR(a.permissions);
+    if (fs_filter_skip(c, src, sdir)) return FS_OK;
+    if (!sdir) return r2r_file(job, x, tmpdir, src, dst);   /* file, link, unknown */
 
-    gboolean ddir = FALSE;
+    gboolean ddir = FALSE, created = FALSE;
     if (fs_sftp_exists(x->dconn->sftp, dst, &ddir)) {
         if (!ddir) return r2r_file(job, x, tmpdir, src, dst);  /* conflict path */
-    } else if (libssh2_sftp_mkdir(x->dconn->sftp, dst,
-                                  (long)(a.permissions & 0777) | 0700) != 0) {
-        if (!c->error) c->error = g_strdup_printf("Cannot create %s", dst);
-        return FS_ERR;
+    } else {
+        if (libssh2_sftp_mkdir(x->dconn->sftp, dst,
+                               (long)(a.permissions & 0777) | 0700) != 0) {
+            if (!c->error) c->error = g_strdup_printf("Cannot create %s", dst);
+            return FS_ERR;
+        }
+        created = TRUE;
     }
     LIBSSH2_SFTP_HANDLE *h = libssh2_sftp_opendir(x->sconn->sftp, src);
     if (!h) {
         if (!c->error) c->error = g_strdup_printf("Cannot read %s", src);
         return FS_ERR;
     }
+    gint before = g_atomic_int_get(&c->filtered);
     int r = FS_OK, rc;
     char nm[1024], longentry[1024];
     LIBSSH2_SFTP_ATTRIBUTES at;
@@ -176,6 +192,12 @@ static int r2r_any(Job *job, Xfer *x, const char *tmpdir,
         g_free(sp); g_free(dp);
     }
     g_ptr_array_unref(names);
+    if (r == FS_OK && fs_filter_prune(c, src, before)) {
+        /* no empty target shell (rmdir fails when something is in it) */
+        if (created) libssh2_sftp_rmdir(x->dconn->sftp, dst);
+        /* excluded items stay in the source */
+        if (g_atomic_int_get(&c->filtered) > before) return r;
+    }
     if (x->move && r == FS_OK && libssh2_sftp_rmdir(x->sconn->sftp, src) != 0) {
         if (!c->error) c->error = g_strdup_printf("Cannot remove %s", src);
         r = FS_ERR;
@@ -196,14 +218,20 @@ static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
 
 #ifdef HAVE_LIBSSH2
     int r;
+    /* move = transfer, then delete the source with the same filter
+     * (excluded items stay); the second pass is not counted again */
     if (!x->sconn) {                                    /* upload */
         r = fs_sftp_upload(c, x->dconn->sftp, src, dst);
+        gint f = g_atomic_int_get(&c->filtered);
         if (x->move && r == FS_OK) r = fs_delete(c, src);
+        g_atomic_int_set(&c->filtered, f);
         return r;
     }
     if (!x->dconn) {                                    /* download */
         r = fs_sftp_download(c, x->sconn->sftp, src, dst);
+        gint f = g_atomic_int_get(&c->filtered);
         if (x->move && r == FS_OK) r = fs_sftp_delete(c, x->sconn->sftp, src);
+        g_atomic_int_set(&c->filtered, f);
         return r;
     }
     /* remote → remote through a private temp directory */
@@ -226,6 +254,7 @@ static int transfer_one(Job *job, Xfer *x, const char *src, const char *dst)
         g_clear_error(&te);
         return FS_ERR;
     }
+    fs_filter_begin(c, src);
     r = r2r_any(job, x, tmpdir, src, dst);
     fs_delete(NULL, tmpdir);
     g_free(tmpdir);
@@ -249,7 +278,7 @@ static void xfer_worker(Job *job, gpointer d)
      * move itself – such an item counts as its own inode size, the
      * same that fs_move reports for it */
     struct stat dst_st;
-    gboolean local_move = x->move && !x->sconn && !x->dconn &&
+    gboolean local_move = x->move && !x->sconn && !x->dconn && !x->filter &&
                           stat(x->dest, &dst_st) == 0;
     for (GList *l = x->srcs; l && !job_cancelled(job); l = l->next) {
         gchar *base = g_path_get_basename(l->data);
@@ -327,6 +356,7 @@ static void run_transfer(FM *fm, Xfer *x)
     if (x->dconn) ssh_conn_ref(x->dconn);
     Job *job = job_new(fm, x->move ? "Moving" : "Copying");
     job->allow_background = !x->sconn && !x->dconn;
+    job->ctx.filter = x->filter;
     job_run(job, xfer_worker, x);
     if (job_cancelled(job)) x->worst = fs_worst(x->worst, FS_CANCELLED);
 
@@ -400,7 +430,10 @@ static void copy_or_move(FM *fm, gboolean move)
     if (!paths) { fm_status(fm, "Nothing is selected"); return; }
 
     gchar *prompt = dlg_count_prompt(move ? "Rename/move" : "Copy", paths, "to:");
-    gchar *dest = ask_destination(fm, move ? "Move" : "Copy", prompt, panel_dir(dst));
+    FsFilter *filter = NULL;
+    gchar *dest = ask_destination_filter(fm, move ? "Move" : "Copy", prompt,
+                                         panel_dir(dst), move ? "move" : "copy",
+                                         &filter);
     g_free(prompt);
     if (!dest) { g_list_free_full(paths, g_free); refocus(src); return; }
 
@@ -422,6 +455,7 @@ static void copy_or_move(FM *fm, gboolean move)
     x.sconn = src->ssh_conn;
     x.dconn = dconn;
     x.move  = move;
+    x.filter = filter;
 
     if (is_dir_on(dconn, dest)) {
         x.dest = dest;
@@ -435,6 +469,7 @@ static void copy_or_move(FM *fm, gboolean move)
                       paths->next ? dest : parent);
             g_free(parent); g_free(name); g_free(dest);
             g_list_free_full(paths, g_free);
+            fs_filter_free(filter);
             refocus(src);
             return;
         }
@@ -445,6 +480,7 @@ static void copy_or_move(FM *fm, gboolean move)
     run_transfer(fm, &x);
     if (src->marks) g_hash_table_remove_all(src->marks);
     panel_reload(src);
+    fs_filter_free(x.filter);
     g_free(x.dest);
     g_free(x.rename_to);
     g_free(dest);
@@ -511,6 +547,7 @@ typedef struct {
     GList   *paths;
     SshConn *conn;
     gboolean trash;
+    FsFilter *filter;     /* one-shot "Refine…" rules (owned)      */
     int      ok, skipped, fail;
 } DelJob;
 
@@ -550,16 +587,20 @@ static void delete_impl(FM *fm, gboolean permanent)
         g_free(what);
         what = t;
     }
-    gboolean go = ask_yes_no(fm, trash ? "Move to trash" : "Delete", what);
+    FsFilter *filter = NULL;
+    gboolean go = ask_yes_no_filter(fm, trash ? "Move to trash" : "Delete", what,
+                                    "delete", &filter);
     g_free(what);
     if (!go) { g_list_free_full(paths, g_free); refocus(p); return; }
 
-    DelJob dj = { .paths = paths, .conn = p->ssh_conn, .trash = trash };
+    DelJob dj = { .paths = paths, .conn = p->ssh_conn, .trash = trash, .filter = filter };
     Job *job = job_new(fm, dj.trash ? "Moving to trash" : "Deleting");
     job->allow_background = !dj.conn;
+    job->ctx.filter = dj.filter;
     job_run(job, delete_worker, &dj);
     report_result(fm, dj.trash ? "Trashed" : "Deleted", job, dj.ok, dj.skipped, dj.fail);
     job_free(job);
+    fs_filter_free(dj.filter);
 
     if (dj.fail) conn_alive(p);
     if (p->marks) g_hash_table_remove_all(p->marks);

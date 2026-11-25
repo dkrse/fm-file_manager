@@ -37,6 +37,20 @@ typedef enum {
     FS_ANS_CANCEL,
 } FsAnswer;
 
+/* ── one-shot filter (.gitignore syntax, see fsfilter.c) ──────────── */
+typedef struct FsFilter FsFilter;
+/* NULL when `text` holds no rules (only blanks/comments) */
+FsFilter *fs_filter_new(const char *text);
+void      fs_filter_free(FsFilter *f);
+guint     fs_filter_rule_count(const FsFilter *f);
+/* TRUE: the opposite – process only what the rules match */
+void      fs_filter_set_invert(FsFilter *f, gboolean invert);
+gboolean  fs_filter_inverted(const FsFilter *f);
+/* the directory `rel` or one of its parents is matched by the rules */
+gboolean  fs_filter_covers(const FsFilter *f, const char *rel);
+/* rel: path relative to the operation root ("dir/sub/file.o") */
+gboolean  fs_filter_excluded(const FsFilter *f, const char *rel, gboolean is_dir);
+
 typedef struct FsCtx FsCtx;
 struct FsCtx {
     gint      cancelled;     /* atomic – set from any thread         */
@@ -49,12 +63,28 @@ struct FsCtx {
     gpointer  user;
     gint      files_done;    /* atomic – files copied/deleted         */
     gchar    *error;         /* first error message (owned)           */
+
+    /* Optional filter for this one operation (not owned).  Excluded
+     * items are left alone – not copied, moved or deleted – and a
+     * directory that keeps excluded items is not removed.  Paths are
+     * matched relative to the directory holding the top-level item. */
+    const FsFilter *filter;
+    gsize     filter_root;   /* set by each top-level fs_* call       */
+    gint      filtered;      /* atomic – items left out by the filter */
 };
 
 void     fs_ctx_clear(FsCtx *ctx);            /* frees ctx->error  */
 gboolean fs_cancelled(FsCtx *ctx);
 void     fs_cancel(FsCtx *ctx);
 int      fs_worst(int a, int b);
+
+/* Filter helpers for walks outside fsops.c (remote → remote copy):
+ * begin = `path` is a top-level item; skip = excluded (and counted). */
+void     fs_filter_begin(FsCtx *ctx, const char *path);
+gboolean fs_filter_skip (FsCtx *ctx, const char *path, gboolean is_dir);
+/* after walking the directory `src` (filtered count was `before`):
+ * should its copy at the target be removed if it stayed empty? */
+gboolean fs_filter_prune(FsCtx *ctx, const char *src, gint before);
 
 /* ── local ────────────────────────────────────────────────────────── */
 gint64 fs_calc_size(FsCtx *ctx, const char *path);
